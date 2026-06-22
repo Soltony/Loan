@@ -12,6 +12,7 @@ import { Prisma } from "@prisma/client";
 import { startOfDay, isBefore, isEqual, differenceInDays } from "date-fns";
 import sendSms from "@/lib/sms";
 import { calculateTotalRepayable } from "@/lib/loan-calculator";
+import { reverseAllLoanJournalEntries } from "@/lib/loan-ledger-reversal";
 
 const approvalSchema = z.object({
   changeId: z.string(),
@@ -463,104 +464,28 @@ async function applyChange(
         }));
         const totalRepaid = reversedPayments.reduce((s: number, p: any) => s + (p.amount || 0), 0);
 
-        const disbJournalEntries = (loan.journalEntries || []).filter((j) =>
+        const hasDisbursementEntry = (loan.journalEntries || []).some((j) =>
           String(j.description || "")
             .toLowerCase()
-            .includes("loan disbursement")
+            .includes("disbursement")
         );
-        if (!disbJournalEntries.length)
+        if (!hasDisbursementEntry)
           throw new Error(
             "No loan disbursement journal entry found; reversal is blocked."
           );
 
-        const accrualJournalEntries = (loan.journalEntries || []).filter(
-          (j) => {
-            const d = String(j.description || "").toLowerCase();
-            return (
-              d.includes("daily interest accrual") ||
-              d.includes("daily penalty accrual")
-            );
-          }
-        );
-
         const provider = loan.product.provider;
 
         const reversalResult = await prisma.$transaction(async (db) => {
-          const reversalJe = await db.journalEntry.create({
-            data: {
-              providerId: provider.id,
-              loanId: loan.id,
-              date: new Date(),
-              description: `Reversal: failed external disbursement for loan ${loan.id} (tx ${tx.id})`,
-            },
-          });
-
-          for (const je of disbJournalEntries) {
-            for (const e of je.entries) {
-              const reverseType = e.type === "Debit" ? "Credit" : "Debit";
-              await db.ledgerEntry.create({
-                data: {
-                  journalEntryId: reversalJe.id,
-                  ledgerAccountId: e.ledgerAccountId,
-                  type: reverseType,
-                  amount: e.amount,
-                },
-              });
-
-              const delta = e.type === "Debit" ? -e.amount : e.amount;
-              await db.ledgerAccount.update({
-                where: { id: e.ledgerAccountId },
-                data: { balance: { increment: delta } },
-              });
-            }
-          }
-
-          // Also unwind any receivable accrual postings that may have been
-          // created before the disbursement failure was identified.
-          // Without this, Interest/Penalty/Tax receivables can remain on
-          // the books even after the loan is marked REVERSED.
-          for (const je of accrualJournalEntries) {
-            for (const e of je.entries) {
-              const reverseType = e.type === "Debit" ? "Credit" : "Debit";
-              await db.ledgerEntry.create({
-                data: {
-                  journalEntryId: reversalJe.id,
-                  ledgerAccountId: e.ledgerAccountId,
-                  type: reverseType,
-                  amount: e.amount,
-                },
-              });
-
-              const delta = e.type === "Debit" ? -e.amount : e.amount;
-              await db.ledgerAccount.update({
-                where: { id: e.ledgerAccountId },
-                data: { balance: { increment: delta } },
-              });
-            }
-          }
-
-          // Reverse payment journal entries if there are repayments
-          const paymentJournalEntries = (loan.journalEntries || []).filter((j) => {
-            const d = String(j.description || "").toLowerCase();
-            return d.includes("loan repayment") || d.includes("payment");
-          });
-          for (const je of paymentJournalEntries) {
-            for (const e of je.entries) {
-              const reverseType = e.type === "Debit" ? "Credit" : "Debit";
-              await db.ledgerEntry.create({
-                data: {
-                  journalEntryId: reversalJe.id,
-                  ledgerAccountId: e.ledgerAccountId,
-                  type: reverseType,
-                  amount: e.amount,
-                },
-              });
-              const delta = e.type === "Debit" ? -e.amount : e.amount;
-              await db.ledgerAccount.update({
-                where: { id: e.ledgerAccountId },
-                data: { balance: { increment: delta } },
-              });
-            }
+          const reversalJournalEntryId = await reverseAllLoanJournalEntries(
+            db,
+            provider.id,
+            loan.id,
+            loan.journalEntries || [],
+            `Reversal: failed external disbursement for loan ${loan.id} (tx ${tx.id})`,
+          );
+          if (!reversalJournalEntryId) {
+            throw new Error("No journal entries found to reverse for this loan.");
           }
 
           // Reset installments that had payments
@@ -627,7 +552,7 @@ async function applyChange(
             where: { loanId: loan.id } as any, // Type assertion until Prisma client is regenerated
           });
 
-          return { loanId: loan.id, reversalJournalEntryId: reversalJe.id };
+          return { loanId: loan.id, reversalJournalEntryId };
         });
 
         await createAuditLog({
@@ -802,113 +727,17 @@ async function applyChange(
         }));
         const totalRepaid = reversedPayments.reduce((s: number, p: any) => s + (p.amount || 0), 0);
 
-        const disbJournalEntries = (loan.journalEntries || []).filter((j) =>
-          String(j.description || "")
-            .toLowerCase()
-            .includes("loan disbursement")
-        );
-
-        const accrualJournalEntries = (loan.journalEntries || []).filter(
-          (j) => {
-            const d = String(j.description || "").toLowerCase();
-            return (
-              d.includes("daily interest accrual") ||
-              d.includes("daily penalty accrual")
-            );
-          }
-        );
-
         const provider = loan.product?.provider;
         if (!provider) throw new Error("Provider not found for loan reversal");
 
         await prisma.$transaction(async (db) => {
-          // Only create reversal journal entries if there are entries to reverse
-          if (disbJournalEntries.length > 0 || accrualJournalEntries.length > 0) {
-            const reversalJe = await db.journalEntry.create({
-              data: {
-                providerId: provider.id,
-                loanId: loan.id,
-                date: new Date(),
-                description: `Reversal: posted loan ${loan.id}`,
-              },
-            });
-
-            for (const je of disbJournalEntries) {
-              for (const e of je.entries) {
-                const reverseType = e.type === "Debit" ? "Credit" : "Debit";
-                await db.ledgerEntry.create({
-                  data: {
-                    journalEntryId: reversalJe.id,
-                    ledgerAccountId: e.ledgerAccountId,
-                    type: reverseType,
-                    amount: e.amount,
-                  },
-                });
-
-                const delta = e.type === "Debit" ? -e.amount : e.amount;
-                await db.ledgerAccount.update({
-                  where: { id: e.ledgerAccountId },
-                  data: { balance: { increment: delta } },
-                });
-              }
-            }
-
-            for (const je of accrualJournalEntries) {
-              for (const e of je.entries) {
-                const reverseType = e.type === "Debit" ? "Credit" : "Debit";
-                await db.ledgerEntry.create({
-                  data: {
-                    journalEntryId: reversalJe.id,
-                    ledgerAccountId: e.ledgerAccountId,
-                    type: reverseType,
-                    amount: e.amount,
-                  },
-                });
-
-                const delta = e.type === "Debit" ? -e.amount : e.amount;
-                await db.ledgerAccount.update({
-                  where: { id: e.ledgerAccountId },
-                  data: { balance: { increment: delta } },
-                });
-              }
-            }
-          }
-
-          // Reverse payment journal entries if there are repayments
-          const paymentJournalEntries = (loan.journalEntries || []).filter((j) => {
-            const d = String(j.description || "").toLowerCase();
-            return d.includes("loan repayment") || d.includes("payment");
-          });
-
-          if (paymentJournalEntries.length > 0) {
-            const payReversalJe = await db.journalEntry.create({
-              data: {
-                providerId: provider.id,
-                loanId: loan.id,
-                date: new Date(),
-                description: `Reversal: repayments for posted loan ${loan.id}`,
-              },
-            });
-
-            for (const je of paymentJournalEntries) {
-              for (const e of je.entries) {
-                const reverseType = e.type === "Debit" ? "Credit" : "Debit";
-                await db.ledgerEntry.create({
-                  data: {
-                    journalEntryId: payReversalJe.id,
-                    ledgerAccountId: e.ledgerAccountId,
-                    type: reverseType,
-                    amount: e.amount,
-                  },
-                });
-                const delta = e.type === "Debit" ? -e.amount : e.amount;
-                await db.ledgerAccount.update({
-                  where: { id: e.ledgerAccountId },
-                  data: { balance: { increment: delta } },
-                });
-              }
-            }
-          }
+          await reverseAllLoanJournalEntries(
+            db,
+            provider.id,
+            loan.id,
+            loan.journalEntries || [],
+            `Reversal: posted loan ${loan.id}`,
+          );
 
           // Reset installments that had payments
           if (loan.installments?.length) {
@@ -1627,7 +1456,15 @@ async function applyChange(
       break;
     case "TermsAndConditions":
       await prisma.$transaction(async (tx) => {
-        const { providerId, content } = data.updated;
+        const {
+          providerId,
+          content,
+          contentAm,
+          contentOm,
+          contentTi,
+          contentSo,
+          contentSid,
+        } = data.updated;
         await tx.termsAndConditions.updateMany({
           where: { providerId },
           data: { isActive: false },
@@ -1643,6 +1480,11 @@ async function applyChange(
           data: {
             providerId,
             content,
+            contentAm: contentAm ?? null,
+            contentOm: contentOm ?? null,
+            contentTi: contentTi ?? null,
+            contentSo: contentSo ?? null,
+            contentSid: contentSid ?? null,
             version: newVersionNumber,
             isActive: true,
             publishedAt: new Date(),
@@ -1854,7 +1696,7 @@ async function applyChange(
               // For installments, only principal and penalty allocation count towards its paidAmount
               const installmentPaymentAmount = penaltyToPay + principalToPay;
               const newPaidAmount = (activeInstallment.paidAmount || 0) + installmentPaymentAmount;
-              const isFullyPaid = newPaidAmount >= activeInstallment.amount + (activeInstallment.penaltyApplied || 0) - 1e-9;
+              const isFullyPaid = newPaidAmount >= activeInstallment.amount + (activeInstallment.penaltyAmount || 0) - 1e-9;
 
               await tx.loanInstallment.update({
                 where: { id: activeInstallment.id },

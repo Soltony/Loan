@@ -1,8 +1,9 @@
 
 
 import { DashboardClient } from '@/components/admin/dashboard-client';
+import { getPortfolioLedgerMetrics } from '@/lib/dashboard-metrics';
 import prisma from '@/lib/prisma';
-import type { LoanProvider, LedgerAccount, DashboardData } from '@/lib/types';
+import type { LoanProvider, DashboardData } from '@/lib/types';
 import { getUserFromSession } from '@/lib/user';
 import { startOfToday, endOfToday, subDays } from 'date-fns';
 
@@ -10,8 +11,8 @@ export const dynamic = 'force-dynamic';
 
 async function getProviderData(providerId?: string): Promise<DashboardData> {
     const today = new Date();
-    const startOfTodayDate = startOfToday(today);
-    const endOfTodayDate = endOfToday(today);
+    const startOfTodayDate = startOfToday();
+    const endOfTodayDate = endOfToday();
 
     const providerFilter = providerId ? { product: { providerId: providerId }} : {};
     const providerWhereClause = providerId ? { id: providerId } : {};
@@ -54,44 +55,23 @@ async function getProviderData(providerId?: string): Promise<DashboardData> {
     
     const totalStartingCapital = providersData.reduce((acc, p) => acc + p.startingCapital, 0);
 
-    // Aggregate ledger balances from LedgerAccount model directly
+    const portfolioLedger = await getPortfolioLedgerMetrics(prisma, providerId);
+    const { totalDisbursed, receivables, collections } = portfolioLedger;
+    const providerFund = totalStartingCapital - totalDisbursed;
+
     const allLedgerAccounts = await prisma.ledgerAccount.findMany({
-        where: providerId ? { providerId } : {}
+        where: providerId ? { providerId } : {},
     });
-
-    const aggregateLedgerBalance = (type: string, category?: string) => {
-        return allLedgerAccounts
-            .filter(acc => acc.type === type && (category ? acc.category === category : true))
+    const aggregateLedgerBalance = (type: string, category?: string) =>
+        allLedgerAccounts
+            .filter((acc) => acc.type === type && (category ? acc.category === category : true))
             .reduce((sum, acc) => sum + acc.balance, 0);
-    };
-
-    const receivables = {
-        principal: aggregateLedgerBalance('Receivable', 'Principal'),
-        interest: aggregateLedgerBalance('Receivable', 'Interest'),
-        serviceFee: aggregateLedgerBalance('Receivable', 'ServiceFee'),
-        penalty: aggregateLedgerBalance('Receivable', 'Penalty'),
-        tax: aggregateLedgerBalance('Receivable', 'Tax'),
-    };
-    
-    const collections = {
-        principal: aggregateLedgerBalance('Received', 'Principal'),
-        interest: aggregateLedgerBalance('Received', 'Interest'),
-        serviceFee: aggregateLedgerBalance('Received', 'ServiceFee'),
-        penalty: aggregateLedgerBalance('Received', 'Penalty'),
-        tax: aggregateLedgerBalance('Received', 'Tax'),
-    };
 
     const income = {
         interest: aggregateLedgerBalance('Income', 'Interest'),
         serviceFee: aggregateLedgerBalance('Income', 'ServiceFee'),
         penalty: aggregateLedgerBalance('Income', 'Penalty'),
     };
-    
-    // Derive from ledger (single source of truth) so that
-    // Initial Fund = Provider Fund + Total Disbursed — always.
-    const totalDisbursed = aggregateLedgerBalance('Receivable', 'Principal')
-                         + aggregateLedgerBalance('Received', 'Principal');
-    const providerFund = totalStartingCapital - totalDisbursed;
     const totalLoans = loans.length;
     const paidLoans = loans.filter(l => l.repaymentStatus === 'Paid').length;
     const repaymentRate = totalLoans > 0 ? (paidLoans / totalLoans) * 100 : 0;
