@@ -4,7 +4,7 @@ import prisma from '@/lib/prisma';
 import { z } from 'zod';
 import { calculateTotalRepayable, splitInstallmentPaidAmount } from '@/lib/loan-calculator';
 import { startOfDay, isBefore, isEqual, differenceInDays } from 'date-fns';
-import type { RepaymentBehavior } from '@prisma/client';
+type RepaymentBehavior = 'EARLY' | 'ON_TIME' | 'LATE';
 import { createAuditLog } from '@/lib/audit-log';
 import sendSms from '@/lib/sms';
 import { MiniAppAuthError, requireMiniAppAuthContext } from '@/lib/miniapp-auth';

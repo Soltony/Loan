@@ -7,10 +7,29 @@ import { createAuditLog } from "@/lib/audit-log";
 import { getUserFromSession } from "@/lib/user";
 import { hasPermission } from "@/lib/require-permission";
 
+function getTaxTransferSimulationDelegate() {
+  const delegate = (prisma as any).taxTransferSimulation;
+  if (!delegate) {
+    const err = new Error(
+      "Tax transfer model is unavailable in Prisma client. Run `npx prisma generate` and restart the dev server."
+    ) as Error & { status?: number };
+    err.status = 500;
+    throw err;
+  }
+  return delegate;
+}
+
+function destinationLedgerAccountName(destinationAccountName: string) {
+  return `Tax Destination: ${destinationAccountName}`.slice(0, 255);
+}
+
 // Validation schema for creating a tax transfer simulation
 const taxTransferCreateSchema = z.object({
   providerId: z.string().min(1, "Provider ID is required"),
-  transferAmount: z.number().positive("Transfer amount must be positive"),
+  transferAmount: z.preprocess((v) => {
+    if (typeof v === "string") return Number(v.replace(/,/g, ""));
+    return v;
+  }, z.number().positive("Transfer amount must be positive")),
   destinationAccountName: z.string().min(1, "Destination account is required"),
   transferReference: z
     .string()
@@ -45,13 +64,59 @@ export async function GET(request: NextRequest) {
     const status = searchParams.get("status");
     const page = parseInt(searchParams.get("page") || "1");
     const limit = parseInt(searchParams.get("limit") || "10");
+    const summary = searchParams.get("summary") === "true";
+
+    if (summary) {
+      if (!providerId) {
+        return NextResponse.json(
+          { error: "providerId is required for summary" },
+          { status: 400 }
+        );
+      }
+
+      const provider = await prisma.loanProvider.findUnique({
+        where: { id: providerId },
+        include: { ledgerAccounts: true },
+      });
+
+      if (!provider) {
+        return NextResponse.json({ error: "Provider not found" }, { status: 404 });
+      }
+
+      const taxHolding = provider.ledgerAccounts.find(
+        (a) => a.category === "Tax" && a.type === "Receivable"
+      );
+
+      const destinationAccounts = provider.ledgerAccounts
+        .filter(
+          (a) =>
+            a.category === "Tax" &&
+            a.type === "Received" &&
+            String(a.name || "").startsWith("Tax Destination:")
+        )
+        .map((a) => ({
+          id: a.id,
+          name: a.name,
+          balance: a.balance,
+        }))
+        .sort((a, b) => String(a.name).localeCompare(String(b.name)));
+
+      return NextResponse.json({
+        providerId,
+        taxHoldingAccount: taxHolding
+          ? { id: taxHolding.id, name: taxHolding.name, balance: taxHolding.balance }
+          : null,
+        destinationAccounts,
+      });
+    }
 
     const where: any = {};
     if (providerId) where.providerId = providerId;
     if (status) where.status = status;
+    const taxTransferSimulation = getTaxTransferSimulationDelegate();
 
     const [transfers, total] = await Promise.all([
-      prisma.taxTransferSimulation.findMany({
+      taxTransferSimulation.findMany({
         where,
         include: {
           provider: true,
@@ -71,7 +136,7 @@ export async function GET(request: NextRequest) {
         skip: (page - 1) * limit,
         take: limit,
       }),
-      prisma.taxTransferSimulation.count({ where }),
+      taxTransferSimulation.count({ where }),
     ]);
 
     return NextResponse.json({
@@ -113,7 +178,7 @@ export async function POST(request: NextRequest) {
       where: { id: data.providerId },
       include: {
         ledgerAccounts: {
-          where: { category: "Tax", type: "Receivable" }, // Tax holding account
+          where: { category: "Tax", type: "Receivable" }, // Collected inclusive tax balance in this deployment
         },
       },
     });
@@ -128,6 +193,12 @@ export async function POST(request: NextRequest) {
     // Get current collected tax balance
     const taxHoldingAccount = provider.ledgerAccounts[0];
     const currentBalance = taxHoldingAccount?.balance || 0;
+    if (!taxHoldingAccount) {
+      return NextResponse.json(
+        { error: "Tax holding ledger account (Tax Receivable) is not configured for this provider." },
+        { status: 400 }
+      );
+    }
 
     if (data.transferAmount > currentBalance) {
       return NextResponse.json(
@@ -137,9 +208,10 @@ export async function POST(request: NextRequest) {
         { status: 400 }
       );
     }
+    const taxTransferSimulation = getTaxTransferSimulationDelegate();
 
     // Check for duplicate transfer reference
-    const existingTransfer = await prisma.taxTransferSimulation.findUnique({
+    const existingTransfer = await taxTransferSimulation.findUnique({
       where: { transferReference: data.transferReference },
     });
 
@@ -152,21 +224,38 @@ export async function POST(request: NextRequest) {
 
     // Create the tax transfer within a transaction
     const result = await prisma.$transaction(async (tx) => {
-      // Ensure a Tax clearing account exists for the other leg of the journal entry
-      let taxClearingAccount = await tx.ledgerAccount.findFirst({
-        where: { providerId: data.providerId, category: "Tax", type: "Received" },
+      const holdingLive = await tx.ledgerAccount.findUnique({
+        where: { id: taxHoldingAccount.id },
       });
-      if (!taxClearingAccount) {
-        taxClearingAccount = await tx.ledgerAccount.create({
+      const liveBalance = holdingLive?.balance ?? 0;
+      if (!holdingLive) {
+        throw new Error("Tax holding ledger account not found.");
+      }
+      if (data.transferAmount > liveBalance) {
+        throw new Error(
+          `Transfer amount exceeds available balance. Available: ${liveBalance}, Requested: ${data.transferAmount}`
+        );
+      }
+
+      // Destination "real account" (tracked as a separate Tax/Received ledger account)
+      // Keep this as Received so transferring out of Tax Receivable does not
+      // re-appear under Tax Receivable in reporting.
+      const destLedgerName = destinationLedgerAccountName(
+        data.destinationAccountName
+      );
+      const destinationAccount =
+        (await tx.ledgerAccount.findFirst({
+          where: { providerId: data.providerId, name: destLedgerName },
+        })) ??
+        (await tx.ledgerAccount.create({
           data: {
             providerId: data.providerId,
-            name: "Tax Transfer Clearing",
+            name: destLedgerName,
             type: "Received",
             category: "Tax",
             balance: 0,
           },
-        });
-      }
+        }));
 
       // Create journal entry for the transfer
       const journalEntry = await tx.journalEntry.create({
@@ -177,13 +266,13 @@ export async function POST(request: NextRequest) {
           entries: {
             create: [
               {
-                // Debit Tax Clearing (money going out)
-                ledgerAccountId: taxClearingAccount.id,
+                // Debit: destination (real) account
+                ledgerAccountId: destinationAccount.id,
                 type: "Debit",
                 amount: data.transferAmount,
               },
               {
-                // Credit Tax Holding (reduce the holding balance)
+                // Credit: tax holding (reduce collected balance)
                 ledgerAccountId: taxHoldingAccount!.id,
                 type: "Credit",
                 amount: data.transferAmount,
@@ -194,18 +283,27 @@ export async function POST(request: NextRequest) {
         include: { entries: true },
       });
 
-      // Reduce tax holding balance
-      if (taxHoldingAccount) {
-        await tx.ledgerAccount.update({
-          where: { id: taxHoldingAccount.id },
-          data: {
-            balance: taxHoldingAccount.balance - data.transferAmount,
-          },
-        });
-      }
+      // Apply balances:
+      // - Decrement Tax Receivable (holding in this deployment)
+      // - Increment destination Tax Received
+      await tx.ledgerAccount.update({
+        where: { id: holdingLive.id },
+        data: { balance: { decrement: data.transferAmount } },
+      });
+      await tx.ledgerAccount.update({
+        where: { id: destinationAccount.id },
+        data: { balance: { increment: data.transferAmount } },
+      });
 
       // Create tax transfer simulation record
-      const transfer = await tx.taxTransferSimulation.create({
+      const txTaxTransferSimulation = (tx as any).taxTransferSimulation;
+      if (!txTaxTransferSimulation) {
+        throw new Error(
+          "Tax transfer model is unavailable in Prisma transaction client. Run `npx prisma generate` and restart the dev server."
+        );
+      }
+
+      const transfer = await txTaxTransferSimulation.create({
         data: {
           providerId: data.providerId,
           transferAmount: data.transferAmount,
@@ -280,19 +378,20 @@ export async function PUT(request: NextRequest) {
 
     const body = await request.json();
     const data = taxTransferReverseSchema.parse(body);
+    const taxTransferSimulation = getTaxTransferSimulationDelegate();
 
     // Find the transfer
-    const transfer = await prisma.taxTransferSimulation.findUnique({
+    const transfer = await taxTransferSimulation.findUnique({
       where: { id: data.transferSimulationId },
       include: {
         provider: {
           include: {
             ledgerAccounts: {
-              where: { category: "Tax", type: "Receivable" }, // Tax holding account
+              where: { category: "Tax", type: "Receivable" }, // Tax holding (collected) account
             },
           },
         },
-        journalEntry: true,
+        journalEntry: { include: { entries: true } },
       },
     });
 
@@ -316,50 +415,53 @@ export async function PUT(request: NextRequest) {
 
       // Create reversal journal entry
       if (transfer.journalEntry && taxHoldingAccount) {
-        // Find tax clearing account used in the original entry
-        const taxClearingAccount = await tx.ledgerAccount.findFirst({
-          where: { providerId: transfer.providerId, category: "Tax", type: "Received" },
+        const originalEntries = transfer.journalEntry.entries || [];
+        await tx.journalEntry.create({
+          data: {
+            providerId: transfer.providerId,
+            date: new Date(),
+            description: `Reversal of tax transfer - Ref: ${transfer.transferReference}`,
+            entries: {
+              create: originalEntries.map((e) => ({
+                ledgerAccountId: e.ledgerAccountId,
+                type: e.type === "Debit" ? "Credit" : "Debit",
+                amount: e.amount,
+              })),
+            },
+          },
         });
 
-        if (taxClearingAccount) {
-          await tx.journalEntry.create({
-            data: {
-              providerId: transfer.providerId,
-              date: new Date(),
-              description: `Reversal of tax transfer - Ref: ${transfer.transferReference}`,
-              entries: {
-                create: [
-                  {
-                    // Reverse: Credit Tax Clearing
-                    ledgerAccountId: taxClearingAccount.id,
-                    type: "Credit",
-                    amount: transfer.transferAmount,
-                  },
-                  {
-                    // Reverse: Debit Tax Holding (restore balance)
-                    ledgerAccountId: taxHoldingAccount.id,
-                    type: "Debit",
-                    amount: transfer.transferAmount,
-                  },
-                ],
-              },
-            },
+        // Restore balances: specifically undo the simulation balances.
+        // Holding (Tax Receivable) was decremented; destination was incremented.
+        const destLedgerName = destinationLedgerAccountName(
+          transfer.destinationAccountName
+        );
+        const destinationAccount = await tx.ledgerAccount.findFirst({
+          where: { providerId: transfer.providerId, name: destLedgerName },
+        });
+
+        await tx.ledgerAccount.update({
+          where: { id: taxHoldingAccount.id },
+          data: { balance: { increment: transfer.transferAmount } },
+        });
+
+        if (destinationAccount) {
+          await tx.ledgerAccount.update({
+            where: { id: destinationAccount.id },
+            data: { balance: { decrement: transfer.transferAmount } },
           });
         }
       }
 
-      // Restore tax holding balance
-      if (taxHoldingAccount) {
-        await tx.ledgerAccount.update({
-          where: { id: taxHoldingAccount.id },
-          data: {
-            balance: taxHoldingAccount.balance + transfer.transferAmount,
-          },
-        });
+      // Update transfer status
+      const txTaxTransferSimulation = (tx as any).taxTransferSimulation;
+      if (!txTaxTransferSimulation) {
+        throw new Error(
+          "Tax transfer model is unavailable in Prisma transaction client. Run `npx prisma generate` and restart the dev server."
+        );
       }
 
-      // Update transfer status
-      const reversedTransfer = await tx.taxTransferSimulation.update({
+      const reversedTransfer = await txTaxTransferSimulation.update({
         where: { id: data.transferSimulationId },
         data: {
           status: "REVERSED",

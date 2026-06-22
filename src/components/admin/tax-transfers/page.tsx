@@ -1,220 +1,388 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { useSearchParams } from "next/navigation";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { useEffect, useMemo, useState } from "react";
+import { useRequirePermission } from "@/hooks/use-require-permission";
+import { usePermissions } from "@/hooks/use-permissions";
 import { useToast } from "@/hooks/use-toast";
-import { getTaxTransfers } from "@/lib/tax-transfer-utils";
-import { TaxTransferForm } from "@/components/admin/tax-transfers/form";
-import { TaxTransferHistory } from "@/components/admin/tax-transfers/history";
-import { BalanceSummary } from "@/components/admin/tax-transfers/balance-summary";
-import { Loader2, AlertCircle } from "lucide-react";
-import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Loader2, RefreshCw } from "lucide-react";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import {
+  clampNonNegative,
+  formatCurrency,
+  TaxTransferSimulation,
+  TaxTransferSummary,
+} from "@/lib/tax-transfer-utils";
+import { TaxTransferForm, type TaxTransferDraft } from "./form";
+import { TaxTransferBalanceSummary } from "./balance-summary";
+import { TaxTransferHistory } from "./history";
 
-interface TaxTransferPageProps {
-  providers: Array<{ id: string; name: string }>;
-  availableBalance: number;
-  currentBalanceBefore: number;
+type ProviderOption = { id: string; name: string };
+
+function parseAmountLoose(input: string) {
+  const raw = String(input ?? "").trim();
+  if (!raw) return 0;
+  // allow users to paste formatted numbers like "29,947.10"
+  const normalized = raw.replace(/,/g, "");
+  const n = Number(normalized);
+  return Number.isFinite(n) ? n : NaN;
 }
 
-export function TaxTransferPage({
-  providers,
-  availableBalance,
-  currentBalanceBefore,
-}: TaxTransferPageProps) {
-  const searchParams = useSearchParams();
-  const [transfers, setTransfers] = useState<any[]>([]);
-  const [isLoading, setIsLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [selectedProviderId, setSelectedProviderId] = useState(
-    searchParams?.get("provider") || providers[0]?.id || ""
-  );
-  const [currentBalance, setCurrentBalance] = useState(availableBalance);
-  const [activeTab, setActiveTab] = useState("transfer");
-  const { toast } = useToast();
+function todayYmd() {
+  const d = new Date();
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
 
-  async function loadTransfers() {
-    setIsLoading(true);
-    setError(null);
+function ymdToIso(ymd: string) {
+  // Date-only input from browser is local; normalize to ISO with noon to avoid timezone edge cases
+  const [y, m, d] = ymd.split("-").map((v) => parseInt(v, 10));
+  if (!y || !m || !d) return new Date().toISOString();
+  return new Date(y, m - 1, d, 12, 0, 0, 0).toISOString();
+}
+
+export default function TaxTransfersPage() {
+  useRequirePermission("tax-transfers");
+  const { toast } = useToast();
+  const { canModule } = usePermissions();
+  const canCreate = canModule("tax-transfers", "create");
+  const canReverse = canModule("tax-transfers", "update");
+
+  const [providers, setProviders] = useState<ProviderOption[]>([]);
+  const [summary, setSummary] = useState<TaxTransferSummary | null>(null);
+  const [transfers, setTransfers] = useState<TaxTransferSimulation[]>([]);
+
+  const [loadingProviders, setLoadingProviders] = useState(true);
+  const [loadingSummary, setLoadingSummary] = useState(false);
+  const [loadingTransfers, setLoadingTransfers] = useState(false);
+  const [posting, setPosting] = useState(false);
+  const [confirmOpen, setConfirmOpen] = useState(false);
+
+  const [draft, setDraft] = useState<TaxTransferDraft>({
+    providerId: "",
+    transferAmount: "",
+    destinationAccountName: "",
+    transferReference: "",
+    transferDate: todayYmd(),
+    notes: "",
+  });
+
+  const holdingBalance = summary?.taxHoldingAccount?.balance ?? 0;
+  const parsedAmount = parseAmountLoose(draft.transferAmount);
+  const postBalance = useMemo(() => {
+    if (!Number.isFinite(parsedAmount) || parsedAmount <= 0) return holdingBalance;
+    return clampNonNegative(holdingBalance - parsedAmount);
+  }, [holdingBalance, parsedAmount]);
+
+  async function fetchProviders() {
+    setLoadingProviders(true);
     try {
-      const data = await getTaxTransfers(selectedProviderId);
-      setTransfers(data.data || []);
-      
-      // Calculate current balance
-      let balance = currentBalanceBefore;
-      data.data?.forEach((transfer: any) => {
-        if (transfer.status === "SIMULATED") {
-          balance -= transfer.transferAmount;
-        } else if (transfer.status === "REVERSED") {
-          balance += transfer.transferAmount;
-        }
+      const res = await fetch("/api/providers");
+      if (!res.ok) throw new Error("Failed to load providers");
+      const data = await res.json();
+      const opts: ProviderOption[] = (data ?? []).map((p: any) => ({
+        id: p.id,
+        name: p.name,
+      }));
+      setProviders(opts);
+
+      // Keep current provider if still valid; else set first
+      setDraft((prev) => {
+        const stillValid = opts.some((p) => p.id === prev.providerId);
+        if (stillValid) return prev;
+        return { ...prev, providerId: opts[0]?.id ?? "" };
       });
-      setCurrentBalance(balance);
-    } catch (err: any) {
-      const errorMessage = err.message || "Failed to load transfers";
-      setError(errorMessage);
+    } catch (e: any) {
       toast({
         title: "Error",
-        description: errorMessage,
+        description: e?.message ?? "Could not load providers.",
         variant: "destructive",
       });
     } finally {
-      setIsLoading(false);
+      setLoadingProviders(false);
     }
   }
 
-  useEffect(() => {
-    loadTransfers();
-  }, [selectedProviderId]);
+  async function fetchSummary(providerId: string) {
+    if (!providerId) return;
+    setLoadingSummary(true);
+    try {
+      const res = await fetch(
+        `/api/tax-transfers?summary=true&providerId=${encodeURIComponent(
+          providerId
+        )}`
+      );
+      if (!res.ok) throw new Error("Failed to load tax transfer summary");
+      const data = (await res.json()) as TaxTransferSummary;
+      setSummary(data);
+    } catch (e: any) {
+      toast({
+        title: "Error",
+        description: e?.message ?? "Could not load balances.",
+        variant: "destructive",
+      });
+    } finally {
+      setLoadingSummary(false);
+    }
+  }
 
-  const simulatedTransfers = transfers.filter((t) => t.status === "SIMULATED");
-  const totalTransferred = simulatedTransfers.reduce(
-    (sum, t) => sum + t.transferAmount,
-    0
-  );
-  const totalReversed = transfers
-    .filter((t) => t.status === "REVERSED")
-    .reduce((sum, t) => sum + t.transferAmount, 0);
+  async function fetchTransfers(providerId: string) {
+    if (!providerId) return;
+    setLoadingTransfers(true);
+    try {
+      const res = await fetch(
+        `/api/tax-transfers?providerId=${encodeURIComponent(
+          providerId
+        )}&page=1&limit=100`
+      );
+      if (!res.ok) throw new Error("Failed to load transfer history");
+      const json = await res.json();
+      setTransfers((json?.data ?? []) as TaxTransferSimulation[]);
+    } catch (e: any) {
+      toast({
+        title: "Error",
+        description: e?.message ?? "Could not load transfer history.",
+        variant: "destructive",
+      });
+    } finally {
+      setLoadingTransfers(false);
+    }
+  }
+
+  async function refreshAll(providerId: string) {
+    await Promise.all([fetchSummary(providerId), fetchTransfers(providerId)]);
+  }
+
+  useEffect(() => {
+    fetchProviders();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    if (!draft.providerId) return;
+    refreshAll(draft.providerId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [draft.providerId]);
+
+  async function postTransfer() {
+    if (!draft.providerId) return;
+    setPosting(true);
+    try {
+      const amount = parseAmountLoose(draft.transferAmount);
+      const payload = {
+        providerId: draft.providerId,
+        transferAmount: amount,
+        destinationAccountName: draft.destinationAccountName.trim(),
+        transferReference: draft.transferReference.trim(),
+        transferDate: ymdToIso(draft.transferDate),
+        notes: draft.notes?.trim() || undefined,
+      };
+
+      const res = await fetch("/api/tax-transfers", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(json?.error || "Failed to post transfer");
+      }
+
+      toast({
+        title: "Posted",
+        description: `Transfer recorded. Ref: ${payload.transferReference}`,
+      });
+
+      setConfirmOpen(false);
+      setDraft((prev) => ({
+        ...prev,
+        transferAmount: "",
+        transferReference: "",
+        notes: "",
+      }));
+      await refreshAll(draft.providerId);
+    } catch (e: any) {
+      toast({
+        title: "Posting failed",
+        description: e?.message ?? "Could not post transfer.",
+        variant: "destructive",
+      });
+    } finally {
+      setPosting(false);
+    }
+  }
+
+  async function reverseTransfer(transferSimulationId: string, reason: string) {
+    setPosting(true);
+    try {
+      const res = await fetch("/api/tax-transfers", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ transferSimulationId, reversalReason: reason }),
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(json?.error || "Failed to reverse transfer");
+
+      toast({ title: "Reversed", description: "Transfer has been reversed." });
+      if (draft.providerId) await refreshAll(draft.providerId);
+    } catch (e: any) {
+      toast({
+        title: "Reversal failed",
+        description: e?.message ?? "Could not reverse transfer.",
+        variant: "destructive",
+      });
+    } finally {
+      setPosting(false);
+    }
+  }
+
+  const destinationAccounts = summary?.destinationAccounts ?? [];
+
+  const confirmDetails = useMemo(() => {
+    return {
+      provider: providers.find((p) => p.id === draft.providerId)?.name ?? "",
+      amount: parseAmountLoose(draft.transferAmount),
+      destination: draft.destinationAccountName.trim(),
+      reference: draft.transferReference.trim(),
+      transferDate: draft.transferDate,
+    };
+  }, [draft, providers]);
 
   return (
-    <div className="space-y-6">
-      {/* Header */}
-      <div>
-        <h1 className="text-3xl font-bold text-gray-900">Tax Transfer Simulation</h1>
-        <p className="text-gray-600 mt-1">
-          Manage and track manual inclusive tax transfers to real accounts
-        </p>
+    <div className="flex-1 space-y-4 p-8 pt-6">
+      <div className="flex items-center justify-between gap-4">
+        <div>
+          <h2 className="text-3xl font-bold tracking-tight">Tax Transfers</h2>
+          <p className="text-muted-foreground">
+            Simulate manual transfers of collected inclusive tax with
+            double-entry journal postings and audit trail.
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <Button
+            variant="outline"
+            onClick={() => draft.providerId && refreshAll(draft.providerId)}
+            disabled={!draft.providerId || loadingSummary || loadingTransfers}
+          >
+            {loadingSummary || loadingTransfers ? (
+              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+            ) : (
+              <RefreshCw className="mr-2 h-4 w-4" />
+            )}
+            Refresh
+          </Button>
+        </div>
       </div>
 
-      {/* Alert */}
-      <Alert className="border-blue-200 bg-blue-50">
-        <AlertCircle className="h-4 w-4 text-blue-600" />
-        <AlertDescription className="text-blue-800">
-          This page simulates manual transfers of collected inclusive tax. The system
-          creates the corresponding journal entries and adjusts account balances.
-          Actual fund transfers must be completed separately.
-        </AlertDescription>
-      </Alert>
+      {loadingProviders ? (
+        <Card>
+          <CardHeader>
+            <CardTitle>Loading...</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <Loader2 className="h-6 w-6 animate-spin" />
+          </CardContent>
+        </Card>
+      ) : (
+        <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+          <TaxTransferBalanceSummary
+            holdingBalance={holdingBalance}
+            postBalance={Number.isFinite(parsedAmount) ? postBalance : null}
+          />
+          <div className="lg:col-span-2">
+            <TaxTransferForm
+              providers={providers}
+              destinationAccounts={destinationAccounts}
+              holdingBalance={holdingBalance}
+              draft={draft}
+              onChange={setDraft}
+              disabled={posting || loadingSummary || loadingTransfers}
+              canCreate={canCreate}
+              onSubmit={() => setConfirmOpen(true)}
+            />
+          </div>
+        </div>
+      )}
 
-      {/* Balance Summary */}
-      <BalanceSummary
-        currentBalance={currentBalance}
-        totalTransferred={totalTransferred}
-        totalReversed={totalReversed}
-        pendingTransferAmount={0}
+      <TaxTransferHistory
+        transfers={transfers}
+        canReverse={canReverse}
+        onReverse={reverseTransfer}
+        busy={posting}
       />
 
-      {/* Main Content */}
-      {error ? (
-        <Alert variant="destructive">
-          <AlertCircle className="h-4 w-4" />
-          <AlertDescription>{error}</AlertDescription>
-        </Alert>
-      ) : isLoading ? (
-        <div className="flex items-center justify-center py-12">
-          <Loader2 className="h-8 w-8 animate-spin text-gray-400" />
-        </div>
-      ) : (
-        <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
-          <TabsList className="grid w-full grid-cols-2">
-            <TabsTrigger value="transfer">New Transfer</TabsTrigger>
-            <TabsTrigger value="history">
-              Transfer History ({transfers.length})
-            </TabsTrigger>
-          </TabsList>
+      <AlertDialog open={confirmOpen} onOpenChange={setConfirmOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Confirm posting</AlertDialogTitle>
+            <AlertDialogDescription>
+              This will create a balanced journal entry and update the collected
+              inclusive tax holding balance.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
 
-          <TabsContent value="transfer" className="space-y-6">
-            <div className="rounded-lg border border-gray-200 bg-white p-6">
-              <div className="mb-6">
-                <h2 className="text-lg font-semibold text-gray-900">
-                  Record Manual Transfer
-                </h2>
-                <p className="text-sm text-gray-600 mt-1">
-                  Create a new tax transfer simulation for accounting purposes
-                </p>
-              </div>
-
-              <TaxTransferForm
-                providers={providers}
-                availableBalance={currentBalance}
-                onSuccess={(transfer) => {
-                  loadTransfers();
-                  setActiveTab("history");
-                  toast({
-                    title: "Success",
-                    description: "Transfer recorded successfully",
-                  });
-                }}
-              />
+          <div className="space-y-2 text-sm">
+            <div className="flex items-center justify-between">
+              <span className="text-muted-foreground">Provider</span>
+              <span className="font-medium">{confirmDetails.provider}</span>
             </div>
-
-            {/* Best Practices */}
-            <div className="rounded-lg border border-green-200 bg-green-50 p-4">
-              <h3 className="font-semibold text-green-900 mb-3">Best Practices</h3>
-              <ul className="space-y-2 text-sm text-green-800">
-                <li className="flex items-start">
-                  <span className="mr-2">✓</span>
-                  <span>Use unique, descriptive transfer references to prevent duplicates</span>
-                </li>
-                <li className="flex items-start">
-                  <span className="mr-2">✓</span>
-                  <span>Match the transfer date with the actual manual transfer date</span>
-                </li>
-                <li className="flex items-start">
-                  <span className="mr-2">✓</span>
-                  <span>Include check numbers, bank references, or receipt numbers</span>
-                </li>
-                <li className="flex items-start">
-                  <span className="mr-2">✓</span>
-                  <span>Always verify the available balance before creating transfers</span>
-                </li>
-              </ul>
+            <div className="flex items-center justify-between">
+              <span className="text-muted-foreground">Reference</span>
+              <span className="font-mono">{confirmDetails.reference}</span>
             </div>
-          </TabsContent>
-
-          <TabsContent value="history" className="space-y-6">
-            <div className="rounded-lg border border-gray-200 bg-white p-6">
-              <div className="mb-6">
-                <h2 className="text-lg font-semibold text-gray-900">
-                  Transfer History
-                </h2>
-                <p className="text-sm text-gray-600 mt-1">
-                  View all recorded transfers and reversals
-                </p>
-              </div>
-
-              <TaxTransferHistory
-                transfers={transfers}
-                onTransferReversed={loadTransfers}
-              />
+            <div className="flex items-center justify-between">
+              <span className="text-muted-foreground">Transfer date</span>
+              <span className="font-medium">{confirmDetails.transferDate}</span>
             </div>
-
-            {/* Summary Stats */}
-            {transfers.length > 0 && (
-              <div className="grid gap-4 md:grid-cols-3">
-                <div className="rounded-lg border border-gray-200 bg-white p-4">
-                  <p className="text-sm text-gray-600 mb-1">Total Records</p>
-                  <p className="text-2xl font-bold text-gray-900">
-                    {transfers.length}
-                  </p>
-                </div>
-                <div className="rounded-lg border border-blue-200 bg-blue-50 p-4">
-                  <p className="text-sm text-blue-700 font-medium mb-1">Active Transfers</p>
-                  <p className="text-2xl font-bold text-blue-900">
-                    {simulatedTransfers.length}
-                  </p>
-                </div>
-                <div className="rounded-lg border border-orange-200 bg-orange-50 p-4">
-                  <p className="text-sm text-orange-700 font-medium mb-1">Reversed</p>
-                  <p className="text-2xl font-bold text-orange-900">
-                    {transfers.filter((t) => t.status === "REVERSED").length}
-                  </p>
-                </div>
+            <div className="flex items-center justify-between">
+              <span className="text-muted-foreground">Amount</span>
+              <span className="font-mono font-semibold">
+                {formatCurrency(confirmDetails.amount)}
+              </span>
+            </div>
+            <div className="flex items-center justify-between">
+              <span className="text-muted-foreground">Destination</span>
+              <span className="font-medium">{confirmDetails.destination}</span>
+            </div>
+            <div className="pt-2 space-y-1">
+              <div className="text-muted-foreground text-xs">
+                Balances (holding)
               </div>
-            )}
-          </TabsContent>
-        </Tabs>
-      )}
+              <div className="flex items-center justify-between">
+                <span className="text-muted-foreground">Pre</span>
+                <span className="font-mono">{formatCurrency(holdingBalance)}</span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-muted-foreground">Post</span>
+                <span className="font-mono">
+                  {formatCurrency(postBalance)}
+                </span>
+              </div>
+            </div>
+          </div>
+
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={posting}>Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={postTransfer} disabled={posting}>
+              {posting ? "Posting..." : "Post"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }
+

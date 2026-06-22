@@ -1,23 +1,11 @@
 "use client";
 
-import { useState } from "react";
-import { useForm } from "react-hook-form";
-import { zodResolver } from "@hookform/resolvers/zod";
-import {
-  taxTransferFormSchema,
-  type TaxTransferFormData,
-  createTaxTransfer,
-  formatCurrency,
-} from "@/lib/tax-transfer-utils";
-import {
-  Form,
-  FormControl,
-  FormDescription,
-  FormField,
-  FormItem,
-  FormLabel,
-  FormMessage,
-} from "@/components/ui/form";
+import { useMemo } from "react";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Textarea } from "@/components/ui/textarea";
 import {
   Select,
   SelectContent,
@@ -25,323 +13,199 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Input } from "@/components/ui/input";
-import { Textarea } from "@/components/ui/textarea";
-import { Button } from "@/components/ui/button";
-import { useToast } from "@/hooks/use-toast";
-import { AlertCircle, Check, Loader2 } from "lucide-react";
-import { Alert, AlertDescription } from "@/components/ui/alert";
+import { formatCurrency } from "@/lib/tax-transfer-utils";
 
-interface TaxTransferFormProps {
-  providers: Array<{ id: string; name: string }>;
-  availableBalance: number;
-  onSuccess: (transfer: any) => void;
+function parseAmountLoose(input: string) {
+  const raw = String(input ?? "").trim();
+  if (!raw) return 0;
+  const normalized = raw.replace(/,/g, "");
+  const n = Number(normalized);
+  return Number.isFinite(n) ? n : NaN;
 }
 
-export function TaxTransferForm({
-  providers,
-  availableBalance,
-  onSuccess,
-}: TaxTransferFormProps) {
-  const [isSubmitting, setIsSubmitting] = useState(false);
-  const [showConfirmation, setShowConfirmation] = useState(false);
-  const [pendingData, setPendingData] = useState<TaxTransferFormData | null>(null);
-  const { toast } = useToast();
+export type TaxTransferDraft = {
+  providerId: string;
+  transferAmount: string; // keep as string for input
+  destinationAccountName: string;
+  transferReference: string;
+  transferDate: string; // YYYY-MM-DD
+  notes: string;
+};
 
-  const form = useForm<TaxTransferFormData>({
-    resolver: zodResolver(taxTransferFormSchema),
-    defaultValues: {
-      providerId: "",
-      transferAmount: 0,
-      destinationAccountName: "",
-      transferReference: "",
-      transferDate: new Date().toISOString().split("T")[0],
-      notes: "",
-    },
-  });
+export function TaxTransferForm(props: {
+  providers: Array<{ id: string; name: string }>;
+  destinationAccounts: Array<{ name: string }>;
+  holdingBalance: number;
+  draft: TaxTransferDraft;
+  disabled?: boolean;
+  canCreate?: boolean;
+  onChange: (next: TaxTransferDraft) => void;
+  onSubmit: () => void;
+}) {
+  const providerOptions = props.providers ?? [];
 
-  const selectedAmount = form.watch("transferAmount");
-  const amountExceedsBalance = selectedAmount > availableBalance;
+  const destinationSuggestions = useMemo(() => {
+    return Array.from(
+      new Set(
+        (props.destinationAccounts ?? [])
+          .map((a) => String(a.name || ""))
+          .filter(Boolean)
+          .map((name) => name.replace(/^Tax Destination:\s*/i, ""))
+      )
+    ).sort((a, b) => a.localeCompare(b));
+  }, [props.destinationAccounts]);
 
-  async function onSubmit(data: TaxTransferFormData) {
-    // First show confirmation
-    setPendingData(data);
-    setShowConfirmation(true);
-  }
-
-  async function handleConfirm() {
-    if (!pendingData) return;
-
-    setIsSubmitting(true);
-    try {
-      const result = await createTaxTransfer(pendingData);
-      
-      toast({
-        title: "Success",
-        description: "Tax transfer has been recorded successfully",
-      });
-
-      form.reset();
-      setShowConfirmation(false);
-      setPendingData(null);
-      onSuccess(result);
-    } catch (error: any) {
-      toast({
-        title: "Error",
-        description: error.message || "Failed to record tax transfer",
-        variant: "destructive",
-      });
-    } finally {
-      setIsSubmitting(false);
-    }
-  }
-
-  if (showConfirmation && pendingData) {
-    return (
-      <div className="rounded-lg border border-yellow-200 bg-yellow-50 p-6">
-        <h3 className="mb-4 flex items-center text-lg font-semibold text-yellow-900">
-          <AlertCircle className="mr-2 h-5 w-5" />
-          Confirm Transfer
-        </h3>
-
-        <div className="mb-6 space-y-3 rounded bg-white p-4">
-          <div className="flex justify-between">
-            <span className="text-sm text-gray-600">Provider:</span>
-            <span className="font-medium">
-              {providers.find((p) => p.id === pendingData.providerId)?.name}
-            </span>
-          </div>
-          <div className="flex justify-between">
-            <span className="text-sm text-gray-600">Transfer Amount:</span>
-            <span className="font-medium text-blue-600">
-              {formatCurrency(pendingData.transferAmount)}
-            </span>
-          </div>
-          <div className="flex justify-between">
-            <span className="text-sm text-gray-600">Destination Account:</span>
-            <span className="font-medium">{pendingData.destinationAccountName}</span>
-          </div>
-          <div className="flex justify-between">
-            <span className="text-sm text-gray-600">Reference:</span>
-            <span className="font-mono text-sm">{pendingData.transferReference}</span>
-          </div>
-          <div className="flex justify-between">
-            <span className="text-sm text-gray-600">Transfer Date:</span>
-            <span className="font-medium">
-              {new Date(pendingData.transferDate).toLocaleDateString()}
-            </span>
-          </div>
-        </div>
-
-        <div className="mb-6 flex gap-4 rounded-lg bg-blue-50 p-3 text-sm text-blue-800">
-          <Check className="h-5 w-5 flex-shrink-0" />
-          <div>
-            <p className="font-medium mb-1">This will create journal entries:</p>
-            <ul className="list-inside space-y-1 text-xs">
-              <li>✓ Debit Provider Fund Account (1100)</li>
-              <li>✓ Credit Real Account (selected destination)</li>
-              <li>✓ Reduce tax holding balance by {formatCurrency(pendingData.transferAmount)}</li>
-            </ul>
-          </div>
-        </div>
-
-        <div className="flex gap-3">
-          <Button
-            variant="outline"
-            onClick={() => {
-              setShowConfirmation(false);
-              setPendingData(null);
-            }}
-            disabled={isSubmitting}
-          >
-            Cancel
-          </Button>
-          <Button
-            onClick={handleConfirm}
-            disabled={isSubmitting}
-            className="bg-green-600 hover:bg-green-700"
-          >
-            {isSubmitting && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-            {isSubmitting ? "Processing..." : "Confirm Transfer"}
-          </Button>
-        </div>
-      </div>
-    );
-  }
+  const parsedAmount = parseAmountLoose(props.draft.transferAmount);
+  const isAmountValid = Number.isFinite(parsedAmount) && parsedAmount > 0;
+  const exceeds = isAmountValid && parsedAmount > props.holdingBalance + 1e-9;
 
   return (
-    <Form {...form}>
-      <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-6">
-        <FormField
-          control={form.control}
-          name="providerId"
-          render={({ field }) => (
-            <FormItem>
-              <FormLabel>Loan Provider</FormLabel>
-              <Select value={field.value} onValueChange={field.onChange}>
-                <FormControl>
-                  <SelectTrigger>
-                    <SelectValue placeholder="Select a provider" />
-                  </SelectTrigger>
-                </FormControl>
-                <SelectContent>
-                  {providers.map((provider) => (
-                    <SelectItem key={provider.id} value={provider.id}>
-                      {provider.name}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              <FormMessage />
-            </FormItem>
-          )}
-        />
+    <Card>
+      <CardHeader>
+        <CardTitle>Record Manual Tax Transfer (Simulation)</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+          <div className="space-y-2">
+            <Label>Provider</Label>
+            <Select
+              value={props.draft.providerId}
+              onValueChange={(v) =>
+                props.onChange({ ...props.draft, providerId: v })
+              }
+              disabled={props.disabled}
+            >
+              <SelectTrigger>
+                <SelectValue placeholder="Select provider" />
+              </SelectTrigger>
+              <SelectContent>
+                {providerOptions.map((p) => (
+                  <SelectItem key={p.id} value={p.id}>
+                    {p.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
 
-        <div className="rounded-lg bg-blue-50 p-4">
-          <div className="flex items-center justify-between">
-            <div>
-              <p className="text-sm font-medium text-blue-900">
-                Available Tax Balance
-              </p>
-              <p className="text-sm text-blue-700">
-                This is the collected inclusive tax available for transfer
-              </p>
-            </div>
-            <p className="text-2xl font-bold text-blue-600">
-              {formatCurrency(availableBalance)}
-            </p>
+          <div className="space-y-2">
+            <Label>Transfer amount</Label>
+            <Input
+              type="text"
+              inputMode="decimal"
+              min={0}
+              step="0.01"
+              value={props.draft.transferAmount}
+              disabled={props.disabled}
+              onChange={(e) =>
+                props.onChange({ ...props.draft, transferAmount: e.target.value })
+              }
+              placeholder={`Max ${formatCurrency(props.holdingBalance)}`}
+            />
+            {exceeds ? (
+              <div className="text-sm text-destructive">
+                Amount exceeds available collected tax balance.
+              </div>
+            ) : null}
+          </div>
+
+          <div className="space-y-2">
+            <Label>Destination (real) account</Label>
+            <Select
+              value="__custom__"
+              onValueChange={(v) => {
+                const label = v === "__custom__" ? "" : v;
+                props.onChange({
+                  ...props.draft,
+                  destinationAccountName: label,
+                });
+              }}
+              disabled={props.disabled || destinationSuggestions.length === 0}
+            >
+              <SelectTrigger>
+                <SelectValue placeholder="Pick from previous destinations (optional)" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="__custom__">Custom</SelectItem>
+                {destinationSuggestions.map((name) => (
+                  <SelectItem key={name} value={name}>
+                    {name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <Input
+              value={props.draft.destinationAccountName}
+              disabled={props.disabled}
+              onChange={(e) =>
+                props.onChange({
+                  ...props.draft,
+                  destinationAccountName: e.target.value,
+                })
+              }
+              placeholder="e.g. NIB Tax Account (Account #...)"
+            />
+          </div>
+
+          <div className="space-y-2">
+            <Label>Transfer reference</Label>
+            <Input
+              value={props.draft.transferReference}
+              disabled={props.disabled}
+              onChange={(e) =>
+                props.onChange({
+                  ...props.draft,
+                  transferReference: e.target.value,
+                })
+              }
+              placeholder="Unique reference / FT number"
+            />
+          </div>
+
+          <div className="space-y-2">
+            <Label>Transfer date</Label>
+            <Input
+              type="date"
+              value={props.draft.transferDate}
+              disabled={props.disabled}
+              onChange={(e) =>
+                props.onChange({ ...props.draft, transferDate: e.target.value })
+              }
+            />
           </div>
         </div>
 
-        <FormField
-          control={form.control}
-          name="transferAmount"
-          render={({ field }) => (
-            <FormItem>
-              <FormLabel>Transfer Amount (KES)</FormLabel>
-              <FormControl>
-                <Input
-                  type="number"
-                  step="0.01"
-                  placeholder="0.00"
-                  {...field}
-                  onChange={(e) =>
-                    field.onChange(
-                      e.target.value ? parseFloat(e.target.value) : 0
-                    )
-                  }
-                />
-              </FormControl>
-              <FormDescription>
-                Maximum available: {formatCurrency(availableBalance)}
-              </FormDescription>
-              {amountExceedsBalance && (
-                <FormMessage className="text-red-600">
-                  Transfer amount cannot exceed available balance
-                </FormMessage>
-              )}
-              {!amountExceedsBalance && selectedAmount > 0 && (
-                <p className="text-xs text-green-600">
-                  Remaining after transfer: {formatCurrency(availableBalance - selectedAmount)}
-                </p>
-              )}
-            </FormItem>
-          )}
-        />
+        <div className="space-y-2">
+          <Label>Remarks / notes (optional)</Label>
+          <Textarea
+            value={props.draft.notes}
+            disabled={props.disabled}
+            onChange={(e) =>
+              props.onChange({ ...props.draft, notes: e.target.value })
+            }
+            placeholder="Any details to keep in the audit trail"
+          />
+        </div>
 
-        <FormField
-          control={form.control}
-          name="destinationAccountName"
-          render={({ field }) => (
-            <FormItem>
-              <FormLabel>Destination Real Account</FormLabel>
-              <FormControl>
-                <Input
-                  placeholder="e.g., Collection Account, Bank Account ABC123"
-                  {...field}
-                />
-              </FormControl>
-              <FormDescription>
-                Enter the name or reference of the real account receiving the funds
-              </FormDescription>
-              <FormMessage />
-            </FormItem>
-          )}
-        />
-
-        <FormField
-          control={form.control}
-          name="transferReference"
-          render={({ field }) => (
-            <FormItem>
-              <FormLabel>Transfer Reference (Unique)</FormLabel>
-              <FormControl>
-                <Input
-                  placeholder="e.g., TRANSFER-2024-001"
-                  {...field}
-                />
-              </FormControl>
-              <FormDescription>
-                Use a unique reference number (e.g., check number, payment reference)
-              </FormDescription>
-              <FormMessage />
-            </FormItem>
-          )}
-        />
-
-        <FormField
-          control={form.control}
-          name="transferDate"
-          render={({ field }) => (
-            <FormItem>
-              <FormLabel>Transfer Date</FormLabel>
-              <FormControl>
-                <Input type="date" {...field} />
-              </FormControl>
-              <FormDescription>
-                Date when the manual transfer occurred
-              </FormDescription>
-              <FormMessage />
-            </FormItem>
-          )}
-        />
-
-        <FormField
-          control={form.control}
-          name="notes"
-          render={({ field }) => (
-            <FormItem>
-              <FormLabel>Additional Notes (Optional)</FormLabel>
-              <FormControl>
-                <Textarea
-                  placeholder="Add any additional details about this transfer..."
-                  rows={3}
-                  {...field}
-                />
-              </FormControl>
-              <FormMessage />
-            </FormItem>
-          )}
-        />
-
-        <Alert>
-          <AlertCircle className="h-4 w-4" />
-          <AlertDescription>
-            <strong>Note:</strong> This simulates the accounting effect of a manual
-            transfer. The actual funds must be transferred separately. Once confirmed,
-            this cannot be undone - you will need to create a reversal record.
-          </AlertDescription>
-        </Alert>
-
-        <Button
-          type="submit"
-          disabled={isSubmitting || amountExceedsBalance || availableBalance <= 0}
-          className="w-full"
-        >
-          {isSubmitting && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-          {isSubmitting ? "Processing..." : "Continue to Confirmation"}
-        </Button>
-      </form>
-    </Form>
+        <div className="flex items-center justify-end gap-2">
+          <Button
+            onClick={props.onSubmit}
+            disabled={
+              props.disabled ||
+              !props.canCreate ||
+              !props.draft.providerId ||
+              !isAmountValid ||
+              exceeds ||
+              !props.draft.destinationAccountName.trim() ||
+              !props.draft.transferReference.trim() ||
+              !props.draft.transferDate
+            }
+          >
+            Review & Post
+          </Button>
+        </div>
+      </CardContent>
+    </Card>
   );
 }
+

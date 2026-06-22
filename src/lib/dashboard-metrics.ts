@@ -83,7 +83,7 @@ export async function getPortfolioLedgerMetrics(
       type: { in: ['Receivable', 'Received'] },
       ...(providerId ? { providerId } : {}),
     },
-    select: { id: true, type: true, category: true },
+    select: { id: true, type: true, category: true, name: true, balance: true },
   });
 
   if (accounts.length === 0) {
@@ -138,6 +138,21 @@ export async function getPortfolioLedgerMetrics(
 
   const clampReceivable = (value: number) => Math.max(0, value);
 
+  // Manual tax transfers post provider-level journal entries (no loanId) that move
+  // collected tax from the Tax Receivable holding to a "Tax Destination:" (Received)
+  // account. Those postings are excluded from the loan-scoped sums above, so reflect
+  // them here: the destination accounts are only ever touched by transfers/reversals,
+  // so their balance is the net amount transferred out.
+  //   - "Tax Paid"    += amount moved to the real destination account(s)
+  //   - "Tax Payable" -= the same amount (gross collected minus what was transferred out)
+  const transferredTax = accounts.reduce((sum, a) => {
+    const isDestination =
+      a.category === 'Tax' &&
+      a.type === 'Received' &&
+      String(a.name || '').startsWith('Tax Destination:');
+    return isDestination ? sum + (a.balance || 0) : sum;
+  }, 0);
+
   return {
     totalDisbursed,
     receivables: {
@@ -145,14 +160,14 @@ export async function getPortfolioLedgerMetrics(
       interest: clampReceivable(receivableNet.interest),
       serviceFee: clampReceivable(receivableNet.servicefee),
       penalty: clampReceivable(receivableNet.penalty),
-      tax: clampReceivable(receivableNet.tax),
+      tax: clampReceivable(receivableNet.tax - transferredTax),
     },
     collections: {
       principal: receivedNet.principal,
       interest: receivedNet.interest,
       serviceFee: receivedNet.servicefee,
       penalty: receivedNet.penalty,
-      tax: receivedNet.tax,
+      tax: receivedNet.tax + transferredTax,
     },
   };
 }

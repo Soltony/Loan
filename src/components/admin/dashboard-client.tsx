@@ -251,7 +251,7 @@ const DashboardView = ({ data, color }: { data: DashboardData, color: string }) 
                     <LedgerDetailRow title="Interest Receivable" value={receivables.interest} />
                     <LedgerDetailRow title="Service Fee Receivable" value={receivables.serviceFee} />
                     <LedgerDetailRow title="Penalty Receivable" value={receivables.penalty} />
-                    <LedgerDetailRow title="Tax Receivable" value={receivables.tax} />
+                    {/* <LedgerDetailRow title="Tax Payable" value={receivables.tax} /> */}
                 </CardContent>
             </Card>
             <Card>
@@ -264,7 +264,26 @@ const DashboardView = ({ data, color }: { data: DashboardData, color: string }) 
                     <LedgerDetailRow title="Interest Received" value={collections.interest} />
                     <LedgerDetailRow title="Service Fee Received" value={collections.serviceFee} />
                     <LedgerDetailRow title="Penalty Received" value={collections.penalty} />
-                    <LedgerDetailRow title="Tax Received" value={collections.tax} />
+                    {/* <LedgerDetailRow title="Tax Paid" value={collections.tax} /> */}
+                </CardContent>
+            </Card>
+        </div>
+
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <Card>
+                <CardHeader>
+                    <CardTitle>Disaster Recovery Tax Payable</CardTitle>
+                </CardHeader>
+                <CardContent>
+                    <LedgerDetailRow title="Tax Payable" value={receivables.tax} />
+                </CardContent>
+            </Card>
+            <Card>
+                <CardHeader>
+                    <CardTitle>Disaster Recovery Tax Paid</CardTitle>
+                </CardHeader>
+                <CardContent>
+                    <LedgerDetailRow title="Tax Paid" value={collections.tax} />
                 </CardContent>
             </Card>
         </div>
