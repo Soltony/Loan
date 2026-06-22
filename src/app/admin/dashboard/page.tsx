@@ -57,7 +57,12 @@ async function getProviderData(providerId?: string): Promise<DashboardData> {
 
     const portfolioLedger = await getPortfolioLedgerMetrics(prisma, providerId);
     const { totalDisbursed, receivables, collections } = portfolioLedger;
-    const providerFund = totalStartingCapital - totalDisbursed;
+    // Capital remaining for disbursement is the live available balance, which is
+    // decremented on every disbursement and incremented by revolving-fund
+    // replenishments. Deriving it from startingCapital - totalDisbursed would
+    // ignore replenishments and go negative once disbursements exceed the
+    // original capital.
+    const providerFund = providersData.reduce((acc, p) => acc + p.initialBalance, 0);
 
     const allLedgerAccounts = await prisma.ledgerAccount.findMany({
         where: providerId ? { providerId } : {},

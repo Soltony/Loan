@@ -33,6 +33,7 @@ const ENTITY_TO_MODULE: Record<string, string[]> = {
   smstemplate: ['sms-management'],
   smscampaign: ['sms-management'],
   smslog: ['sms-management'],
+  fundreplenishment: ['revolving-fund'],
 };
 
 export function entityTypeToPermissionKeys(entityType: string) {
