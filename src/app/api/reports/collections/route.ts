@@ -81,6 +81,18 @@ export async function GET(req: NextRequest) {
         journalEntry: {
             ...(dateRange.gte && { date: { gte: dateRange.gte } }),
             ...(dateRange.lte && { date: { lte: dateRange.lte } }),
+            // Count only collections from live loan repayments. Scope to loan-linked,
+            // non-reversed journal entries so "Total Collected" reconciles with actual
+            // payments (and the dashboard's Daily Repayments). Without this the
+            // "Received" Debit-only sum is overstated by:
+            //   - Reversed loans: a reversal posts an *offsetting Credit* (on the
+            //     reversal date) and deletes the Payment records, but the original
+            //     "Received" Debits remain. Summing Debits only never nets the credit,
+            //     so reversed repayments are counted forever.
+            //   - Provider-level postings with no loan (e.g. tax-transfer destination
+            //     entries) are cash outflows, not collections.
+            // Mirrors getPortfolioLedgerMetrics, the dashboard's collections source.
+            loan: { is: { repaymentStatus: { not: 'REVERSED' } } },
         }
     };
     
