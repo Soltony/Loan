@@ -248,7 +248,9 @@ export type UserRole =
   | "Auditor"
   | "Loan Provider"
   | "Reconciliation"
-  | "Application Reviewer";
+  | "Application Reviewer"
+  | "Branch"
+  | "District";
 export type UserStatus = "Active" | "Inactive";
 
 export interface User {
@@ -262,6 +264,10 @@ export interface User {
   loanProviderId?: string | null;
   providerName?: string;
   permissions: Permissions;
+  // Branch scoping: `Branch` users have a single branchCode; `District` users
+  // manage several (matched against ProvisionedData -> Branchcode).
+  branchCode?: number | null;
+  managedBranchCodes?: number[] | null;
 }
 
 export type Permissions = {

@@ -1,28 +1,33 @@
 
 
 import { DashboardClient } from '@/components/admin/dashboard-client';
-import { getPortfolioLedgerMetrics } from '@/lib/dashboard-metrics';
+import { getPortfolioLedgerMetrics, getIncomeForLoanIds } from '@/lib/dashboard-metrics';
 import prisma from '@/lib/prisma';
 import type { LoanProvider, DashboardData } from '@/lib/types';
 import { getUserFromSession } from '@/lib/user';
+import { resolveBranchBorrowerIdsForUser, parseBranchCodeQueryParam } from '@/lib/branch-filter';
 import { startOfToday, endOfToday, subDays } from 'date-fns';
 
 export const dynamic = 'force-dynamic';
 
-async function getProviderData(providerId?: string): Promise<DashboardData> {
+// `borrowerIds` scopes the dashboard to a Branch/District user's borrowers.
+// `null`/`undefined` => unrestricted; `[]` => no borrowers in scope (all zeros).
+async function getProviderData(providerId?: string, borrowerIds?: string[] | null): Promise<DashboardData> {
     const today = new Date();
     const startOfTodayDate = startOfToday();
     const endOfTodayDate = endOfToday();
 
     const providerFilter = providerId ? { product: { providerId: providerId }} : {};
     const providerWhereClause = providerId ? { id: providerId } : {};
-    
-    // Base query for ledger entries
-    const ledgerEntryWhere = providerId ? { ledgerAccount: { providerId: providerId } } : {};
+    const borrowerFilter = borrowerIds ? { borrowerId: { in: borrowerIds } } : {};
+    // Combined loan-relation filter for queries that key off `loan` (payments).
+    const loanScopeFilter: any = { ...(providerId ? { product: { providerId } } : {}), ...borrowerFilter };
+    const hasLoanScope = providerId != null || borrowerIds != null;
 
-    const loans = await prisma.loan.findMany({ 
+    const loans = await prisma.loan.findMany({
         where: {
             ...providerFilter,
+            ...borrowerFilter,
             repaymentStatus: { not: 'REVERSED' },
         },
         select: {
@@ -42,7 +47,12 @@ async function getProviderData(providerId?: string): Promise<DashboardData> {
         }
     });
     
-    const usersCount = providerId 
+    const usersCount = borrowerIds
+        ? await prisma.loan.groupBy({
+            by: ['borrowerId'],
+            where: { ...providerFilter, ...borrowerFilter, repaymentStatus: { not: 'REVERSED' } },
+          }).then(results => results.length)
+        : providerId
         ? await prisma.loan.groupBy({
             by: ['borrowerId'],
                         where: { product: { providerId: providerId }, repaymentStatus: { not: 'REVERSED' } },
@@ -55,7 +65,7 @@ async function getProviderData(providerId?: string): Promise<DashboardData> {
     
     const totalStartingCapital = providersData.reduce((acc, p) => acc + p.startingCapital, 0);
 
-    const portfolioLedger = await getPortfolioLedgerMetrics(prisma, providerId);
+    const portfolioLedger = await getPortfolioLedgerMetrics(prisma, providerId, borrowerIds);
     const { totalDisbursed, receivables, collections } = portfolioLedger;
     // Capital remaining for disbursement is the live available balance, which is
     // decremented on every disbursement and incremented by revolving-fund
@@ -64,19 +74,25 @@ async function getProviderData(providerId?: string): Promise<DashboardData> {
     // original capital.
     const providerFund = providersData.reduce((acc, p) => acc + p.initialBalance, 0);
 
-    const allLedgerAccounts = await prisma.ledgerAccount.findMany({
-        where: providerId ? { providerId } : {},
-    });
-    const aggregateLedgerBalance = (type: string, category?: string) =>
-        allLedgerAccounts
-            .filter((acc) => acc.type === type && (category ? acc.category === category : true))
-            .reduce((sum, acc) => sum + acc.balance, 0);
-
-    const income = {
-        interest: aggregateLedgerBalance('Income', 'Interest'),
-        serviceFee: aggregateLedgerBalance('Income', 'ServiceFee'),
-        penalty: aggregateLedgerBalance('Income', 'Penalty'),
-    };
+    // Branch/District: income is scoped to the in-scope loans (entry-based).
+    // Otherwise income is the provider/portfolio account-balance aggregate.
+    let income: { interest: number; serviceFee: number; penalty: number };
+    if (borrowerIds) {
+        income = await getIncomeForLoanIds(prisma, loans.map((l) => l.id));
+    } else {
+        const allLedgerAccounts = await prisma.ledgerAccount.findMany({
+            where: providerId ? { providerId } : {},
+        });
+        const aggregateLedgerBalance = (type: string, category?: string) =>
+            allLedgerAccounts
+                .filter((acc) => acc.type === type && (category ? acc.category === category : true))
+                .reduce((sum, acc) => sum + acc.balance, 0);
+        income = {
+            interest: aggregateLedgerBalance('Income', 'Interest'),
+            serviceFee: aggregateLedgerBalance('Income', 'ServiceFee'),
+            penalty: aggregateLedgerBalance('Income', 'Penalty'),
+        };
+    }
     const totalLoans = loans.length;
     const paidLoans = loans.filter(l => l.repaymentStatus === 'Paid').length;
     const repaymentRate = totalLoans > 0 ? (paidLoans / totalLoans) * 100 : 0;
@@ -90,7 +106,8 @@ async function getProviderData(providerId?: string): Promise<DashboardData> {
                 lt: endOfTodayDate,
             },
             repaymentStatus: { not: 'REVERSED' },
-            ...(providerFilter && { product: providerFilter.product })
+            ...providerFilter,
+            ...borrowerFilter,
         },
     });
 
@@ -101,7 +118,7 @@ async function getProviderData(providerId?: string): Promise<DashboardData> {
                 gte: startOfTodayDate,
                 lt: endOfTodayDate,
             },
-             ...(providerFilter && { loan: providerFilter })
+             ...(hasLoanScope ? { loan: loanScopeFilter } : {})
         }
     });
 
@@ -117,7 +134,8 @@ async function getProviderData(providerId?: string): Promise<DashboardData> {
                         lt: nextDate,
                     },
                     repaymentStatus: { not: 'REVERSED' },
-                    ...(providerFilter && { product: providerFilter.product })
+                    ...providerFilter,
+                    ...borrowerFilter,
                 },
             });
             return {
@@ -139,6 +157,7 @@ async function getProviderData(providerId?: string): Promise<DashboardData> {
     const recentActivity = await prisma.loan.findMany({
         where: {
             ...providerFilter,
+            ...borrowerFilter,
             repaymentStatus: { not: 'REVERSED' },
         },
         take: 5,
@@ -179,9 +198,9 @@ async function getProviderData(providerId?: string): Promise<DashboardData> {
     });
 
     const productOverview = await Promise.all(allProducts.map(async p => {
-        const active = await prisma.loan.count({ where: { productId: p.id, repaymentStatus: 'Unpaid' } });
-        const defaulted = await prisma.loan.count({ where: { productId: p.id, repaymentStatus: 'Unpaid', dueDate: { lt: new Date() } } });
-        const total = await prisma.loan.count({ where: { productId: p.id, repaymentStatus: { not: 'REVERSED' } } });
+        const active = await prisma.loan.count({ where: { productId: p.id, repaymentStatus: 'Unpaid', ...borrowerFilter } });
+        const defaulted = await prisma.loan.count({ where: { productId: p.id, repaymentStatus: 'Unpaid', dueDate: { lt: new Date() }, ...borrowerFilter } });
+        const total = await prisma.loan.count({ where: { productId: p.id, repaymentStatus: { not: 'REVERSED' }, ...borrowerFilter } });
         return {
             name: p.name,
             provider: p.provider.name,
@@ -212,7 +231,7 @@ async function getProviderData(providerId?: string): Promise<DashboardData> {
     };
 }
 
-export async function getDashboardData(userId: string): Promise<{
+export async function getDashboardData(userId: string, requestedBranchCode?: number | null): Promise<{
     providers: LoanProvider[];
     overallData: DashboardData;
     providerSpecificData: Record<string, DashboardData>;
@@ -223,6 +242,8 @@ export async function getDashboardData(userId: string): Promise<{
             id: true,
             roleId: true,
             loanProviderId: true,
+            branchCode: true,
+            managedBranchCodes: true,
             role: {
                 select: {
                     id: true,
@@ -241,8 +262,24 @@ export async function getDashboardData(userId: string): Promise<{
         }
     });
 
-    const isSuperAdminOrAdmin = user?.role?.name === 'Super Admin' || user?.role?.name === 'Admin';
-    
+    const roleName = user?.role?.name;
+    const isSuperAdminOrAdmin = roleName === 'Super Admin' || roleName === 'Admin';
+
+    // Branch/District users see a single dashboard scoped to their branch
+    // borrowers (District optionally narrowed to one managed branch).
+    if (roleName === 'Branch' || roleName === 'District') {
+        const borrowerIds = await resolveBranchBorrowerIdsForUser(
+            {
+                role: roleName,
+                branchCode: user?.branchCode ?? null,
+                managedBranchCodes: user?.managedBranchCodes ?? null,
+            },
+            requestedBranchCode ?? null,
+        );
+        const overallData = await getProviderData(undefined, borrowerIds ?? []);
+        return { providers: [], overallData, providerSpecificData: {} };
+    }
+
     // For non-admins, get their specific provider or an empty array
     const providers = isSuperAdminOrAdmin
         ? await prisma.loanProvider.findMany({
@@ -279,16 +316,23 @@ export async function getDashboardData(userId: string): Promise<{
 }
 
 
-export default async function AdminDashboard() {
+export default async function AdminDashboard({
+    searchParams,
+}: {
+    searchParams?: Promise<{ branch?: string }>;
+}) {
     const user = await getUserFromSession();
     if (!user) {
         return <div>Not authenticated</div>;
     }
-    
-    const data = await getDashboardData(user.id);
+
+    const sp = (await searchParams) ?? {};
+    const requestedBranch = parseBranchCodeQueryParam(sp.branch);
+
+    const data = await getDashboardData(user.id, requestedBranch);
     if (!data) {
         return <div>Loading dashboard...</div>;
     }
-    
+
     return <DashboardClient dashboardData={data} />;
 }

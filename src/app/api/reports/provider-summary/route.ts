@@ -4,6 +4,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import prisma from '@/lib/prisma';
 import { startOfDay, endOfDay, startOfWeek, endOfWeek, startOfMonth, endOfMonth, startOfYear, endOfYear, subDays, differenceInDays, isValid } from 'date-fns';
 import { getUserFromSession } from '@/lib/user';
+import { resolveBranchBorrowerIdsForUser, parseBranchCodeQueryParam } from '@/lib/branch-filter';
 
 const getDates = (timeframe: string, from?: string, to?: string) => {
     if (from && to) {
@@ -48,7 +49,7 @@ const getDates = (timeframe: string, from?: string, to?: string) => {
     }
 }
 
-async function getAggregatedLedgerEntries(providerId: string, timeframe: string, from: string | null, to: string | null, entryType: 'Debit' | 'Credit', accountTypes: string[], categories: string[]) {
+async function getAggregatedLedgerEntries(providerId: string, timeframe: string, from: string | null, to: string | null, entryType: 'Debit' | 'Credit', accountTypes: string[], categories: string[], branchBorrowerIds?: string[] | null) {
      const dateRange = getDates(timeframe, from ?? undefined, to ?? undefined);
      const result = await prisma.ledgerEntry.groupBy({
         by: ['ledgerAccountId'],
@@ -57,6 +58,8 @@ async function getAggregatedLedgerEntries(providerId: string, timeframe: string,
                 providerId: providerId,
                 ...(dateRange.gte && { date: { gte: dateRange.gte } }),
                 ...(dateRange.lte && { date: { lte: dateRange.lte } }),
+                // Branch/District scope: only in-scope borrowers' loans.
+                ...(branchBorrowerIds ? { loan: { is: { borrowerId: { in: branchBorrowerIds } } } } : {}),
             },
             type: entryType,
             ledgerAccount: {
@@ -111,6 +114,11 @@ export async function GET(req: NextRequest) {
         return NextResponse.json({ error: 'Forbidden: You can only access reports for your own provider.' }, { status: 403 });
     }
 
+    // Branch/District users only see this provider's data for their branch borrowers.
+    const requestedBranchCode = parseBranchCodeQueryParam(searchParams.get('branchCode'));
+    const branchBorrowerIds = await resolveBranchBorrowerIdsForUser(user, requestedBranchCode);
+    const loanBranchFilter = branchBorrowerIds ? { borrowerId: { in: branchBorrowerIds } } : {};
+
     try {
         const dateRange = getDates(timeframe, from ?? undefined, to ?? undefined);
 
@@ -122,6 +130,7 @@ export async function GET(req: NextRequest) {
                 // Failed external disbursements can be reversed internally; those loans are marked REVERSED
                 // and should not count as disbursed in reports.
                 repaymentStatus: { not: 'REVERSED' },
+                ...loanBranchFilter,
                 ...(dateRange.gte && { disbursedDate: { gte: dateRange.gte } }),
                 ...(dateRange.lte && { disbursedDate: { lte: dateRange.lte } }),
             },
@@ -130,17 +139,18 @@ export async function GET(req: NextRequest) {
         const repaidResult = await prisma.payment.aggregate({
             _sum: { amount: true },
             where: {
-                loan: { product: { providerId } },
+                loan: { product: { providerId }, ...loanBranchFilter },
                 ...(dateRange.gte && { date: { gte: dateRange.gte } }),
                 ...(dateRange.lte && { date: { lte: dateRange.lte } }),
             },
         });
-        
+
         const outstandingLoans = await prisma.loan.aggregate({
             _sum: { loanAmount: true },
             where: {
                 product: { providerId },
-                repaymentStatus: 'Unpaid'
+                repaymentStatus: 'Unpaid',
+                ...loanBranchFilter,
             }
         });
         
@@ -151,12 +161,12 @@ export async function GET(req: NextRequest) {
         };
         
         // 2. Collections Report
-        const collections = await getAggregatedLedgerEntries(providerId, timeframe, from, to, 'Debit', ['Received'], ['Principal', 'Interest', 'ServiceFee', 'Penalty']);
+        const collections = await getAggregatedLedgerEntries(providerId, timeframe, from, to, 'Debit', ['Received'], ['Principal', 'Interest', 'ServiceFee', 'Penalty'], branchBorrowerIds);
         const totalCollected = Object.values(collections).reduce((sum, val) => sum + val, 0);
 
         // 3. Income Statement
-        const accruedIncome = await getAggregatedLedgerEntries(providerId, timeframe, from, to, 'Credit', ['Income'], ['Interest', 'ServiceFee', 'Penalty']);
-        const collectedIncome = await getAggregatedLedgerEntries(providerId, timeframe, from, to, 'Debit', ['Received'], ['Interest', 'ServiceFee', 'Penalty']);
+        const accruedIncome = await getAggregatedLedgerEntries(providerId, timeframe, from, to, 'Credit', ['Income'], ['Interest', 'ServiceFee', 'Penalty'], branchBorrowerIds);
+        const collectedIncome = await getAggregatedLedgerEntries(providerId, timeframe, from, to, 'Debit', ['Received'], ['Interest', 'ServiceFee', 'Penalty'], branchBorrowerIds);
         const netRealizedIncome = (collectedIncome.interest || 0) + (collectedIncome.servicefee || 0) + (collectedIncome.penalty || 0);
 
         // 4. Fund Utilization
@@ -167,6 +177,7 @@ export async function GET(req: NextRequest) {
                 where: {
                     product: { providerId },
                     repaymentStatus: { not: 'REVERSED' },
+                    ...loanBranchFilter,
                 },
             })
         )._sum.loanAmount || 0;
@@ -178,7 +189,8 @@ export async function GET(req: NextRequest) {
             where: {
                 product: { providerId },
                 repaymentStatus: 'Unpaid',
-                dueDate: { lt: today }
+                dueDate: { lt: today },
+                ...loanBranchFilter,
             },
             include: { 
                 borrower: { 

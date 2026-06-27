@@ -15,6 +15,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { SingleBranchPicker, MultiBranchPicker } from '@/components/user/branch-picker';
 import type { User, UserRole, UserStatus, Role, LoanProvider } from '@/lib/types';
 
 interface AddUserDialogProps {
@@ -36,6 +37,8 @@ export function AddUserDialog({ isOpen, onClose, onSave, user, roles, providers,
     role: 'Loan Provider' as UserRole,
     status: 'Active' as UserStatus,
     providerId: '' as string | null,
+    branchCode: null as number | null,
+    managedBranchCodes: [] as number[],
   });
 
   const [pwChecks, setPwChecks] = useState({
@@ -54,6 +57,7 @@ export function AddUserDialog({ isOpen, onClose, onSave, user, roles, providers,
 
   const [phoneTouched, setPhoneTouched] = useState(false);
   const [phoneError, setPhoneError] = useState<string | null>(null);
+  const [branchError, setBranchError] = useState<string | null>(null);
 
   const COMMON = new Set(['123456','123456789','qwerty','password','1234567','12345678','12345','111111','123123','password1','1234567890','1234','welcome','letmein','admin','iloveyou']);
 
@@ -76,6 +80,8 @@ export function AddUserDialog({ isOpen, onClose, onSave, user, roles, providers,
         role: user.role,
         status: user.status,
         providerId: user.providerId || null,
+        branchCode: user.branchCode ?? null,
+        managedBranchCodes: user.managedBranchCodes ?? [],
       });
     } else {
       setFormData({
@@ -86,12 +92,15 @@ export function AddUserDialog({ isOpen, onClose, onSave, user, roles, providers,
         role: defaultRole as UserRole,
         status: 'Active' as UserStatus,
         providerId: providers.length > 0 ? providers[0].id : null,
+        branchCode: null,
+        managedBranchCodes: [],
       });
     }
 
     // reset field-level validation UI on open/change
     setPhoneTouched(false);
     setPhoneError(null);
+    setBranchError(null);
   }, [user, isOpen, providers, roles]);
 
   // Validate password client-side and run debounced pwned-password check
@@ -232,17 +241,38 @@ export function AddUserDialog({ isOpen, onClose, onSave, user, roles, providers,
       delete submissionData.password;
     }
     setPwError(null);
-    
+
     // Ensure providerId is null if the role is not provider-specific
     if (submissionData.role !== 'Loan Provider' && submissionData.role !== 'Loan Manager') {
         submissionData.providerId = null;
     }
+
+    // Branch scoping: validate and normalize branch fields based on role.
+    if (submissionData.role === 'Branch') {
+      if (submissionData.branchCode == null) {
+        setBranchError('Please select a branch for this user.');
+        return;
+      }
+      submissionData.managedBranchCodes = null;
+    } else if (submissionData.role === 'District') {
+      if (!submissionData.managedBranchCodes || submissionData.managedBranchCodes.length === 0) {
+        setBranchError('Please select at least one branch for this district user.');
+        return;
+      }
+      submissionData.branchCode = null;
+    } else {
+      submissionData.branchCode = null;
+      submissionData.managedBranchCodes = null;
+    }
+    setBranchError(null);
 
     onSave(submissionData);
     onClose();
   };
   
   const isProviderRole = formData.role === 'Loan Provider' || formData.role === 'Loan Manager';
+  const isBranchRole = formData.role === 'Branch';
+  const isDistrictRole = formData.role === 'District';
 
   return (
     <Dialog open={isOpen} onOpenChange={onClose}>
@@ -369,6 +399,40 @@ export function AddUserDialog({ isOpen, onClose, onSave, user, roles, providers,
                     </SelectContent>
                 </Select>
              </div>
+          )}
+          {isBranchRole && (
+            <div className="grid grid-cols-4 items-center gap-4">
+              <Label className="text-right">Branch</Label>
+              <div className="col-span-3">
+                <SingleBranchPicker
+                  value={formData.branchCode}
+                  onChange={(code) => {
+                    setFormData((prev) => ({ ...prev, branchCode: code }));
+                    setBranchError(null);
+                  }}
+                />
+              </div>
+            </div>
+          )}
+          {isDistrictRole && (
+            <div className="grid grid-cols-4 items-center gap-4">
+              <Label className="text-right">Branches</Label>
+              <div className="col-span-3">
+                <MultiBranchPicker
+                  value={formData.managedBranchCodes}
+                  onChange={(codes) => {
+                    setFormData((prev) => ({ ...prev, managedBranchCodes: codes }));
+                    setBranchError(null);
+                  }}
+                />
+              </div>
+            </div>
+          )}
+          {branchError && (
+            <div className="grid grid-cols-4 items-center gap-4">
+              <div />
+              <div className="col-span-3 text-sm text-destructive">{branchError}</div>
+            </div>
           )}
           <div className="grid grid-cols-4 items-center gap-4">
             <Label htmlFor="status" className="text-right">

@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import prisma from '@/lib/prisma';
 import { differenceInDays } from 'date-fns';
 import { getUserFromSession } from '@/lib/user';
+import { applyUserBranchFilterToLoanWhere, parseBranchCodeQueryParam } from '@/lib/branch-filter';
 
 // Aging buckets
 const BUCKETS = [
@@ -38,11 +39,20 @@ export async function GET(req: NextRequest) {
   }
 
   // Get all active loans with overdue principal/interest
+  const whereClause: any = {
+    ...(providerId ? { providerId } : {}),
+    status: { not: 'CLOSED' },
+  };
+
+  // Branch/District users only see loans for their branch borrowers.
+  const requestedBranchCode = parseBranchCodeQueryParam(searchParams.get('branchCode'));
+  const inBranchScope = await applyUserBranchFilterToLoanWhere(whereClause, user, requestedBranchCode);
+  if (!inBranchScope) {
+    return NextResponse.json({ byBorrower: [], byProvider: [] });
+  }
+
   const loans = await prisma.loan.findMany({
-    where: {
-      ...(providerId ? { providerId } : {}),
-      status: { not: 'CLOSED' },
-    },
+    where: whereClause,
     include: {
       borrower: true,
       provider: true,

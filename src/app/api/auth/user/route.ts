@@ -4,6 +4,7 @@ import { getSession } from '@/lib/session';
 import prisma from '@/lib/prisma';
 import type { User as PrismaUser, Role as PrismaRole, LoanProvider as PrismaLoanProvider } from '@prisma/client';
 import type { User as AuthUser, Permissions } from '@/lib/types';
+import { parseManagedBranchCodes } from '@/lib/branch-filter';
 
 
 export async function GET(req: NextRequest) {
@@ -26,13 +27,16 @@ export async function GET(req: NextRequest) {
       return NextResponse.json({ error: 'User not found' }, { status: 404 });
     }
 
-    const { password, ...userWithoutPassword } = user;
-    
+    // Exclude the raw (string) managedBranchCodes from the spread so it does not
+    // clash with the parsed number[] shape on the AuthUser type.
+    const { password, managedBranchCodes: _rawManagedBranchCodes, ...userWithoutPassword } = user;
+
     const authUser: AuthUser = {
       ...userWithoutPassword,
       role: user.role.name as AuthUser['role'],
       providerName: user.loanProvider?.name,
       permissions: JSON.parse(user.role.permissions as string) as Permissions,
+      managedBranchCodes: parseManagedBranchCodes(user.managedBranchCodes),
     };
 
 

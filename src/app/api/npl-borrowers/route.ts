@@ -5,6 +5,7 @@ import { getSession } from '@/lib/session';
 import { getUserFromSession } from '@/lib/user';
 import { differenceInDays, startOfDay } from 'date-fns';
 import { calculateTotalRepayable } from '@/lib/loan-calculator';
+import { resolveBranchBorrowerIdsForUser, parseBranchCodeQueryParam } from '@/lib/branch-filter';
 
 export async function GET(req: NextRequest) {
     const session = await getSession();
@@ -23,13 +24,23 @@ export async function GET(req: NextRequest) {
     try {
         const today = startOfDay(new Date());
 
+        // Branch/District users only see NPL borrowers in their branch scope.
+        const requestedBranchCode = parseBranchCodeQueryParam(
+            new URL(req.url).searchParams.get('branchCode'),
+        );
+        const branchBorrowerIds = await resolveBranchBorrowerIdsForUser(user, requestedBranchCode);
+        if (branchBorrowerIds !== null && branchBorrowerIds.length === 0) {
+            return NextResponse.json([]);
+        }
+
         // Step 1: Find all unpaid loans for borrowers with NPL status
         const nplLoans = await prisma.loan.findMany({
             where: {
                 borrower: {
                     status: 'NPL'
                 },
-                repaymentStatus: 'Unpaid'
+                repaymentStatus: 'Unpaid',
+                ...(branchBorrowerIds ? { borrowerId: { in: branchBorrowerIds } } : {}),
             },
             select: {
                 id: true,

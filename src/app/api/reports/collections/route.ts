@@ -4,6 +4,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import prisma from '@/lib/prisma';
 import { startOfDay, endOfDay, startOfWeek, endOfWeek, startOfMonth, endOfMonth, startOfYear, endOfYear, format, isValid } from 'date-fns';
 import { getUserFromSession } from '@/lib/user';
+import { resolveBranchBorrowerIdsForUser, parseBranchCodeQueryParam } from '@/lib/branch-filter';
 
 const getDates = (timeframe: string, from?: string, to?: string) => {
     if (from && to) {
@@ -110,6 +111,16 @@ export async function GET(req: NextRequest) {
     
     if (providerId === 'none') {
         return NextResponse.json({ data: [], total: 0, page: 1, pageSize, totalPages: 0 });
+    }
+
+    // Branch/District users only see collections from their branch borrowers.
+    const requestedBranchCode = parseBranchCodeQueryParam(searchParams.get('branchCode'));
+    const branchBorrowerIds = await resolveBranchBorrowerIdsForUser(user, requestedBranchCode);
+    if (branchBorrowerIds !== null && branchBorrowerIds.length === 0) {
+        return NextResponse.json({ data: [], total: 0, page: 1, pageSize, totalPages: 0 });
+    }
+    if (branchBorrowerIds) {
+        whereClause.journalEntry.loan.is.borrowerId = { in: branchBorrowerIds };
     }
 
     try {

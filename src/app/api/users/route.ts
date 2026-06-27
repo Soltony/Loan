@@ -10,6 +10,7 @@ import { isBlocked, recordFailedAttempt, resetAttempts, getRemainingAttempts, ge
 import { createAuditLog } from '@/lib/audit-log';
 import { getUserFromSession } from '@/lib/user';
 import { revokeAllUserSessions } from '@/lib/session';
+import { parseManagedBranchCodes } from '@/lib/branch-filter';
 
 const userSchema = z.object({
   fullName: z.string().min(1, 'Full name is required'),
@@ -20,7 +21,28 @@ const userSchema = z.object({
   role: z.string(), // Role name, will be connected by ID
   providerId: z.string().nullable().optional(),
   status: z.enum(['Active', 'Inactive']),
+  // Branch scoping: `Branch` users get a single branchCode; `District` users
+  // get a list of managedBranchCodes (stored as a JSON string).
+  branchCode: z.number().int().positive().nullable().optional(),
+  managedBranchCodes: z.array(z.number().int().positive()).nullable().optional(),
 });
+
+// Map role-relevant branch fields to the persisted shape. `District` stores the
+// list as a JSON string; everyone except `Branch`/`District` clears both.
+function resolveBranchFields(
+  roleName: string,
+  branchCode: number | null | undefined,
+  managedBranchCodes: number[] | null | undefined,
+): { branchCode: number | null; managedBranchCodes: string | null } {
+  if (roleName === 'Branch') {
+    return { branchCode: branchCode ?? null, managedBranchCodes: null };
+  }
+  if (roleName === 'District') {
+    const codes = Array.isArray(managedBranchCodes) ? managedBranchCodes : [];
+    return { branchCode: null, managedBranchCodes: codes.length ? JSON.stringify(codes) : null };
+  }
+  return { branchCode: null, managedBranchCodes: null };
+}
 
 export async function GET() {
     const user = await getUserFromSession();
@@ -59,6 +81,8 @@ export async function GET() {
       providerName: user.loanProvider?.name || 'N/A',
       providerId: user.loanProvider?.id,
       status: user.status,
+      branchCode: user.branchCode ?? null,
+      managedBranchCodes: parseManagedBranchCodes(user.managedBranchCodes),
     }));
 
     return NextResponse.json(formattedUsers);
@@ -88,7 +112,7 @@ export async function POST(req: NextRequest) {
   try {
 
     const body = await req.json();
-    const { password, role: roleName, providerId, ...userData } = userSchema.parse(body);
+    const { password, role: roleName, providerId, branchCode, managedBranchCodes, ...userData } = userSchema.parse(body);
     // Validate password with the stronger shared password rules (includes breach check)
     try {
       // Use the exported `passwordSchema` which includes the async HaveIBeenPwned check.
@@ -142,8 +166,9 @@ export async function POST(req: NextRequest) {
         password: hashedPassword,
         passwordChangeRequired: true, // Force password change on first login
         roleId: role.id,
+        ...resolveBranchFields(role.name, branchCode, managedBranchCodes),
     };
-    
+
     // Only assign providerId if the creator is allowed to and the role requires it
     if (user.role === 'Super Admin' || (user.loanProviderId && providerId === user.loanProviderId)) {
        if (providerId) {
@@ -210,7 +235,7 @@ export async function PUT(req: NextRequest) {
   try {
 
     const body = await req.json();
-    const { id, role: roleName, providerId, password, ...userData } = body;
+    const { id, role: roleName, providerId, password, branchCode, managedBranchCodes, ...userData } = body;
 
     if (!id) {
         throw new Error('User ID is required for an update.');
@@ -255,6 +280,12 @@ export async function PUT(req: NextRequest) {
 
     dataToUpdate.roleId = role.id;
     roleChanged = role.id !== existingUser.roleId;
+
+    // A full edit (role provided) re-derives branch scoping; a partial update
+    // such as a status toggle leaves the stored branch fields untouched.
+    const branchFields = resolveBranchFields(role.name, branchCode, managedBranchCodes);
+    dataToUpdate.branchCode = branchFields.branchCode;
+    dataToUpdate.managedBranchCodes = branchFields.managedBranchCodes;
     }
     
     if (password) {

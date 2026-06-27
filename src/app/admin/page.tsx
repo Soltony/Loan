@@ -4,10 +4,15 @@ import { getUserFromSession } from '@/lib/user';
 import { getDashboardData } from './dashboard/page';
 import { redirect } from 'next/navigation';
 import { allMenuItems } from '@/lib/menu-items';
+import { parseBranchCodeQueryParam } from '@/lib/branch-filter';
 
 export const dynamic = 'force-dynamic';
 
-export default async function AdminRootPage() {
+export default async function AdminRootPage({
+    searchParams,
+}: {
+    searchParams?: Promise<{ branch?: string }>;
+}) {
     const user = await getUserFromSession();
     if (!user) {
         // This should be handled by middleware, but as a fallback
@@ -38,7 +43,9 @@ export default async function AdminRootPage() {
     }
     
     // Original logic for users who have dashboard access
-    const data = await getDashboardData(user.id);
+    const sp = (await searchParams) ?? {};
+    const requestedBranch = parseBranchCodeQueryParam(sp.branch);
+    const data = await getDashboardData(user.id, requestedBranch);
 
     if (!data || !data.overallData) {
         return <div>Loading dashboard...</div>;

@@ -4,6 +4,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import prisma from '@/lib/prisma';
 import { startOfDay, endOfDay, startOfWeek, endOfWeek, startOfMonth, endOfMonth, startOfYear, endOfYear, isValid } from 'date-fns';
 import { getUserFromSession } from '@/lib/user';
+import { resolveBranchBorrowerIdsForUser, parseBranchCodeQueryParam } from '@/lib/branch-filter';
 
 const getDates = (timeframe: string, from?: string, to?: string) => {
     if (from && to) {
@@ -48,11 +49,13 @@ const getDates = (timeframe: string, from?: string, to?: string) => {
     }
 };
 
-async function getIncomeData(providerIdFilter: any, dateFilter: any) {
+async function getIncomeData(providerIdFilter: any, dateFilter: any, branchBorrowerIds?: string[] | null) {
     const whereClause: any = {
         journalEntry: {
             ...providerIdFilter.journalEntry,
             ...dateFilter.journalEntry,
+            // Branch/District scope: only income from in-scope borrowers' loans.
+            ...(branchBorrowerIds ? { loan: { is: { borrowerId: { in: branchBorrowerIds } } } } : {}),
         },
         ledgerAccount: {
             type: { in: ['Income', 'Received'] },
@@ -119,6 +122,13 @@ export async function GET(req: NextRequest) {
 
     const isSuperAdminOrRecon = user.role === 'Super Admin' || user.role === 'Reconciliation';
 
+    // Branch/District users only see income from their branch borrowers.
+    const requestedBranchCode = parseBranchCodeQueryParam(searchParams.get('branchCode'));
+    const branchBorrowerIds = await resolveBranchBorrowerIdsForUser(user, requestedBranchCode);
+    if (branchBorrowerIds !== null && branchBorrowerIds.length === 0) {
+        return NextResponse.json([]);
+    }
+
     try {
         let providersToQuery;
         // Users with loanProviderId are restricted to their own provider
@@ -143,7 +153,7 @@ export async function GET(req: NextRequest) {
                 }
             };
             
-            const income = await getIncomeData(providerIdFilter, dateFilter);
+            const income = await getIncomeData(providerIdFilter, dateFilter, branchBorrowerIds);
             reportData.push({
                 provider: provider.name,
                 ...income

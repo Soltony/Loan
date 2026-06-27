@@ -33,6 +33,7 @@ import { Badge } from "../ui/badge";
 import { cn } from "@/lib/utils";
 import { format } from "date-fns";
 import { useAuth } from "@/hooks/use-auth";
+import { branchLabel } from "@/lib/branches";
 import { Card, CardContent, CardHeader, CardTitle } from "../ui/card";
 import { Popover, PopoverContent, PopoverTrigger } from "../ui/popover";
 import { Calendar } from "../ui/calendar";
@@ -73,6 +74,8 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
   const [timeframe, setTimeframe] = useState("overall");
   const [dateRange, setDateRange] = useState<DateRange | undefined>();
   const [providerId, setProviderId] = useState<string | null>(null);
+  // District users can narrow all report tabs to one of their managed branches.
+  const [selectedBranch, setSelectedBranch] = useState("all");
   const [isLoading, setIsLoading] = useState(true);
   const [activeTab, setActiveTab] = useState("providerReport");
   
@@ -110,6 +113,9 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
   const isSuperAdminOrRecon =
     currentUser?.role === "Super Admin" ||
     currentUser?.role === "Reconciliation";
+
+  const isDistrictUser = currentUser?.role === "District";
+  const managedBranchCodes = currentUser?.managedBranchCodes ?? [];
 
   // Check if user can view all providers (either super admin/recon OR has reports permission with multiple providers)
   // Users with a loanProviderId are bound to a specific provider and should only see that provider's reports
@@ -274,8 +280,11 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
     if (search) {
       params.set("search", search);
     }
+    if (selectedBranch && selectedBranch !== "all") {
+      params.set("branchCode", selectedBranch);
+    }
     return `${baseUrl}?${params.toString()}`;
-  }, []);
+  }, [selectedBranch]);
 
   // Individual fetch functions for each report type
   const fetchLoansData = useCallback(async (page: number = 1, pageSize: number = DEFAULT_PAGE_SIZE) => {
@@ -448,6 +457,9 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
           if (currentSearch) {
             params.set("search", currentSearch);
           }
+          if (selectedBranch && selectedBranch !== "all") {
+            params.set("branchCode", selectedBranch);
+          }
           return `${baseUrl}?${params.toString()}`;
         };
 
@@ -599,7 +611,7 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
         setIsLoading(false);
       }
     },
-    [toast, providers, canViewAllProviders]
+    [toast, providers, canViewAllProviders, selectedBranch]
   );
 
   // Effect to set the initial providerId and fetch data ONCE
@@ -1399,6 +1411,21 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
                 {providers.map((p) => (
                   <SelectItem key={p.id} value={p.id}>
                     {p.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          )}
+          {isDistrictUser && (
+            <Select value={selectedBranch} onValueChange={setSelectedBranch}>
+              <SelectTrigger className="w-[240px]">
+                <SelectValue placeholder="All Branches" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">All Branches</SelectItem>
+                {managedBranchCodes.map((code: number) => (
+                  <SelectItem key={code} value={String(code)}>
+                    {branchLabel(code)}
                   </SelectItem>
                 ))}
               </SelectContent>

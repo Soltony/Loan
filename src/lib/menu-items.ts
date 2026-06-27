@@ -24,13 +24,13 @@ export const allMenuItems = [
     path: '/admin',
     label: 'Dashboard',
     icon: LayoutDashboard,
-    roles: ['Super Admin', 'Loan Manager', 'Auditor', 'Loan Provider'],
+    roles: ['Super Admin', 'Loan Manager', 'Auditor', 'Loan Provider', 'Branch', 'District'],
   },
   {
     path: '/admin/reports',
     label: 'Reports',
     icon: FileText,
-    roles: ['Super Admin', 'Loan Manager', 'Auditor', 'Loan Provider', 'Reconciliation'],
+    roles: ['Super Admin', 'Loan Manager', 'Auditor', 'Loan Provider', 'Reconciliation', 'Branch', 'District'],
   },
    {
     path: '/admin/approvals',
@@ -66,7 +66,7 @@ export const allMenuItems = [
     path: '/admin/npl',
     label: 'NPL',
     icon: BadgeAlert,
-    roles: ['Super Admin', 'Loan Manager', 'Auditor'],
+    roles: ['Super Admin', 'Loan Manager', 'Auditor', 'Branch', 'District'],
   },
   {
     path: '/admin/npl-collection',

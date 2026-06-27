@@ -26,6 +26,9 @@ function categoryKey(category: string): keyof CategoryAmounts {
 export async function getPortfolioLedgerMetrics(
   prisma: PrismaClient,
   providerId?: string,
+  // When provided, scope all metrics to these borrowers (Branch/District users).
+  // An empty array means "no borrowers in scope" and yields all-zero metrics.
+  borrowerIds?: string[] | null,
 ): Promise<{
   totalDisbursed: number;
   receivables: {
@@ -47,6 +50,7 @@ export async function getPortfolioLedgerMetrics(
     where: {
       repaymentStatus: { not: 'REVERSED' },
       ...(providerId ? { product: { providerId } } : {}),
+      ...(borrowerIds ? { borrowerId: { in: borrowerIds } } : {}),
     },
     select: { id: true, loanAmount: true },
   });
@@ -170,4 +174,50 @@ export async function getPortfolioLedgerMetrics(
       tax: receivedNet.tax + transferredTax,
     },
   };
+}
+
+/**
+ * Accrued income (Interest / ServiceFee / Penalty) attributable to a set of
+ * loans, summed from `Income`-type ledger entries — the loan-scoped equivalent
+ * of the dashboard's account-balance income card. Used for Branch/District
+ * dashboards. Empty `loanIds` returns zeros.
+ */
+export async function getIncomeForLoanIds(
+  prisma: PrismaClient,
+  loanIds: string[],
+): Promise<{ interest: number; serviceFee: number; penalty: number }> {
+  const zero = { interest: 0, serviceFee: 0, penalty: 0 };
+  if (loanIds.length === 0) return zero;
+
+  const accounts = await prisma.ledgerAccount.findMany({
+    where: { type: 'Income', category: { in: ['Interest', 'ServiceFee', 'Penalty'] } },
+    select: { id: true, category: true },
+  });
+  if (accounts.length === 0) return zero;
+
+  const categoryByAccount = new Map(accounts.map((a) => [a.id, a.category]));
+  const accountIds = accounts.map((a) => a.id);
+  const sums = { interest: 0, serviceFee: 0, penalty: 0 };
+
+  const LOAN_ID_BATCH = 500;
+  for (let i = 0; i < loanIds.length; i += LOAN_ID_BATCH) {
+    const batch = loanIds.slice(i, i + LOAN_ID_BATCH);
+    const grouped = await prisma.ledgerEntry.groupBy({
+      by: ['ledgerAccountId'],
+      where: {
+        ledgerAccountId: { in: accountIds },
+        journalEntry: { loanId: { in: batch } },
+      },
+      _sum: { amount: true },
+    });
+    for (const g of grouped) {
+      const category = categoryByAccount.get(g.ledgerAccountId);
+      const amount = g._sum.amount || 0;
+      if (category === 'Interest') sums.interest += amount;
+      else if (category === 'ServiceFee') sums.serviceFee += amount;
+      else if (category === 'Penalty') sums.penalty += amount;
+    }
+  }
+
+  return sums;
 }

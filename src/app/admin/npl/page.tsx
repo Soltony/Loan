@@ -13,6 +13,8 @@ import { Loader2, RefreshCw, Download, Search, ChevronLeft, ChevronRight, Chevro
 import { useToast } from '@/hooks/use-toast';
 import { updateNplStatus } from '@/actions/npl';
 import { usePermissions } from '@/hooks/use-permissions';
+import { useAuth } from '@/hooks/use-auth';
+import { branchLabel } from '@/lib/branches';
 import { cn } from '@/lib/utils';
 import { format } from 'date-fns';
 import * as ExcelJS from 'exceljs';
@@ -50,7 +52,11 @@ export default function NplManagementPage() {
     useRequirePermission('npl');
     const { canModule } = usePermissions();
     const canRunNplUpdate = canModule('npl', 'update');
-    
+    const { currentUser } = useAuth();
+    const isDistrictUser = currentUser?.role === 'District';
+    const managedBranchCodes = currentUser?.managedBranchCodes ?? [];
+    const [branchFilter, setBranchFilter] = useState('all');
+
     const [entries, setEntries] = useState<NplEntry[]>([]);
     const [providers, setProviders] = useState<Provider[]>([]);
     const [isLoading, setIsLoading] = useState(true);
@@ -73,7 +79,10 @@ export default function NplManagementPage() {
     const fetchBorrowers = async () => {
         setIsLoading(true);
         try {
-            const response = await fetch('/api/npl-borrowers');
+            const nplUrl = branchFilter !== 'all'
+                ? `/api/npl-borrowers?branchCode=${encodeURIComponent(branchFilter)}`
+                : '/api/npl-borrowers';
+            const response = await fetch(nplUrl);
             if (!response.ok) throw new Error('Failed to fetch NPL borrowers');
             const data = await response.json();
             setEntries(data);
@@ -97,7 +106,9 @@ export default function NplManagementPage() {
 
     useEffect(() => {
         fetchBorrowers();
-    }, []);
+        // Re-fetch when a District user switches the branch filter.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [branchFilter]);
 
     const handleRunNplUpdate = async () => {
         if (!canRunNplUpdate) {
@@ -299,6 +310,19 @@ export default function NplManagementPage() {
                             ))}
                         </SelectContent>
                     </Select>
+                    {isDistrictUser && (
+                        <Select value={branchFilter} onValueChange={setBranchFilter}>
+                            <SelectTrigger className="w-[240px]">
+                                <SelectValue placeholder="All Branches" />
+                            </SelectTrigger>
+                            <SelectContent>
+                                <SelectItem value="all">All Branches</SelectItem>
+                                {managedBranchCodes.map((code: number) => (
+                                    <SelectItem key={code} value={String(code)}>{branchLabel(code)}</SelectItem>
+                                ))}
+                            </SelectContent>
+                        </Select>
+                    )}
                     <div className="flex items-center gap-2">
                         <Input
                             placeholder="Min Days Overdue"

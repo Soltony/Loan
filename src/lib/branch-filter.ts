@@ -3,7 +3,8 @@ import prisma from './prisma';
 export type BranchScopedUser = {
   role?: string;
   branchCode?: number | null;
-  managedBranchCodes?: number[] | null;
+  // May arrive already parsed (number[]) or as the raw DB JSON string.
+  managedBranchCodes?: number[] | string | null;
 };
 
 export function parseManagedBranchCodes(raw: string | null | undefined): number[] | null {
@@ -20,12 +21,28 @@ export function parseManagedBranchCodes(raw: string | null | undefined): number[
   }
 }
 
-export function getBranchCodesFromUser(user: BranchScopedUser): number[] | null {
-  if (user.role === 'Branch' && user.branchCode != null) {
-    return [user.branchCode];
+function normalizeManagedBranchCodes(
+  value: number[] | string | null | undefined,
+): number[] {
+  if (Array.isArray(value)) {
+    return value.filter((n) => Number.isFinite(n) && n > 0);
   }
-  if (user.role === 'District' && user.managedBranchCodes?.length) {
-    return user.managedBranchCodes;
+  return parseManagedBranchCodes(value) ?? [];
+}
+
+/**
+ * Branch codes a user is scoped to.
+ *  - `Branch`/`District` => the codes they are allowed to see. A branch-scoped
+ *    user with no codes assigned resolves to `[]` (sees NOTHING) — never `null`
+ *    (which would mean "no restriction").
+ *  - any other role => `null` (unrestricted).
+ */
+export function getBranchCodesFromUser(user: BranchScopedUser): number[] | null {
+  if (user.role === 'Branch') {
+    return user.branchCode != null ? [user.branchCode] : [];
+  }
+  if (user.role === 'District') {
+    return normalizeManagedBranchCodes(user.managedBranchCodes);
   }
   return null;
 }

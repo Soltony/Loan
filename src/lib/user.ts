@@ -6,6 +6,7 @@ import { getSession, deleteSession } from './session';
 import prisma from './prisma';
 import type { User as AuthUser, Permissions } from '@/lib/types';
 import { Prisma } from '@prisma/client';
+import { parseManagedBranchCodes } from './branch-filter';
 
 export async function getUserFromSession(options?: { allowRefresh?: boolean }): Promise<AuthUser | null> {
   try {
@@ -50,6 +51,7 @@ export async function getUserFromSession(options?: { allowRefresh?: boolean }): 
       role: user.role.name as AuthUser['role'],
       providerName: user.loanProvider?.name,
       permissions: JSON.parse(user.role.permissions as string) as Permissions,
+      managedBranchCodes: parseManagedBranchCodes(user.managedBranchCodes),
       passwordChangeRequired: user.passwordChangeRequired,
     };
 
@@ -75,6 +77,7 @@ export async function getUserFromSession(options?: { allowRefresh?: boolean }): 
           role: user.role.name as AuthUser['role'],
           providerName: user.loanProvider?.name,
           permissions: JSON.parse(user.role.permissions as string) as Permissions,
+          managedBranchCodes: parseManagedBranchCodes(user.managedBranchCodes),
           passwordChangeRequired: user.passwordChangeRequired,
         };
         return authUser;

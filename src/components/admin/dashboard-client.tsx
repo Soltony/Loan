@@ -1,8 +1,8 @@
 
 'use client';
 
-import React, { useMemo, useEffect, useState } from 'react';
-import { useRouter } from 'next/navigation';
+import React, { useMemo } from 'react';
+import { useRouter, useSearchParams } from 'next/navigation';
 import {
   Card,
   CardContent,
@@ -39,6 +39,9 @@ import {
 import type { LoanProvider, DashboardData } from '@/lib/types';
 import { FileCheck2, Wallet, TrendingUp, DollarSign, Receipt, Banknote, AlertCircle, TrendingDown, Users, Landmark, ArrowUpNarrowWide, ArrowDownWideNarrow } from 'lucide-react';
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '../ui/tabs';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../ui/select';
+import { branchLabel } from '@/lib/branches';
+import { cn } from '@/lib/utils';
 // ...existing code...
 
 interface LedgerData {
@@ -74,7 +77,7 @@ const LedgerDetailRow = ({ title, value }: { title: string; value: number }) => 
     </div>
 );
 
-const DashboardView = ({ data, color }: { data: DashboardData, color: string }) => {
+const DashboardView = ({ data, color, hideFunds = false }: { data: DashboardData, color: string, hideFunds?: boolean }) => {
     const {
         totalLoans,
         totalDisbursed,
@@ -118,7 +121,10 @@ const DashboardView = ({ data, color }: { data: DashboardData, color: string }) 
 
     return (
       <div className="space-y-4">
-        <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+        <div className={cn('grid gap-4', hideFunds ? 'md:grid-cols-1' : 'md:grid-cols-2 lg:grid-cols-3')}>
+             {/* Initial Fund and Provider Fund (Live) are bank-wide capital figures
+                 and are hidden from Branch/District users. */}
+             {!hideFunds && (
              <Card>
                 <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
                     <CardTitle className="text-sm font-medium">Initial Fund</CardTitle>
@@ -129,6 +135,8 @@ const DashboardView = ({ data, color }: { data: DashboardData, color: string }) 
                     <p className="text-xs text-muted-foreground">Total starting capital</p>
                 </CardContent>
             </Card>
+             )}
+             {!hideFunds && (
              <Card>
                 <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
                     <CardTitle className="text-sm font-medium">Provider Fund (Live)</CardTitle>
@@ -139,6 +147,7 @@ const DashboardView = ({ data, color }: { data: DashboardData, color: string }) 
                     <p className="text-xs text-muted-foreground">Capital remaining for disbursement</p>
                 </CardContent>
             </Card>
+             )}
             <Card>
                 <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
                     <CardTitle className="text-sm font-medium">Total Disbursed</CardTitle>
@@ -325,13 +334,50 @@ const DashboardView = ({ data, color }: { data: DashboardData, color: string }) 
 
 export function DashboardClient({ dashboardData: initialDashboardData }: DashboardClientProps) {
   const { currentUser } = useAuth();
-  const [dashboardData, setDashboardData] = useState(initialDashboardData);
-  // SignalR logic removed; dashboard updates will not be received in real-time
+  const router = useRouter();
+  const searchParams = useSearchParams();
 
-  const { providers, overallData, providerSpecificData } = dashboardData;
+  // Use prop directly so Server Component re-renders (on URL change) are reflected immediately.
+  const { providers, overallData, providerSpecificData } = initialDashboardData;
 
   const isSuperAdmin = currentUser?.role === 'Super Admin' || currentUser?.role === 'Admin';
-  
+  const isBranchUser = currentUser?.role === 'Branch';
+  const isDistrictUser = currentUser?.role === 'District';
+  const isBranchScoped = isBranchUser || isDistrictUser;
+
+  const managedBranchCodes = currentUser?.managedBranchCodes ?? [];
+  const selectedBranch = searchParams?.get('branch') ?? 'all';
+
+  const handleBranchChange = (value: string) => {
+    const params = new URLSearchParams(Array.from(searchParams?.entries() ?? []));
+    if (value === 'all') {
+      params.delete('branch');
+    } else {
+      params.set('branch', value);
+    }
+    const qs = params.toString();
+    router.push(qs ? `/admin?${qs}` : '/admin');
+  };
+
+  const districtFilter = isDistrictUser ? (
+    <div className="flex items-center gap-2">
+      <span className="text-sm text-muted-foreground">Branch:</span>
+      <Select value={selectedBranch} onValueChange={handleBranchChange}>
+        <SelectTrigger className="w-[260px]">
+          <SelectValue placeholder="All branches" />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="all">All branches</SelectItem>
+          {managedBranchCodes.map((code: number) => (
+            <SelectItem key={code} value={String(code)}>
+              {branchLabel(code)}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+    </div>
+  ) : null;
+
   const themeColor = React.useMemo(() => {
     if (isSuperAdmin) {
         return providers.find(p => p.name === 'NIb Bank')?.colorHex || '#fdb913';
@@ -352,8 +398,11 @@ export function DashboardClient({ dashboardData: initialDashboardData }: Dashboa
     const providerData = overallData;
     return (
       <div className="flex-1 space-y-4 p-8 pt-6">
-          <h2 className="text-3xl font-bold tracking-tight">Dashboard</h2>
-          <DashboardView data={providerData} color={themeColor} />
+          <div className="flex items-center justify-between gap-4">
+            <h2 className="text-3xl font-bold tracking-tight">Dashboard</h2>
+            {districtFilter}
+          </div>
+          <DashboardView data={providerData} color={themeColor} hideFunds={isBranchScoped} />
       </div>
     );
   }

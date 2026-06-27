@@ -5,6 +5,7 @@ import { startOfDay, endOfDay, startOfWeek, endOfWeek, startOfMonth, endOfMonth,
 import { calculateTotalRepayable } from '@/lib/loan-calculator';
 import type { Loan, LoanProduct, Payment, ProvisionedData } from '@prisma/client';
 import { getUserFromSession } from '@/lib/user';
+import { applyUserBranchFilterToLoanWhere, parseBranchCodeQueryParam } from '@/lib/branch-filter';
 
 const getDates = (timeframe: string, from?: string, to?: string) => {
     if (from && to) {
@@ -153,6 +154,13 @@ export async function GET(req: NextRequest) {
         }
         
         whereClause.borrowerId = { in: matchingBorrowerIds };
+    }
+
+    // Branch/District users only see loans for their branch borrowers.
+    const requestedBranchCode = parseBranchCodeQueryParam(searchParams.get('branchCode'));
+    const inBranchScope = await applyUserBranchFilterToLoanWhere(whereClause, user, requestedBranchCode);
+    if (!inBranchScope) {
+        return NextResponse.json({ data: [], total: 0, page: 1, pageSize, totalPages: 0 });
     }
 
     try {
