@@ -10,6 +10,7 @@ import sendSms from '@/lib/sms';
 import { MiniAppAuthError, requireMiniAppAuthContext } from '@/lib/miniapp-auth';
 import { getAsOfDate } from '@/lib/date-utils';
 import { ensureInstallmentRollover } from '@/lib/installment-rollover';
+import { syncCbsDeletionForBorrower } from '@/actions/cbs-npl';
 
 const paymentSchema = z.object({
     loanId: z.string(),
@@ -287,6 +288,10 @@ export async function POST(req: NextRequest) {
                 return { paymentRec };
             });
 
+            // If this repayment cleared the borrower's last unpaid loan, remove
+            // their account from CBS NPL monitoring (best-effort, non-blocking).
+            void syncCbsDeletionForBorrower(loan.borrowerId, { source: 'MANUAL' });
+
             return NextResponse.json(result, { status: 200 });
         }
 
@@ -459,6 +464,10 @@ export async function POST(req: NextRequest) {
 
             return finalLoan;
         });
+
+        // If this repayment cleared the borrower's last unpaid loan, remove
+        // their account from CBS NPL monitoring (best-effort, non-blocking).
+        void syncCbsDeletionForBorrower(loan.borrowerId, { source: 'MANUAL' });
 
         return NextResponse.json(updatedLoan, { status: 200 });
 

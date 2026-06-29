@@ -48,6 +48,16 @@ export interface CbsRepayResponse {
   providerId: string | null;
 }
 
+export interface CbsDeleteResponse {
+  // CBS may echo back a status/message; shape is intentionally loose since the
+  // delete endpoint contract only specifies the account number in the path.
+  status?: string;
+  message?: string;
+  status_code?: number;
+  deletedCount?: number;
+  [key: string]: unknown;
+}
+
 export interface CbsCallResult<T> {
   ok: boolean;
   status: number;

@@ -232,28 +232,44 @@ export async function GET(req: NextRequest) {
         };
         let providerTotalOverdue = 0;
 
+        // SQL Server caps ~2100 parameters per query; batch IDs to stay under it.
+        // Providers with thousands of overdue loans (e.g. NIB BANK) would otherwise
+        // blow past the limit and the whole report would 500.
+        const ID_BATCH = 500;
+
         // Preload phoneAccount active mappings for borrowers to avoid N+1
         const borrowerIds = Array.from(new Set(overdueLoans.map(l => l.borrowerId)));
-        const phoneAccounts = borrowerIds.length > 0 ? await prisma.phoneAccount.findMany({ where: { phoneNumber: { in: borrowerIds }, isActive: true } }) : [];
+        const phoneAccounts: { phoneNumber: string; accountNumber: string }[] = [];
+        for (let i = 0; i < borrowerIds.length; i += ID_BATCH) {
+            const batch = borrowerIds.slice(i, i + ID_BATCH);
+            phoneAccounts.push(...await prisma.phoneAccount.findMany({
+                where: { phoneNumber: { in: batch }, isActive: true },
+                select: { phoneNumber: true, accountNumber: true },
+            }));
+        }
         const phoneMap = new Map(phoneAccounts.map(p => [p.phoneNumber, p.accountNumber]));
 
         // Preload ledger entries for all overdue loans to avoid N+1
         const overdueLoanIds = overdueLoans.map(l => l.id);
-        const allLedgerEntries = overdueLoanIds.length > 0 ? await prisma.ledgerEntry.findMany({
-            where: { 
-                journalEntry: { 
-                    loanId: { in: overdueLoanIds } 
-                } 
-            },
-            include: { 
-                ledgerAccount: {
-                    select: { category: true }
+        const allLedgerEntries: any[] = [];
+        for (let i = 0; i < overdueLoanIds.length; i += ID_BATCH) {
+            const batch = overdueLoanIds.slice(i, i + ID_BATCH);
+            allLedgerEntries.push(...await prisma.ledgerEntry.findMany({
+                where: {
+                    journalEntry: {
+                        loanId: { in: batch }
+                    }
                 },
-                journalEntry: { 
-                    select: { loanId: true } 
+                include: {
+                    ledgerAccount: {
+                        select: { category: true }
+                    },
+                    journalEntry: {
+                        select: { loanId: true }
+                    }
                 }
-            }
-        }) : [];
+            }));
+        }
 
         // Group ledger entries by loanId for fast lookup
         const ledgerMap = new Map<string, any[]>();

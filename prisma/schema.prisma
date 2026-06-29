@@ -930,6 +930,30 @@ model NplCreditNotification {
   @@index([loanId])
 }
 
+// One row per attempt to remove an account from CBS NPL monitoring via
+// DELETE /api/v1/notification/delete/{accountNumber}. Deletions fire
+// automatically when a borrower exits NPL (loan fully repaid) and can also
+// be triggered manually from the NPL Collection admin page to clean up
+// accounts that left NPL before the delete integration existed.
+model NplCbsDeletion {
+  id                String    @id @default(cuid())
+  accountNumber     String
+  source            String    @default("MANUAL") // MANUAL | AUTO
+  status            String    @default("PENDING") // PENDING | SUCCESS | FAILED
+  httpStatus        Int?
+  reason            String?   @db.NVarChar(Max)
+  borrowerId        String?
+  triggeredByUserId String?   // null when triggered by the auto-repay worker
+  responsePayload   String?   @db.NVarChar(Max)
+  errorMessage      String?   @db.NVarChar(Max)
+  createdAt         DateTime  @default(now())
+  finishedAt        DateTime?
+
+  @@index([accountNumber])
+  @@index([status])
+  @@index([createdAt])
+}
+
 // ================================================= //
 //            PHONE NUMBER CHANGE REQUESTS           //
 // ================================================= //

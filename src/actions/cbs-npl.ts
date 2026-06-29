@@ -14,6 +14,7 @@ import prisma from "@/lib/prisma";
 import { randomUUID } from "crypto";
 import { differenceInDays, startOfDay } from "date-fns";
 import {
+  deleteNplAccount,
   getDefaultCbsProviderId,
   requestRepay,
   uploadNplBulkInBatches,
@@ -222,6 +223,224 @@ async function collectActiveNplAccountNumbers(): Promise<string[]> {
     }
   }
   return out;
+}
+
+// ------------------------------------------------------------------
+// 1b. Removing accounts from CBS NPL monitoring
+//
+// Once a borrower exits NPL (their loan is fully repaid) we must tell the CBS
+// to stop monitoring the account, otherwise the CBS keeps streaming credit
+// notifications for accounts we no longer care about and its database fills up.
+// ------------------------------------------------------------------
+
+/** Pull a bank account number out of a provisionedData JSON blob. */
+function accountNumberFromProvisionedData(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  try {
+    const pd = JSON.parse(raw);
+    const candidate =
+      pd.AccountNumber ??
+      pd.accountNumber ??
+      pd.account_number ??
+      pd.accountNo ??
+      pd.account_no ??
+      null;
+    return candidate ? String(candidate) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Resolve every bank account number we may have uploaded for a borrower so we
+ * can delete them from CBS monitoring. Mirrors the resolution used by the bulk
+ * upload (registered PhoneAccount rows first, provisionedData as a fallback).
+ */
+async function resolveAccountNumbersForBorrower(borrowerId: string): Promise<string[]> {
+  const accounts = new Set<string>();
+
+  const phoneAccounts = await prisma.phoneAccount.findMany({
+    where: { phoneNumber: borrowerId },
+    select: { accountNumber: true },
+  });
+  for (const pa of phoneAccounts) {
+    if (pa.accountNumber) accounts.add(String(pa.accountNumber));
+  }
+
+  if (accounts.size === 0) {
+    const pd = await prisma.provisionedData.findFirst({
+      where: { borrowerId },
+      orderBy: { createdAt: "desc" },
+      select: { data: true },
+    });
+    const fromPd = accountNumberFromProvisionedData(pd?.data);
+    if (fromPd) accounts.add(fromPd);
+  }
+
+  return Array.from(accounts);
+}
+
+interface CbsDeletionResult {
+  id: string;
+  accountNumber: string;
+  status: "SUCCESS" | "FAILED";
+  httpStatus: number | null;
+  message: string | null;
+}
+
+/**
+ * Call the CBS delete endpoint for a single account and persist the outcome.
+ * A 404 / "not found" response is treated as success: the goal is for the
+ * account to be absent from CBS, and it already is.
+ */
+export async function deleteNplAccountFromCbs(args: {
+  accountNumber: string;
+  source: "AUTO" | "MANUAL";
+  reason?: string;
+  borrowerId?: string | null;
+  triggeredByUserId?: string | null;
+}): Promise<CbsDeletionResult> {
+  const accountNumber = String(args.accountNumber).trim();
+  const call = await deleteNplAccount(accountNumber);
+
+  const notFound =
+    call.status === 404 ||
+    Boolean(call.data?.message?.toLowerCase().includes("not found"));
+  const ok = call.ok || notFound;
+
+  const record = await prisma.nplCbsDeletion.create({
+    data: {
+      accountNumber,
+      source: args.source,
+      status: ok ? "SUCCESS" : "FAILED",
+      httpStatus: call.status || null,
+      reason: args.reason ?? null,
+      borrowerId: args.borrowerId ?? null,
+      triggeredByUserId: args.triggeredByUserId ?? null,
+      responsePayload: call.rawResponse ?? null,
+      errorMessage: ok ? null : call.error ?? truncate(call.rawResponse, 2000) ?? null,
+      finishedAt: new Date(),
+    },
+  });
+
+  await createAuditLog({
+    actorId: args.triggeredByUserId ?? (args.source === "AUTO" ? "cbs-auto" : "system"),
+    action: ok ? "CBS_NPL_DELETE_SUCCESS" : "CBS_NPL_DELETE_FAILED",
+    entity: "NplCbsDeletion",
+    entityId: record.id,
+    details: {
+      accountNumber,
+      source: args.source,
+      httpStatus: call.status,
+      borrowerId: args.borrowerId ?? null,
+      message: call.data?.message ?? call.error ?? null,
+    },
+  });
+
+  return {
+    id: record.id,
+    accountNumber,
+    status: ok ? "SUCCESS" : "FAILED",
+    httpStatus: call.status || null,
+    message: call.data?.message ?? call.error ?? null,
+  };
+}
+
+/**
+ * Best-effort: when a borrower no longer has any unpaid loans, remove their
+ * account(s) from CBS NPL monitoring. Safe to call after every repayment —
+ * it no-ops while unpaid loans remain, and skips accounts already deleted
+ * since the last upload. Never throws.
+ */
+export async function syncCbsDeletionForBorrower(
+  borrowerId: string,
+  opts?: { source?: "AUTO" | "MANUAL"; actorId?: string; reason?: string },
+): Promise<void> {
+  try {
+    if (!borrowerId) return;
+
+    const remainingUnpaid = await prisma.loan.count({
+      where: { borrowerId, repaymentStatus: "Unpaid" },
+    });
+    if (remainingUnpaid > 0) return; // still has unpaid loans → keep monitored
+
+    const accounts = await resolveAccountNumbersForBorrower(borrowerId);
+    if (accounts.length === 0) return;
+
+    const latestUpload = await prisma.nplCbsUploadBatch.aggregate({
+      _max: { startedAt: true },
+    });
+    const latestUploadAt = latestUpload._max.startedAt;
+
+    for (const accountNumber of accounts) {
+      // Skip if we already deleted it and it hasn't been re-uploaded since.
+      const priorSuccess = await prisma.nplCbsDeletion.findFirst({
+        where: { accountNumber, status: "SUCCESS" },
+        orderBy: { createdAt: "desc" },
+        select: { createdAt: true },
+      });
+      if (
+        priorSuccess &&
+        (!latestUploadAt || priorSuccess.createdAt >= latestUploadAt)
+      ) {
+        continue;
+      }
+
+      await deleteNplAccountFromCbs({
+        accountNumber,
+        source: opts?.source ?? "AUTO",
+        reason: opts?.reason ?? "Borrower exited NPL (loan fully repaid).",
+        borrowerId,
+        triggeredByUserId: opts?.actorId ?? null,
+      });
+    }
+  } catch (e: any) {
+    void logger.error(
+      `[CBS-NPL] syncCbsDeletionForBorrower failed for borrower=${borrowerId}: ${String(e?.message ?? e)}`,
+    );
+  }
+}
+
+/**
+ * Compute accounts that we previously pushed to the CBS but that are no longer
+ * part of the active NPL set and have not yet been deleted — i.e. accounts that
+ * exited NPL before the delete integration existed and are still cluttering the
+ * CBS database. This powers the manual cleanup tab.
+ */
+export async function computeStaleCbsAccounts(): Promise<string[]> {
+  const batches = await prisma.nplCbsUploadBatch.findMany({
+    where: { status: "SUCCESS" },
+    select: { accountNumbers: true },
+  });
+
+  const uploaded = new Set<string>();
+  for (const b of batches) {
+    try {
+      const arr = JSON.parse(b.accountNumbers);
+      if (Array.isArray(arr)) {
+        for (const a of arr) if (a) uploaded.add(String(a));
+      }
+    } catch {
+      // ignore malformed batch payloads
+    }
+  }
+  if (uploaded.size === 0) return [];
+
+  const [current, deletedRows] = await Promise.all([
+    collectActiveNplAccountNumbers(),
+    prisma.nplCbsDeletion.findMany({
+      where: { status: "SUCCESS" },
+      select: { accountNumber: true },
+    }),
+  ]);
+  const currentSet = new Set(current);
+  const deletedSet = new Set(deletedRows.map((d) => d.accountNumber));
+
+  const stale: string[] = [];
+  for (const account of uploaded) {
+    if (!currentSet.has(account) && !deletedSet.has(account)) stale.push(account);
+  }
+  return stale.sort();
 }
 
 // ------------------------------------------------------------------
@@ -604,6 +823,16 @@ export async function attemptRepayForNotification(
       accountNumber: notification.accountNumber,
       breakdown,
       notificationId: notification.id,
+    });
+  }
+
+  // When this repayment cleared the borrower's last unpaid loan, ask the CBS to
+  // stop monitoring the account. Best-effort: never blocks or rolls back the
+  // (already committed) repayment.
+  if (repaySuccess && !internalError && breakdown?.isFullyPaid) {
+    void syncCbsDeletionForBorrower(borrowerId, {
+      source: "AUTO",
+      reason: "NPL loan fully repaid via CBS auto-debit.",
     });
   }
 

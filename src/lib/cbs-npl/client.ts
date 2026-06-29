@@ -3,6 +3,7 @@ import type {
   CbsBulkUploadRequest,
   CbsBulkUploadResponse,
   CbsCallResult,
+  CbsDeleteResponse,
   CbsRepayRequest,
   CbsRepayResponse,
 } from "./types";
@@ -60,9 +61,10 @@ function chunkArray<T>(items: T[], chunkSize: number): T[][] {
   return out;
 }
 
-async function cbsPost<T>(
+async function cbsRequest<T>(
+  method: "POST" | "DELETE",
   path: string,
-  body: unknown,
+  body?: unknown,
   opts?: { timeoutMs?: number },
 ): Promise<CbsCallResult<T>> {
   const url = `${getCbsBaseUrl()}${path}`;
@@ -71,7 +73,7 @@ async function cbsPost<T>(
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   const startedAt = Date.now();
 
-  void logger.info(`[CBS-NPL] POST ${url}`);
+  void logger.info(`[CBS-NPL] ${method} ${url}`);
 
   let status = 0;
   let raw: string | undefined;
@@ -80,13 +82,13 @@ async function cbsPost<T>(
 
   try {
     const res = await fetch(url, {
-      method: "POST",
+      method,
       headers: {
         "Content-Type": "application/json",
         Accept: "application/json",
         ...getOutboundAuthHeader(),
       },
-      body: JSON.stringify(body),
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
       signal: controller.signal,
       cache: "no-store",
     });
@@ -129,6 +131,32 @@ async function cbsPost<T>(
   } finally {
     clearTimeout(timer);
   }
+}
+
+function cbsPost<T>(
+  path: string,
+  body: unknown,
+  opts?: { timeoutMs?: number },
+): Promise<CbsCallResult<T>> {
+  return cbsRequest<T>("POST", path, body, opts);
+}
+
+function cbsDelete<T>(
+  path: string,
+  opts?: { timeoutMs?: number },
+): Promise<CbsCallResult<T>> {
+  return cbsRequest<T>("DELETE", path, undefined, opts);
+}
+
+/**
+ * Remove a single account from CBS NPL monitoring.
+ * Corresponds to: DELETE /delete/{accountNumber}
+ */
+export async function deleteNplAccount(
+  accountNumber: string,
+): Promise<CbsCallResult<CbsDeleteResponse>> {
+  const encoded = encodeURIComponent(String(accountNumber).trim());
+  return cbsDelete<CbsDeleteResponse>(`/delete/${encoded}`);
 }
 
 /**
