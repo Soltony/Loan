@@ -73,6 +73,18 @@ interface ProtectedLayoutProps {
   providers: LoanProvider[];
 }
 
+// A menu item is active only on an exact match or a true sub-path (segment boundary),
+// so e.g. "/admin/tax" does not light up while on "/admin/tax-transfers".
+function isPathActive(pathname: string | null, itemPath: string) {
+  if (!pathname) {
+    return false;
+  }
+  if (itemPath === '/admin') {
+    return pathname === '/admin';
+  }
+  return pathname === itemPath || pathname.startsWith(`${itemPath}/`);
+}
+
 export function ProtectedLayout({ children, providers }: ProtectedLayoutProps) {
   const pathname = usePathname();
   const router = useRouter();
@@ -86,7 +98,7 @@ export function ProtectedLayout({ children, providers }: ProtectedLayoutProps) {
   const currentMenuItem = React.useMemo(() => {
     let best: (typeof allMenuItems)[number] | undefined;
     for (const item of allMenuItems) {
-      if (pathname.startsWith(item.path) && (!best || item.path.length > best.path.length)) {
+      if (isPathActive(pathname, item.path) && (!best || item.path.length > best.path.length)) {
         best = item;
       }
     }
@@ -181,7 +193,7 @@ export function ProtectedLayout({ children, providers }: ProtectedLayoutProps) {
                 <SidebarMenuItem key={item.label}>
                   <Link href={item.path}>
                     <SidebarMenuButton
-                      isActive={pathname.startsWith(item.path) && (item.path !== '/admin' || pathname === '/admin')}
+                      isActive={isPathActive(pathname, item.path)}
                       tooltip={{
                         children: item.label,
                       }}
