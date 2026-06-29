@@ -2,6 +2,7 @@
 
 import { NextRequest, NextResponse } from 'next/server';
 import prisma from '@/lib/prisma';
+import { calculateTotalRepayable } from '@/lib/loan-calculator';
 import { startOfDay, endOfDay, startOfWeek, endOfWeek, startOfMonth, endOfMonth, startOfYear, endOfYear, subDays, differenceInDays, isValid } from 'date-fns';
 import { getUserFromSession } from '@/lib/user';
 import { resolveBranchBorrowerIdsForUser, parseBranchCodeQueryParam } from '@/lib/branch-filter';
@@ -185,27 +186,34 @@ export async function GET(req: NextRequest) {
 
         // 5. Aging Report (snapshot as of today) - borrower level amounts and provider classification
         const today = startOfDay(new Date());
-        const overdueLoans = await prisma.loan.findMany({
-            where: {
-                product: { providerId },
-                repaymentStatus: 'Unpaid',
-                dueDate: { lt: today },
-                ...loanBranchFilter,
-            },
-            include: { 
-                borrower: { 
-                    include: { 
-                        provisionedData: { 
-                            orderBy: { createdAt: 'desc' }, 
-                            take: 1 
-                        } 
-                    } 
+        const [overdueLoans, taxConfigs] = await Promise.all([
+            prisma.loan.findMany({
+                where: {
+                    product: { providerId },
+                    repaymentStatus: 'Unpaid',
+                    dueDate: { lt: today },
+                    ...loanBranchFilter,
                 },
-                payments: {
-                    select: { amount: true }
-                }
-            },
-        });
+                include: {
+                    installments: true,
+                    payments: true,
+                    borrower: {
+                        include: {
+                            provisionedData: {
+                                orderBy: { createdAt: 'desc' },
+                                take: 1
+                            }
+                        }
+                    },
+                },
+            }),
+            prisma.tax.findMany(),
+        ]);
+
+        // Product config drives the principal/interest/serviceFee/penalty breakdown.
+        const productIds = Array.from(new Set(overdueLoans.map(l => l.productId)));
+        const products = await prisma.loanProduct.findMany({ where: { id: { in: productIds } } });
+        const productMap = new Map(products.map(p => [p.id, p]));
 
         const classifications = [
             { key: 'Pass', min: 0, max: 29 },
@@ -223,7 +231,7 @@ export async function GET(req: NextRequest) {
         };
 
         // Initialize provider-level counters
-        const providerBuckets = {
+        const providerBuckets: Record<string, number> = {
             Pass: 0,
             'Special Mention': 0,
             Substandard: 0,
@@ -248,38 +256,6 @@ export async function GET(req: NextRequest) {
             }));
         }
         const phoneMap = new Map(phoneAccounts.map(p => [p.phoneNumber, p.accountNumber]));
-
-        // Preload ledger entries for all overdue loans to avoid N+1
-        const overdueLoanIds = overdueLoans.map(l => l.id);
-        const allLedgerEntries: any[] = [];
-        for (let i = 0; i < overdueLoanIds.length; i += ID_BATCH) {
-            const batch = overdueLoanIds.slice(i, i + ID_BATCH);
-            allLedgerEntries.push(...await prisma.ledgerEntry.findMany({
-                where: {
-                    journalEntry: {
-                        loanId: { in: batch }
-                    }
-                },
-                include: {
-                    ledgerAccount: {
-                        select: { category: true }
-                    },
-                    journalEntry: {
-                        select: { loanId: true }
-                    }
-                }
-            }));
-        }
-
-        // Group ledger entries by loanId for fast lookup
-        const ledgerMap = new Map<string, any[]>();
-        for (const entry of allLedgerEntries) {
-            const loanId = entry.journalEntry?.loanId;
-            if (loanId) {
-                if (!ledgerMap.has(loanId)) ledgerMap.set(loanId, []);
-                ledgerMap.get(loanId)!.push(entry);
-            }
-        }
 
         // Helper: extract borrower name from provisionedData payload
         const getBorrowerNameFromProvisioned = (pdRaw: string | undefined | null) => {
@@ -307,44 +283,37 @@ export async function GET(req: NextRequest) {
             const daysOverdue = differenceInDays(today, loan.dueDate);
             const classification = classify(daysOverdue);
 
-            // Determine repaid amount from pre-fetched payments
-            let repaid = loan.repaidAmount ?? 0;
-            if (!repaid || repaid === 0) {
-                repaid = (loan.payments || []).reduce((sum, p) => sum + (p.amount || 0), 0);
-            }
+            const product = productMap.get(loan.productId);
+            if (!product) continue;
 
-            const overdueAmount = Math.max(0, (loan.loanAmount || 0) - repaid);
-            if (overdueAmount <= 0.01) continue;
+            // Compute the full repayable breakdown with the same calculator the Loans and
+            // NPL reports use, so the aging report's per-component columns are consistent
+            // system-wide. (Previously this was derived from ledger entries and collapsed
+            // the entire balance into Principal whenever a loan had no matching ledger rows.)
+            const { total, principal, interest, penalty, serviceFee } =
+                calculateTotalRepayable(loan as any, product as any, taxConfigs, today, true);
 
-            // Compute per-component outstanding amounts for this loan from pre-fetched ledger entries
-            const entries = ledgerMap.get(loan.id) || [];
+            const totalRepaid = loan.repaidAmount ?? 0;
+            if (Math.max(0, total - totalRepaid) <= 0.01) continue;
 
-            let principalOutstandingForLoan = 0;
-            let interestOutstandingForLoan = 0;
-            let serviceFeeOutstandingForLoan = 0;
-            let penaltyOutstandingForLoan = 0;
+            // Apply repayments with the standard waterfall: Penalty -> Service Fee -> Interest -> Principal.
+            const penaltyPaid = Math.min(totalRepaid, penalty);
+            const serviceFeePaid = Math.min(Math.max(0, totalRepaid - penalty), serviceFee);
+            const interestPaid = Math.min(Math.max(0, totalRepaid - penalty - serviceFee), interest);
+            const principalPaid = Math.max(0, totalRepaid - penalty - serviceFee - interest);
 
-            for (const e of entries) {
-                const category = (e.ledgerAccount?.category || '').toString();
-                // Convention: Debits increase receivable, Credits reduce receivable.
-                const signed = e.type === 'Debit' ? (e.amount || 0) : -(e.amount || 0);
-                if (category === 'Principal') principalOutstandingForLoan += signed;
-                if (category === 'Interest') interestOutstandingForLoan += signed;
-                if (category === 'ServiceFee') serviceFeeOutstandingForLoan += signed;
-                if (category === 'Penalty') penaltyOutstandingForLoan += signed;
-            }
+            const principalOutstandingForLoan = Math.max(0, principal - principalPaid);
+            const interestOutstandingForLoan = Math.max(0, interest - interestPaid);
+            const serviceFeeOutstandingForLoan = Math.max(0, serviceFee - serviceFeePaid);
+            const penaltyOutstandingForLoan = Math.max(0, penalty - penaltyPaid);
 
-            // Ensure non-negative and fallback to coarse overdue amount if ledger data is not present
-            principalOutstandingForLoan = Math.max(0, principalOutstandingForLoan) || 0;
-            interestOutstandingForLoan = Math.max(0, interestOutstandingForLoan) || 0;
-            serviceFeeOutstandingForLoan = Math.max(0, serviceFeeOutstandingForLoan) || 0;
-            penaltyOutstandingForLoan = Math.max(0, penaltyOutstandingForLoan) || 0;
-
-            // If ledger-derived total is zero (no entries), fallback to distributing overdueAmount into principal
-            const ledgerTotal = principalOutstandingForLoan + interestOutstandingForLoan + serviceFeeOutstandingForLoan + penaltyOutstandingForLoan;
-            if (ledgerTotal === 0) {
-                principalOutstandingForLoan = overdueAmount;
-            }
+            // Bucket/total amounts reflect the borrower's outstanding balance across the
+            // displayed components.
+            const overdueAmount =
+                principalOutstandingForLoan +
+                interestOutstandingForLoan +
+                serviceFeeOutstandingForLoan +
+                penaltyOutstandingForLoan;
 
             // (provider-level counts are incremented later after borrower aggregation)
 
@@ -417,6 +386,12 @@ export async function GET(req: NextRequest) {
             const borrowerClass = classify(maxDays);
             b.classification = borrowerClass;
             b.classificationAmount = b.buckets?.[borrowerClass] || 0;
+            // Total outstanding for the borrower = sum of the displayed components.
+            b.totalOutstanding =
+                (b.principalOutstanding || 0) +
+                (b.interestOutstanding || 0) +
+                (b.serviceFeeOutstanding || 0) +
+                (b.penaltyOutstanding || 0);
             // remove internal helper key
             delete b.maxDaysOverdue;
         }

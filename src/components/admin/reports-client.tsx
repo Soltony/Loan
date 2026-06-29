@@ -985,7 +985,7 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
             "Interest Outstanding": b.interestOutstanding || 0,
             "Service Fee Outstanding": b.serviceFeeOutstanding || 0,
             "Penalty Outstanding": b.penaltyOutstanding || 0,
-            "Total Outstanding": b.classificationAmount || b.totalOverdue || 0,
+            "Total Outstanding": b.totalOutstanding ?? b.classificationAmount ?? b.totalOverdue ?? 0,
           });
         });
       });
@@ -2520,7 +2520,10 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
                               </TableCell>
                               <TableCell className="text-right font-mono font-bold">
                                 {formatCurrency(
-                                  b.classificationAmount || b.totalOverdue || 0
+                                  b.totalOutstanding ??
+                                    b.classificationAmount ??
+                                    b.totalOverdue ??
+                                    0
                                 )}
                               </TableCell>
                             </TableRow>
