@@ -1,6 +1,7 @@
 'use client';
 
 import React, { useState, useEffect } from 'react';
+import { useRouter } from 'next/navigation';
 import { useRequirePermission } from '@/hooks/use-require-permission';
 import { PlusCircle, MoreHorizontal } from 'lucide-react';
 import { Button } from '@/components/ui/button';
@@ -348,6 +349,7 @@ function RolesTab() {
     const [deletingRoleId, setDeletingRoleId] = useState<string | null>(null);
     const [currentPage, setCurrentPage] = useState(1);
     const { toast } = useToast();
+    const router = useRouter();
 
     const canCreate = !!currentUser?.permissions?.['access-control']?.create;
     const canUpdate = !!currentUser?.permissions?.['access-control']?.update;
@@ -604,7 +606,7 @@ function RolesTab() {
                                             </DropdownMenuTrigger>
                                             <DropdownMenuContent align="end">
                                                 <DropdownMenuLabel>Actions</DropdownMenuLabel>
-                                                <DropdownMenuItem onClick={() => handleOpenDialog(role)} disabled={!canUpdate}>Edit</DropdownMenuItem>
+                                                <DropdownMenuItem onClick={() => router.push(`/admin/access-control/roles/${role.id}/edit`)} disabled={!canUpdate}>Edit</DropdownMenuItem>
                                                 <DropdownMenuItem className="text-red-600" onClick={() => setDeletingRoleId(role.id)} disabled={!canDelete}>Delete</DropdownMenuItem>
                                             </DropdownMenuContent>
                                         </DropdownMenu>
