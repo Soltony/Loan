@@ -194,7 +194,12 @@ export async function GET(req: NextRequest) {
             });
         }
         
-        reportData.sort((a,b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+        reportData.sort((a,b) => {
+            const diff = new Date(b.date).getTime() - new Date(a.date).getTime();
+            if (diff !== 0) return diff;
+            // Tiebreak on provider so pagination is stable for same-day rows
+            return String(a.provider).localeCompare(String(b.provider));
+        });
 
         // Apply pagination on aggregated data
         const total = reportData.length;

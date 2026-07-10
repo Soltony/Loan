@@ -2,6 +2,7 @@
 
 import { AuthProvider } from '@/hooks/use-auth';
 import type { AuthenticatedUser } from '@/hooks/use-auth';
+import { ReportExportProvider } from '@/components/admin/report-export-provider';
 
 interface AdminProvidersProps {
     children: React.ReactNode;
@@ -11,7 +12,9 @@ interface AdminProvidersProps {
 export function AdminProviders({ children, initialUser }: AdminProvidersProps) {
     return (
         <AuthProvider initialUser={initialUser}>
-            {children}
+            <ReportExportProvider>
+                {children}
+            </ReportExportProvider>
         </AuthProvider>
     );
 }

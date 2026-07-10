@@ -373,7 +373,9 @@ export async function GET(request: NextRequest) {
             entries: { include: { ledgerAccount: true } },
             payment: true,
           },
-          orderBy: { date: "desc" },
+          // Stable sort: unique id tiebreaker keeps pagination deterministic
+          // (SQL Server returns tied dates in arbitrary order otherwise)
+          orderBy: [{ date: "desc" }, { id: "desc" }],
         });
         allEntries.push(...batchEntries);
       }
@@ -382,7 +384,9 @@ export async function GET(request: NextRequest) {
       allEntries.sort((a, b) => {
         const dateA = new Date(a.date).getTime();
         const dateB = new Date(b.date).getTime();
-        return dateB - dateA;
+        if (dateB !== dateA) return dateB - dateA;
+        // Tiebreak on id so page slices stay stable across requests
+        return String(b.id).localeCompare(String(a.id));
       });
       
       journalEntries = allEntries.slice(skip, skip + pageSize);
@@ -406,7 +410,10 @@ export async function GET(request: NextRequest) {
           entries: { include: { ledgerAccount: true } },
           payment: true,
         },
-        orderBy: { date: "desc" },
+        // Stable sort: unique id tiebreaker keeps pagination deterministic
+        // (SQL Server returns tied dates in arbitrary order otherwise, which
+        // duplicated/skipped rows when the export walked through the pages)
+        orderBy: [{ date: "desc" }, { id: "desc" }],
         skip,
         take: pageSize,
       });

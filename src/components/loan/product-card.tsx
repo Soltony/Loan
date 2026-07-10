@@ -9,7 +9,7 @@ import type { LoanProduct, LoanDetails, FeeRule, Tax, PenaltyRule } from '@/lib/
 import { ChevronDown, ChevronUp } from 'lucide-react';
 import { format } from 'date-fns';
 import { cn } from '@/lib/utils';
-import { calculateInstallmentDueBreakdown, calculateTotalRepayableDetailed } from '@/lib/loan-calculator';
+import { calculateTotalRepayableDetailed } from '@/lib/loan-calculator';
 import { Tooltip, TooltipProvider, TooltipTrigger, TooltipContent } from '../ui/tooltip';
 
 const formatCurrency = (amount: number | null | undefined) => {
@@ -103,33 +103,23 @@ export function ProductCard({
         : undefined;
     const isOverdue = activeInstallment ? asOfDate > new Date(activeInstallment.dueDate) : (activeLoan ? asOfDate > new Date(activeLoan.dueDate) : false);
 
-    const balanceDue = useMemo(() => {
-        if (!activeLoan) return 0;
-        
-        // Calculate total repayable using asOfDate with detailed breakdown
-        const totals = calculateTotalRepayableDetailed(activeLoan, activeLoan.product, taxConfigs, asOfDate);
-        
-        // For installment-based loans, only show the CURRENT installment amount due
-        if (Array.isArray((activeLoan as any).installments) && (activeLoan as any).installments.length > 0) {
-            const installments = (activeLoan as any).installments;
-            const activeInst = installments.find((i: any) => i.isActive);
-            if (activeInst) {
-                const due = calculateInstallmentDueBreakdown({
-                    loanDetails: activeLoan,
-                    loanProduct: activeLoan.product,
-                    taxConfigs,
-                    activeInstallment: activeInst,
-                    asOfDate,
-                });
-                return Math.max(0, due.totalDue);
-            }
-        }
-        
-        // For non-installment loans, use accurate paid amounts from detailed calculation
-        const alreadyRepaid = activeLoan.repaidAmount || 0;
-        const remainingBalance = totals.total - alreadyRepaid;
-        return Math.max(0, remainingBalance);
+    // Loan-level repayment totals. The Outstanding shown on this card must match the
+    // Loan History and Loan Detail pages, which both compute (total repayable −
+    // loan.repaidAmount). The dashboard also repays at the loan level (it sends no
+    // installmentId), so the card reads the same loan-level figure. Deriving it from
+    // the per-installment paidAmount counter is what made this card go stale: that
+    // counter only tracks penalty+principal, so auto-collections that settle
+    // interest/penalty move loan.repaidAmount without moving installment.paidAmount.
+    const loanTotals = useMemo(() => {
+        if (!activeLoan) return null;
+        return calculateTotalRepayableDetailed(activeLoan, activeLoan.product, taxConfigs, asOfDate);
     }, [activeLoan, taxConfigs, asOfDate]);
+
+    const balanceDue = useMemo(() => {
+        if (!activeLoan || !loanTotals) return 0;
+        const alreadyRepaid = activeLoan.repaidAmount || 0;
+        return Math.max(0, loanTotals.total - alreadyRepaid);
+    }, [activeLoan, loanTotals]);
 
     const trueAvailableLimit = useMemo(() => {
         // The available limit for this specific product is the smaller of the product's general
@@ -189,8 +179,15 @@ export function ProductCard({
     );
 
     if (activeLoan) {
-        const instOutstanding = activeInstallment ? Math.max(0, (activeInstallment.amount || 0) - (activeInstallment.paidAmount || 0)) : null;
-        const instPenalty = activeInstallment ? Math.max(0, activeInstallment.penaltyAmount || 0) : 0;
+        // Principal / penalty remaining come from the loan-level repayment waterfall
+        // (over loan.repaidAmount) so they reflect every repayment — including SuperApp
+        // auto-collections — exactly like the History and Detail pages. The stale
+        // per-installment paidAmount counter is intentionally not used here.
+        const principalRemaining = loanTotals
+            ? Math.max(0, loanTotals.principal - loanTotals.principalPaidFromInterestCalc)
+            : null;
+        const penaltyPaid = loanTotals ? Math.min(loanTotals.penalty, activeLoan.repaidAmount || 0) : 0;
+        const instPenalty = loanTotals ? Math.max(0, loanTotals.penalty - penaltyPaid) : 0;
         return (
             <Card>
                 <CardContent className="p-4">
@@ -216,8 +213,8 @@ export function ProductCard({
                         <div className="text-right">
                              <p className="text-xl font-bold">{formatCurrency(balanceDue)}</p>
                              <p className="text-xs text-muted-foreground">Outstanding</p>
-                             {activeInstallment && instOutstanding !== null && (
-                                <p className="text-xs text-muted-foreground">Principal: {formatCurrency(instOutstanding)} ETB</p>
+                             {principalRemaining !== null && (
+                                <p className="text-xs text-muted-foreground">Principal: {formatCurrency(principalRemaining)} ETB</p>
                              )}
                         </div>
                     </div>

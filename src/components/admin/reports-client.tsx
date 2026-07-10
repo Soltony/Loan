@@ -35,6 +35,7 @@ import { format } from "date-fns";
 import { useAuth } from "@/hooks/use-auth";
 import { branchLabel } from "@/lib/branches";
 import { Card, CardContent, CardHeader, CardTitle } from "../ui/card";
+import { useReportExport } from "./report-export-provider";
 import { Popover, PopoverContent, PopoverTrigger } from "../ui/popover";
 import { Calendar } from "../ui/calendar";
 import { DateRange } from "react-day-picker";
@@ -108,7 +109,9 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
   const [providerSummaryData, setProviderSummaryData] = useState<
     Record<string, ProviderReportData>
   >({});
-  const [isExporting, setIsExporting] = useState(false);
+  // Export runs in ReportExportProvider (admin layout level) so it keeps
+  // going and stays visible in the floating widget across page navigation
+  const { isExporting, runExport } = useReportExport();
 
   const isSuperAdminOrRecon =
     currentUser?.role === "Super Admin" ||
@@ -661,9 +664,10 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
       return;
     }
 
-    setIsExporting(true);
+    await runExport("Exporting reports to Excel", async (ctl) => {
+      // Start with 1 page per report endpoint; totals grow as each reports its page count
+      ctl.update(() => ({ done: 0, total: 7, phase: "fetching" }));
 
-    try {
       const wb = new ExcelJS.Workbook();
       const providerList = (
         providerId === "all"
@@ -699,11 +703,8 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
         buildUrl: (page: number, pageSize: number) => string
       ) => {
         const pageSize = EXPORT_PAGE_SIZE;
-        let page = 1;
-        let totalPages = 1;
-        const all: any[] = [];
 
-        do {
+        const fetchPage = async (page: number) => {
           const url = buildUrl(page, pageSize);
           const resp = await fetch(url);
           if (!resp.ok) {
@@ -713,13 +714,35 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
             );
           }
           const result = await resp.json();
-          const data = result.data || [];
-          all.push(...data);
-          totalPages = result.totalPages || 1;
-          page += 1;
-        } while (page <= totalPages);
+          ctl.update((p) => ({ ...p, done: p.done + 1 }));
+          return result;
+        };
 
-        return all;
+        const first = await fetchPage(1);
+        const totalPages = first.totalPages || 1;
+        if (totalPages > 1) {
+          ctl.update((p) => ({ ...p, total: p.total + (totalPages - 1) }));
+        }
+
+        // Results indexed by page number so row order is preserved
+        const pages: any[][] = [first.data || []];
+
+        // Fetch remaining pages a few at a time instead of one-by-one
+        const CONCURRENCY = 3;
+        let nextPage = 2;
+        const workers = Array.from(
+          { length: Math.min(CONCURRENCY, Math.max(0, totalPages - 1)) },
+          async () => {
+            while (nextPage <= totalPages) {
+              const page = nextPage++;
+              const result = await fetchPage(page);
+              pages[page - 1] = result.data || [];
+            }
+          }
+        );
+        await Promise.all(workers);
+
+        return pages.flat();
       };
 
       const buildBaseUrl = (base: string) => (page: number, pageSize: number) =>
@@ -766,6 +789,8 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
         ),
         fetchAllPages(buildBaseUrl("/api/reports/national-bank")),
       ]);
+
+      ctl.update((p) => ({ ...p, phase: "generating" }));
 
       // 1. Provider Loans
       if (allLoans.length > 0) {
@@ -1057,30 +1082,16 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
 
       // If workbook has no worksheets (no data), inform the user
       if (wb.worksheets.length === 0) {
-        toast({
-          description: "No data available to export.",
-          variant: "destructive",
-        });
-        return;
+        throw new Error("No data available to export for the selected filters.");
       }
 
       const buffer = await wb.xlsx.writeBuffer();
-      saveAs(
-        new Blob([buffer], { type: "application/octet-stream" }),
-        `LoanFlow_Report_${timeframe}_${
-          new Date().toISOString().split("T")[0]
-        }.xlsx`
-      );
-    } catch (err: any) {
-      console.error("Failed to generate Excel file", err);
-      toast({
-        title: "Export Failed",
-        description: err?.message || "Could not generate Excel file.",
-        variant: "destructive",
-      });
-    } finally {
-      setIsExporting(false);
-    }
+      const fileName = `LoanFlow_Report_${timeframe}_${
+        new Date().toISOString().split("T")[0]
+      }.xlsx`;
+      saveAs(new Blob([buffer], { type: "application/octet-stream" }), fileName);
+      return { fileName };
+    });
   };
 
   // Generic helpers: sort + paginate for current tab

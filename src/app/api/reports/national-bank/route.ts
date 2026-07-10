@@ -237,7 +237,9 @@ export async function GET(req: NextRequest) {
             },
           },
         },
-        orderBy: { disbursedDate: "desc" },
+        // Unique id tiebreaker keeps skip/take pagination deterministic
+        // when many loans share the same disbursedDate
+        orderBy: [{ disbursedDate: "desc" }, { id: "desc" }],
         skip,
         take: pageSize,
       }),
