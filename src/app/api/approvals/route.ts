@@ -13,6 +13,7 @@ import { startOfDay, isBefore, isEqual, differenceInDays } from "date-fns";
 import sendSms from "@/lib/sms";
 import { calculateTotalRepayable } from "@/lib/loan-calculator";
 import { reverseAllLoanJournalEntries } from "@/lib/loan-ledger-reversal";
+import { isSafeOnlyProductUpdate } from "@/lib/loan-product-changes";
 
 const approvalSchema = z.object({
   changeId: z.string(),
@@ -1237,8 +1238,14 @@ async function applyChange(
           );
         }
 
-        // Keep product disabled even after an approved update per requested policy
-        const updateData = { ...restOfUpdateData, status: "Disabled" };
+        // Term changes disable the product after approval so an admin re-reviews
+        // and re-enables it. Safe-only changes (e.g. salary mappings, eligibility)
+        // don't alter existing loan terms, so preserve the product's current
+        // status instead of forcing it to Disabled.
+        const safeOnlyChange = isSafeOnlyProductUpdate(data);
+        const updateData = safeOnlyChange
+          ? { ...restOfUpdateData }
+          : { ...restOfUpdateData, status: "Disabled" };
 
         if (
           updateData.serviceFee &&

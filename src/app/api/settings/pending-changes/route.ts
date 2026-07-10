@@ -7,6 +7,7 @@ import ExcelJS from 'exceljs';
 import { hasPermissionForEntity } from '@/lib/require-permission';
 import { z } from 'zod';
 import { createAuditLog } from '@/lib/audit-log';
+import { isSafeOnlyProductUpdate } from '@/lib/loan-product-changes';
 
 export async function GET(req: NextRequest) {
   const user = await getUserFromSession();
@@ -160,7 +161,20 @@ export async function POST(req: NextRequest) {
       if (entityType === 'LoanProvider') {
         await prisma.loanProvider.update({ where: { id: entityId }, data: { status: 'PENDING_APPROVAL' }});
       } else if (entityType === 'LoanProduct') {
-        await prisma.loanProduct.update({ where: { id: entityId }, data: { status: 'Disabled' }});
+        // Safe-only updates (e.g. salary mappings, eligibility) don't change
+        // existing loan terms, so keep the product in its current status while
+        // the change is pending. The maker-checker flow is unchanged.
+        let keepProductStatus = false;
+        if (changeType === 'UPDATE') {
+          try {
+            keepProductStatus = isSafeOnlyProductUpdate(JSON.parse(payload));
+          } catch {
+            keepProductStatus = false;
+          }
+        }
+        if (!keepProductStatus) {
+          await prisma.loanProduct.update({ where: { id: entityId }, data: { status: 'Disabled' }});
+        }
       } else if (entityType === 'Tax') {
         await prisma.tax.update({ where: { id: entityId }, data: { status: 'PENDING_APPROVAL' }});
       }

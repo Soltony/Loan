@@ -49,6 +49,7 @@ import {
 } from '@/components/ui/dialog';
 import { useAuth } from '@/hooks/use-auth';
 import { postPendingChange } from '@/lib/fetch-utils';
+import { isSafeOnlyProductUpdate } from '@/lib/loan-product-changes';
 import { produce } from 'immer';
 import { IconDisplay } from '@/components/icons';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -715,7 +716,14 @@ const ProductSettingsForm = ({ provider, product, providerColor, onSave, onDelet
                     payload: JSON.stringify(payload)
                 }, 'Failed to submit product changes for approval.');
 
-            onUpdate({ status: 'Disabled', _optimisticPending: true } as any);
+            // Safe-only changes (e.g. salary mappings) keep the product enabled;
+            // only term changes disable it while pending.
+            const safeOnlyChange = isSafeOnlyProductUpdate(payload);
+            onUpdate(
+                safeOnlyChange
+                    ? ({ _optimisticPending: true } as any)
+                    : ({ status: 'Disabled', _optimisticPending: true } as any)
+            );
 
             toast({
                 title: 'Submitted for Approval',
