@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import type { LoanProvider, LoanDetails, Tax } from "@/lib/types";
 import { Loader2 } from "lucide-react";
@@ -15,6 +15,9 @@ import {
   DialogTitle,
   DialogDescription,
 } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Button } from "@/components/ui/button";
 
 type Step = "calculator" | "details";
 
@@ -44,6 +47,16 @@ export function ApplyClient({
   const [selectedAccount, setSelectedAccount] = useState<any | null>(null);
   const [showAccountModal, setShowAccountModal] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
+
+  // TIN (Tax Identification Number) collection state.
+  const [storedTin, setStoredTin] = useState<string | null>(null);
+  const [showTinModal, setShowTinModal] = useState(false);
+  const [tinInput, setTinInput] = useState("");
+  const [savingTin, setSavingTin] = useState(false);
+  const pendingDetailsRef = useRef<Omit<
+    LoanDetails,
+    "id" | "providerName" | "productName" | "payments"
+  > | null>(null);
 
   useEffect(() => {
     // When the super-app provides a borrowerId (phone), check for an active associated account.
@@ -93,6 +106,27 @@ export function ApplyClient({
     checkActive();
   }, [borrowerId]);
 
+  // Check whether the borrower already has a TIN Number on file so we know
+  // whether to prompt for it during the application.
+  useEffect(() => {
+    if (!borrowerId) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch("/api/borrower-tin");
+        if (!res.ok) return;
+        const data = await res.json().catch(() => null);
+        if (cancelled || !data) return;
+        if (data.tin) setStoredTin(String(data.tin));
+      } catch {
+        /* ignore; will re-check when the borrower applies */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [borrowerId]);
+
   const eligibilityResult = useMemo(() => {
     const min = searchParams.get("min");
     const max = searchParams.get("max");
@@ -109,12 +143,104 @@ export function ApplyClient({
     };
   }, [searchParams, selectedProduct]);
 
-  const handleLoanAccept = async (
-    details: Omit<
-      LoanDetails,
-      "id" | "providerName" | "productName" | "payments"
-    >,
-  ) => {
+  type AcceptedDetails = Omit<
+    LoanDetails,
+    "id" | "providerName" | "productName" | "payments"
+  >;
+
+  // Returns true if the borrower already has a TIN Number on file.
+  const ensureTinOnFile = async (): Promise<boolean> => {
+    if (storedTin) return true;
+    try {
+      const res = await fetch("/api/borrower-tin");
+      if (res.ok) {
+        const data = await res.json().catch(() => null);
+        if (data?.tin) {
+          setStoredTin(String(data.tin));
+          return true;
+        }
+        return false;
+      }
+    } catch {
+      /* ignore and prompt for the TIN below */
+    }
+    return false;
+  };
+
+  const handleTinSubmit = async () => {
+    const value = tinInput.trim();
+    if (!value) {
+      toast({
+        title: "TIN Number required",
+        description: "Please enter your TIN Number to continue.",
+        variant: "destructive",
+      });
+      return;
+    }
+    setSavingTin(true);
+    try {
+      const res = await fetch("/api/borrower-tin", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ tin: value, providerId: provider?.id }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data?.error || "Failed to save TIN Number.");
+      }
+      const saved = String(data?.tin ?? value);
+      setStoredTin(saved);
+      setShowTinModal(false);
+      setTinInput("");
+      toast({
+        title: "TIN Number saved",
+        description: "Thank you. Continuing your application.",
+      });
+      // Resume the loan application that was paused to collect the TIN.
+      const pending = pendingDetailsRef.current;
+      pendingDetailsRef.current = null;
+      if (pending) {
+        await submitLoan(pending);
+      }
+    } catch (err: any) {
+      toast({
+        title: "Could not save TIN Number",
+        description: String(err?.message ?? err),
+        variant: "destructive",
+      });
+    } finally {
+      setSavingTin(false);
+    }
+  };
+
+  const handleLoanAccept = async (details: AcceptedDetails) => {
+    if (!selectedProduct || !borrowerId) {
+      toast({
+        title: "Error",
+        description: "Missing required information.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    if (isSubmitting || savingTin) {
+      return;
+    }
+
+    // A TIN Number must be on file before a loan application can proceed. If the
+    // borrower does not have one yet, prompt for it and resume once it is saved.
+    const hasTin = await ensureTinOnFile();
+    if (!hasTin) {
+      pendingDetailsRef.current = details;
+      setTinInput("");
+      setShowTinModal(true);
+      return;
+    }
+
+    await submitLoan(details);
+  };
+
+  const submitLoan = async (details: AcceptedDetails) => {
     if (!selectedProduct || !borrowerId) {
       toast({
         title: "Error",
@@ -381,6 +507,61 @@ export function ApplyClient({
                   />
                 </div>
               )}
+            </DialogContent>
+          </Dialog>
+
+          {/* Blocking modal: collects the borrower's TIN Number when none is on file */}
+          <Dialog
+            open={showTinModal}
+            onOpenChange={(open) => {
+              // Prevent closing while saving.
+              if (savingTin) return;
+              if (!open) pendingDetailsRef.current = null;
+              setShowTinModal(open);
+            }}
+          >
+            <DialogContent>
+              <DialogHeader>
+                <DialogTitle>Enter your TIN Number</DialogTitle>
+                <DialogDescription>
+                  A Tax Identification Number (TIN) is required before you can
+                  continue your loan application. We&apos;ll save it so you
+                  won&apos;t be asked again.
+                </DialogDescription>
+              </DialogHeader>
+              <div className="mt-4 space-y-3">
+                <Label htmlFor="tin-input">TIN Number</Label>
+                <Input
+                  id="tin-input"
+                  inputMode="numeric"
+                  autoFocus
+                  value={tinInput}
+                  onChange={(e) => setTinInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      handleTinSubmit();
+                    }
+                  }}
+                  placeholder="Enter your TIN Number"
+                  disabled={savingTin}
+                />
+                <div className="flex justify-end">
+                  <Button
+                    onClick={handleTinSubmit}
+                    disabled={savingTin || !tinInput.trim()}
+                  >
+                    {savingTin ? (
+                      <>
+                        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                        Saving…
+                      </>
+                    ) : (
+                      "Save & Continue"
+                    )}
+                  </Button>
+                </div>
+              </div>
             </DialogContent>
           </Dialog>
         </div>

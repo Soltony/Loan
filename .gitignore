@@ -43,3 +43,5 @@ next-env.d.ts
 # firebase
 firebase-debug.log
 firestore-debug.log
+# TIN migration reports (contain names/TINs — do not commit)
+scripts/output/

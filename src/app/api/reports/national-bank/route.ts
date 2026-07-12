@@ -317,7 +317,7 @@ export async function GET(req: NextRequest) {
         borrowerData, "NationalId", "nationalId", "national_id",
         "faydaNo", "fayda_no", "faydaNumber", "nationalIdNo"
       );
-      const tin = extractField(borrowerData, "tin", "TIN", "taxId", "tax_id");
+      const tin = extractField(borrowerData, "TINNo", "tinNo", "tin", "TIN", "taxId", "tax_id");
       const otherIdNo = extractField(
         borrowerData, "otherIdNo", "other_id", "otherId", "idNo", "id_no",
         "AccountNumber", "accountNumber"
