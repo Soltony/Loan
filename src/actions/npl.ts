@@ -60,13 +60,23 @@ async function updateNplStatusInternal(): Promise<{ success: boolean; message: s
         const borrowerIdsToFlag = [...new Set(overdueLoans.map(loan => loan.borrowerId))];
         
         try {
-            // Find borrowers to flag (exclude those already NPL)
-            const borrowersToFlag = await prisma.borrower.findMany({ where: { id: { in: borrowerIdsToFlag }, status: { not: 'NPL' } }, select: { id: true } });
+            // Find borrowers to flag (exclude those already NPL). Chunk the id
+            // list to stay under SQL Server's ~2100 query-parameter limit.
+            const CHUNK_SIZE = 1000;
+            const borrowersToFlag: { id: string }[] = [];
+            for (let i = 0; i < borrowerIdsToFlag.length; i += CHUNK_SIZE) {
+                const chunk = borrowerIdsToFlag.slice(i, i + CHUNK_SIZE);
+                const found = await prisma.borrower.findMany({ where: { id: { in: chunk }, status: { not: 'NPL' } }, select: { id: true } });
+                borrowersToFlag.push(...found);
+            }
             if (borrowersToFlag.length === 0) continue;
 
             const idsToUpdate = borrowersToFlag.map(b => b.id);
-            const { count } = await prisma.borrower.updateMany({ where: { id: { in: idsToUpdate } }, data: { status: 'NPL' } });
-            totalUpdatedCount += count;
+            for (let i = 0; i < idsToUpdate.length; i += CHUNK_SIZE) {
+                const chunk = idsToUpdate.slice(i, i + CHUNK_SIZE);
+                const { count } = await prisma.borrower.updateMany({ where: { id: { in: chunk } }, data: { status: 'NPL' } });
+                totalUpdatedCount += count;
+            }
 
             // Send SMS notification to each borrower updated
             for (const b of borrowersToFlag) {

@@ -164,62 +164,54 @@ async function collectActiveNplAccountNumbers(): Promise<string[]> {
       repaymentStatus: "Unpaid",
       borrower: { status: "NPL" },
     },
-    select: {
-      borrowerId: true,
-      borrower: {
-        select: {
-          id: true,
-          provisionedData: {
-            orderBy: { createdAt: "desc" },
-            take: 1,
-            select: { data: true },
-          },
-        },
-      },
-    },
+    select: { borrowerId: true },
   });
 
   if (nplLoans.length === 0) return [];
 
+  // Chunk id lists to stay under SQL Server's ~2100 query-parameter limit.
+  const CHUNK_SIZE = 1000;
   const borrowerIds = Array.from(new Set(nplLoans.map((l) => l.borrowerId)));
-  const phoneAccounts = await prisma.phoneAccount.findMany({
-    where: { phoneNumber: { in: borrowerIds } },
-    select: { phoneNumber: true, accountNumber: true, isActive: true },
-  });
 
   const accountByBorrower = new Map<string, string>();
-  for (const pa of phoneAccounts) {
-    const existing = accountByBorrower.get(pa.phoneNumber);
-    if (!existing || (pa.isActive && existing !== pa.accountNumber)) {
-      accountByBorrower.set(pa.phoneNumber, pa.accountNumber);
+  for (let i = 0; i < borrowerIds.length; i += CHUNK_SIZE) {
+    const chunk = borrowerIds.slice(i, i + CHUNK_SIZE);
+    const phoneAccounts = await prisma.phoneAccount.findMany({
+      where: { phoneNumber: { in: chunk } },
+      select: { phoneNumber: true, accountNumber: true, isActive: true },
+    });
+    for (const pa of phoneAccounts) {
+      const existing = accountByBorrower.get(pa.phoneNumber);
+      if (!existing || (pa.isActive && existing !== pa.accountNumber)) {
+        accountByBorrower.set(pa.phoneNumber, pa.accountNumber);
+      }
+    }
+  }
+
+  // Fall back to the latest provisionedData payload for borrowers with no
+  // registered PhoneAccount.
+  const missingIds = borrowerIds.filter((id) => !accountByBorrower.has(id));
+  for (let i = 0; i < missingIds.length; i += CHUNK_SIZE) {
+    const chunk = missingIds.slice(i, i + CHUNK_SIZE);
+    const pdRows = await prisma.provisionedData.findMany({
+      where: { borrowerId: { in: chunk } },
+      orderBy: { createdAt: "desc" },
+      select: { borrowerId: true, data: true },
+    });
+    for (const row of pdRows) {
+      if (accountByBorrower.has(row.borrowerId)) continue; // rows are newest-first
+      const account = accountNumberFromProvisionedData(row.data);
+      if (account) accountByBorrower.set(row.borrowerId, account);
     }
   }
 
   const seen = new Set<string>();
   const out: string[] = [];
-  for (const loan of nplLoans) {
-    let account = accountByBorrower.get(loan.borrowerId);
-    if (!account) {
-      const pdRaw = loan.borrower.provisionedData?.[0]?.data;
-      if (pdRaw) {
-        try {
-          const pd = JSON.parse(pdRaw);
-          const candidate =
-            pd.AccountNumber ??
-            pd.accountNumber ??
-            pd.account_number ??
-            pd.accountNo ??
-            pd.account_no ??
-            null;
-          if (candidate) account = String(candidate);
-        } catch {
-          // ignore parse error
-        }
-      }
-    }
+  for (const borrowerId of borrowerIds) {
+    const account = accountByBorrower.get(borrowerId);
     if (account && !seen.has(account)) {
       seen.add(account);
-      out.push(String(account));
+      out.push(account);
     }
   }
   return out;
