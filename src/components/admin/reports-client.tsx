@@ -84,6 +84,9 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
   const [searchQuery, setSearchQuery] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
 
+  // Aging report: classification (status) filter for the borrower-level table.
+  const [agingStatusFilter, setAgingStatusFilter] = useState("all");
+
   // Paginated data states with metadata
   const [loansData, setLoansData] = useState<LoanReportData[]>([]);
   const [loansPagination, setLoansPagination] = useState({ total: 0, page: 1, pageSize: 50, totalPages: 0 });
@@ -118,7 +121,12 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
     currentUser?.role === "Reconciliation";
 
   const isDistrictUser = currentUser?.role === "District";
+  const isBranchUser = currentUser?.role === "Branch";
   const managedBranchCodes = currentUser?.managedBranchCodes ?? [];
+
+  // District and Branch users don't manage provider funds, so the Fund
+  // Utilization report is hidden for them.
+  const showUtilizationTab = !isDistrictUser && !isBranchUser;
 
   // Check if user can view all providers (either super admin/recon OR has reports permission with multiple providers)
   // Users with a loanProviderId are bound to a specific provider and should only see that provider's reports
@@ -826,8 +834,8 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
         addSanitizedRows(ws, collectionsExportData);
       }
 
-      // 4. Fund Utilization
-      const utilizationExportData = providerList
+      // 4. Fund Utilization (hidden from District/Branch users)
+      const utilizationExportData = (showUtilizationTab ? providerList : [])
         .map((p) => {
           const data = providerSummaryData[p.id];
           if (!data) return null;
@@ -1500,7 +1508,9 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
             <TabsTrigger value="postedDisbursementRepaymentReport">Posted Disbursements with Repayments</TabsTrigger>
             <TabsTrigger value="collectionsReport">Collections</TabsTrigger>
 
-            <TabsTrigger value="utilizationReport">Fund Utilization</TabsTrigger>
+            {showUtilizationTab && (
+              <TabsTrigger value="utilizationReport">Fund Utilization</TabsTrigger>
+            )}
             <TabsTrigger value="agingReport">Aging</TabsTrigger>
             <TabsTrigger value="borrowerReport">Borrower Performance</TabsTrigger>
             <TabsTrigger value="nationalBankReport">National Bank Reporting</TabsTrigger>
@@ -2318,6 +2328,7 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
             />
           </TabsContent>
 
+          {showUtilizationTab && (
           <TabsContent value="utilizationReport">
             <Table>
               <TableHeader className="sticky top-0 bg-card z-10">
@@ -2382,6 +2393,7 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
               }}
             />
           </TabsContent>
+          )}
           <TabsContent value="agingReport">
             <Table>
               <TableHeader className="sticky top-0 bg-card z-10">
@@ -2456,15 +2468,64 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
               (() => {
                 const pdata = providerSummaryData[providerId];
                 const borrowers = pdata?.agingReport?.byBorrower || [];
+                // The provider-summary endpoint returns the full borrower list;
+                // account search and status filtering are applied client-side.
+                const searchTerm = debouncedSearch.trim().toLowerCase();
+                const filteredBorrowers = borrowers.filter((b: any) => {
+                  const matchesSearch =
+                    !searchTerm ||
+                    String(b.borrowerAccount || "")
+                      .toLowerCase()
+                      .includes(searchTerm) ||
+                    String(b.borrowerId || "")
+                      .toLowerCase()
+                      .includes(searchTerm) ||
+                    String(b.borrowerName || "")
+                      .toLowerCase()
+                      .includes(searchTerm);
+                  const matchesStatus =
+                    agingStatusFilter === "all" ||
+                    b.classification === agingStatusFilter;
+                  return matchesSearch && matchesStatus;
+                });
                 const borrowerMeta = applySortAndPaginate(
                   "borrowerAging",
-                  borrowers
+                  filteredBorrowers
                 );
+                const hasActiveFilters =
+                  !!searchTerm || agingStatusFilter !== "all";
                 return (
                   <div className="mt-6">
-                    <h3 className="text-lg font-medium mb-2">
-                      Borrower-level Aging
-                    </h3>
+                    <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
+                      <h3 className="text-lg font-medium">
+                        Borrower-level Aging
+                      </h3>
+                      <Select
+                        value={agingStatusFilter}
+                        onValueChange={(value) => {
+                          setAgingStatusFilter(value);
+                          setTableState("borrowerAging", { page: 1 });
+                        }}
+                      >
+                        <SelectTrigger className="w-[240px]">
+                          <SelectValue placeholder="Filter by status" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="all">All Statuses</SelectItem>
+                          <SelectItem value="Pass">Pass (0-29 Days)</SelectItem>
+                          <SelectItem value="Special Mention">
+                            Special Mention (30-89 Days)
+                          </SelectItem>
+                          <SelectItem value="Substandard">
+                            Substandard (90-179 Days)
+                          </SelectItem>
+                          <SelectItem value="Doubtful">
+                            Doubtful (180-359 Days)
+                          </SelectItem>
+                          <SelectItem value="Loss">Loss (360+ Days)</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
                     <Table>
                       <TableHeader className="sticky top-0 bg-card z-10">
                         <TableRow>
@@ -2496,10 +2557,12 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
                         </TableRow>
                       </TableHeader>
                       <TableBody>
-                        {borrowers.length === 0 ? (
+                        {filteredBorrowers.length === 0 ? (
                           <TableRow>
                             <TableCell colSpan={9} className="h-24 text-center">
-                              No borrower-level aging data.
+                              {hasActiveFilters
+                                ? "No borrowers match the current search/status filters."
+                                : "No borrower-level aging data."}
                             </TableCell>
                           </TableRow>
                         ) : (

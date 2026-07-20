@@ -1,12 +1,9 @@
 'use client';
 
-import React, { useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Check, ChevronsUpDown, Search } from 'lucide-react';
-import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
-import { Checkbox } from '@/components/ui/checkbox';
-import { ScrollArea } from '@/components/ui/scroll-area';
 import { cn } from '@/lib/utils';
 import { BRANCHES } from '@/lib/branches';
 
@@ -23,6 +20,83 @@ function useFilteredBranches(query: string) {
   }, [query]);
 }
 
+const PANEL_HEIGHT = 300;
+
+/**
+ * Self-contained dropdown state. Deliberately avoids Radix Popover: this picker is
+ * rendered inside a Dialog, and a portalled popover layer inside a modal layer treats
+ * clicks on its own items as "outside", which dismissed the panel on every selection.
+ */
+function useDropdown() {
+  const [open, setOpen] = useState(false);
+  const [dropUp, setDropUp] = useState(false);
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  const toggleOpen = useCallback(() => {
+    setOpen((prev) => {
+      if (!prev && containerRef.current) {
+        const rect = containerRef.current.getBoundingClientRect();
+        setDropUp(rect.bottom + PANEL_HEIGHT > window.innerHeight && rect.top > PANEL_HEIGHT);
+      }
+      return !prev;
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!open) return;
+
+    const onPointerDown = (e: MouseEvent | TouchEvent) => {
+      const el = containerRef.current;
+      if (el && !el.contains(e.target as Node)) setOpen(false);
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        // Keep Escape from also closing the surrounding dialog.
+        e.stopPropagation();
+        setOpen(false);
+      }
+    };
+
+    document.addEventListener('mousedown', onPointerDown);
+    document.addEventListener('touchstart', onPointerDown);
+    document.addEventListener('keydown', onKeyDown, true);
+    return () => {
+      document.removeEventListener('mousedown', onPointerDown);
+      document.removeEventListener('touchstart', onPointerDown);
+      document.removeEventListener('keydown', onKeyDown, true);
+    };
+  }, [open]);
+
+  return { open, setOpen, toggleOpen, dropUp, containerRef };
+}
+
+function DropdownPanel({ dropUp, children }: { dropUp: boolean; children: React.ReactNode }) {
+  return (
+    <div
+      className={cn(
+        'absolute left-0 z-50 w-full rounded-md border bg-popover text-popover-foreground shadow-md',
+        dropUp ? 'bottom-full mb-1' : 'top-full mt-1',
+      )}
+    >
+      {children}
+    </div>
+  );
+}
+
+function SearchRow({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  return (
+    <div className="flex items-center border-b px-3">
+      <Search className="mr-2 h-4 w-4 shrink-0 opacity-50" />
+      <Input
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder="Search branch by name or code..."
+        className="h-9 border-0 px-0 shadow-none focus-visible:ring-0"
+      />
+    </div>
+  );
+}
+
 interface SingleBranchPickerProps {
   value: number | null;
   onChange: (code: number | null) => void;
@@ -30,39 +104,31 @@ interface SingleBranchPickerProps {
 }
 
 export function SingleBranchPicker({ value, onChange, placeholder = 'Select a branch' }: SingleBranchPickerProps) {
-  const [open, setOpen] = useState(false);
+  const { open, setOpen, toggleOpen, dropUp, containerRef } = useDropdown();
   const [query, setQuery] = useState('');
   const filtered = useFilteredBranches(query);
   const selected = value != null ? BRANCHES.find((b) => b.code === value) : undefined;
 
   return (
-    <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger asChild>
-        <Button
-          type="button"
-          variant="outline"
-          role="combobox"
-          aria-expanded={open}
-          className="w-full justify-between font-normal"
-        >
-          <span className={cn('truncate', !selected && 'text-muted-foreground')}>
-            {selected ? `${selected.name} (${selected.code})` : placeholder}
-          </span>
-          <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
-        </Button>
-      </PopoverTrigger>
-      <PopoverContent className="w-[--radix-popover-trigger-width] p-0" align="start">
-        <div className="flex items-center border-b px-3">
-          <Search className="mr-2 h-4 w-4 shrink-0 opacity-50" />
-          <Input
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search branch by name or code..."
-            className="h-9 border-0 px-0 shadow-none focus-visible:ring-0"
-          />
-        </div>
-        <ScrollArea className="h-64">
-          <div className="p-1">
+    <div className="relative" ref={containerRef}>
+      <Button
+        type="button"
+        variant="outline"
+        role="combobox"
+        aria-expanded={open}
+        onClick={toggleOpen}
+        className="w-full justify-between font-normal"
+      >
+        <span className={cn('truncate', !selected && 'text-muted-foreground')}>
+          {selected ? `${selected.name} (${selected.code})` : placeholder}
+        </span>
+        <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
+      </Button>
+
+      {open && (
+        <DropdownPanel dropUp={dropUp}>
+          <SearchRow value={query} onChange={setQuery} />
+          <div className="max-h-64 overflow-y-auto p-1" role="listbox">
             {filtered.length === 0 ? (
               <div className="py-6 text-center text-sm text-muted-foreground">No branch found.</div>
             ) : (
@@ -70,6 +136,8 @@ export function SingleBranchPicker({ value, onChange, placeholder = 'Select a br
                 <button
                   key={b.id}
                   type="button"
+                  role="option"
+                  aria-selected={value === b.code}
                   onClick={() => {
                     onChange(b.code);
                     setOpen(false);
@@ -77,16 +145,16 @@ export function SingleBranchPicker({ value, onChange, placeholder = 'Select a br
                   }}
                   className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-left text-sm hover:bg-accent hover:text-accent-foreground"
                 >
-                  <Check className={cn('h-4 w-4', value === b.code ? 'opacity-100' : 'opacity-0')} />
+                  <Check className={cn('h-4 w-4 shrink-0', value === b.code ? 'opacity-100' : 'opacity-0')} />
                   <span className="flex-1 truncate">{b.name}</span>
                   <span className="text-xs text-muted-foreground">{b.code}</span>
                 </button>
               ))
             )}
           </div>
-        </ScrollArea>
-      </PopoverContent>
-    </Popover>
+        </DropdownPanel>
+      )}
+    </div>
   );
 }
 
@@ -97,7 +165,7 @@ interface MultiBranchPickerProps {
 }
 
 export function MultiBranchPicker({ value, onChange, placeholder = 'Select branches' }: MultiBranchPickerProps) {
-  const [open, setOpen] = useState(false);
+  const { open, toggleOpen, dropUp, containerRef } = useDropdown();
   const [query, setQuery] = useState('');
   const filtered = useFilteredBranches(query);
   const selectedSet = useMemo(() => new Set(value), [value]);
@@ -111,41 +179,33 @@ export function MultiBranchPicker({ value, onChange, placeholder = 'Select branc
   };
 
   return (
-    <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger asChild>
-        <Button
-          type="button"
-          variant="outline"
-          role="combobox"
-          aria-expanded={open}
-          className="w-full justify-between font-normal"
-        >
-          <span className={cn('truncate', value.length === 0 && 'text-muted-foreground')}>
-            {value.length === 0 ? placeholder : `${value.length} branch${value.length === 1 ? '' : 'es'} selected`}
-          </span>
-          <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
-        </Button>
-      </PopoverTrigger>
-      <PopoverContent className="w-[--radix-popover-trigger-width] p-0" align="start">
-        <div className="flex items-center border-b px-3">
-          <Search className="mr-2 h-4 w-4 shrink-0 opacity-50" />
-          <Input
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search branch by name or code..."
-            className="h-9 border-0 px-0 shadow-none focus-visible:ring-0"
-          />
-        </div>
-        <div className="flex items-center justify-between border-b px-3 py-1.5 text-xs text-muted-foreground">
-          <span>{value.length} selected</span>
-          {value.length > 0 && (
-            <button type="button" className="hover:text-foreground underline" onClick={() => onChange([])}>
-              Clear
-            </button>
-          )}
-        </div>
-        <ScrollArea className="h-64">
-          <div className="p-1">
+    <div className="relative" ref={containerRef}>
+      <Button
+        type="button"
+        variant="outline"
+        role="combobox"
+        aria-expanded={open}
+        onClick={toggleOpen}
+        className="w-full justify-between font-normal"
+      >
+        <span className={cn('truncate', value.length === 0 && 'text-muted-foreground')}>
+          {value.length === 0 ? placeholder : `${value.length} branch${value.length === 1 ? '' : 'es'} selected`}
+        </span>
+        <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
+      </Button>
+
+      {open && (
+        <DropdownPanel dropUp={dropUp}>
+          <SearchRow value={query} onChange={setQuery} />
+          <div className="flex items-center justify-between border-b px-3 py-1.5 text-xs text-muted-foreground">
+            <span>{value.length} selected</span>
+            {value.length > 0 && (
+              <button type="button" className="underline hover:text-foreground" onClick={() => onChange([])}>
+                Clear
+              </button>
+            )}
+          </div>
+          <div className="max-h-64 overflow-y-auto p-1" role="listbox" aria-multiselectable>
             {filtered.length === 0 ? (
               <div className="py-6 text-center text-sm text-muted-foreground">No branch found.</div>
             ) : (
@@ -153,18 +213,27 @@ export function MultiBranchPicker({ value, onChange, placeholder = 'Select branc
                 <button
                   key={b.id}
                   type="button"
+                  role="option"
+                  aria-selected={selectedSet.has(b.code)}
                   onClick={() => toggle(b.code)}
                   className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-left text-sm hover:bg-accent hover:text-accent-foreground"
                 >
-                  <Checkbox checked={selectedSet.has(b.code)} className="pointer-events-none" />
+                  <span
+                    className={cn(
+                      'flex h-4 w-4 shrink-0 items-center justify-center rounded-sm border border-primary',
+                      selectedSet.has(b.code) ? 'bg-primary text-primary-foreground' : 'bg-transparent',
+                    )}
+                  >
+                    <Check className={cn('h-3.5 w-3.5', selectedSet.has(b.code) ? 'opacity-100' : 'opacity-0')} />
+                  </span>
                   <span className="flex-1 truncate">{b.name}</span>
                   <span className="text-xs text-muted-foreground">{b.code}</span>
                 </button>
               ))
             )}
           </div>
-        </ScrollArea>
-      </PopoverContent>
-    </Popover>
+        </DropdownPanel>
+      )}
+    </div>
   );
 }

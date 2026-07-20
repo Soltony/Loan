@@ -89,27 +89,6 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: GENERIC_AUTH_ERROR, retriesLeft: remaining, delaySeconds: backoff }, { status: 401 });
     }
 
-    if (user.status === 'Inactive') {
-        const logDetails = {
-            reason: 'User account is inactive',
-            userId: user.id,
-            attemptedPhoneNumber: phoneNumber,
-        };
-        await createAuditLog({
-            actorId: user.id,
-            action: 'USER_LOGIN_FAILURE',
-            ipAddress,
-            userAgent,
-            details: logDetails
-        });
-        // Do not disclose account state on login.
-        recordFailedAttempt(validatedRateKey);
-        const backoff = getBackoffSeconds(validatedRateKey);
-        if (backoff > 0) await new Promise((res) => setTimeout(res, backoff * 1000));
-        const remaining = getRemainingAttempts(validatedRateKey);
-        return NextResponse.json({ error: GENERIC_AUTH_ERROR, retriesLeft: remaining, delaySeconds: backoff }, { status: 401 });
-    }
-
     const isPasswordValid = await bcrypt.compare(password, user.password);
 
      if (!isPasswordValid) {
@@ -139,6 +118,28 @@ export async function POST(req: NextRequest) {
        if (backoff > 0) await new Promise((res) => setTimeout(res, backoff * 1000));
        const remaining = getRemainingAttempts(validatedRateKey);
        return NextResponse.json({ error: GENERIC_AUTH_ERROR, retriesLeft: remaining, delaySeconds: backoff }, { status: 401 });
+    }
+
+    // Credentials are valid, so it is safe to disclose the account state now.
+    // Deactivated users get an explicit message instead of the generic
+    // "invalid credentials" error, and no failed attempt is recorded.
+    if (user.status === 'Inactive') {
+        const logDetails = {
+            reason: 'User account is inactive',
+            userId: user.id,
+            attemptedPhoneNumber: phoneNumber,
+        };
+        await createAuditLog({
+            actorId: user.id,
+            action: 'USER_LOGIN_FAILURE',
+            ipAddress,
+            userAgent,
+            details: logDetails
+        });
+        return NextResponse.json(
+            { error: 'Your account is inactive. Please contact an administrator to reactivate your account.' },
+            { status: 403 }
+        );
     }
 
      // Successful login: clear any recorded failed attempts

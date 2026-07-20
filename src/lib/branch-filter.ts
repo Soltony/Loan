@@ -87,41 +87,60 @@ export function getEffectiveBranchCodes(
   return userCodes;
 }
 
+/** Recursively find a `Branchcode`/`branchcode` key (it lives under `detail` in CBS payloads). */
+function extractBranchCode(value: unknown): number | null {
+  if (value == null || typeof value !== 'object') return null;
+  for (const [key, v] of Object.entries(value as Record<string, unknown>)) {
+    if (key.toLowerCase() === 'branchcode') {
+      const n = typeof v === 'number' ? v : parseInt(String(v), 10);
+      if (Number.isFinite(n)) return n;
+    } else if (v && typeof v === 'object') {
+      const nested = extractBranchCode(v);
+      if (nested != null) return nested;
+    }
+  }
+  return null;
+}
+
 export async function getBorrowerIdsForBranchCode(branchCode: number): Promise<string[]> {
-  const patterns = [
-    `"Branchcode":${branchCode}`,
-    `"Branchcode": ${branchCode}`,
-    `"branchcode":${branchCode}`,
-    `"branchcode": ${branchCode}`,
-  ];
-
-  const rows = await prisma.provisionedData.findMany({
-    where: { OR: patterns.map((p) => ({ data: { contains: p } })) },
-    select: { borrowerId: true },
-  });
-
-  return [...new Set(rows.map((r) => r.borrowerId))];
+  return getBorrowerIdsForBranchCodes([branchCode]);
 }
 
 export async function getBorrowerIdsForBranchCodes(branchCodes: number[]): Promise<string[]> {
   if (branchCodes.length === 0) return [];
-  if (branchCodes.length === 1) {
-    return getBorrowerIdsForBranchCode(branchCodes[0]);
-  }
 
+  // `contains` is only a prefilter: '"Branchcode":4' also matches 40, 409, ...
+  // so every candidate row is re-checked against the parsed JSON below.
   const patterns = branchCodes.flatMap((branchCode) => [
     `"Branchcode":${branchCode}`,
     `"Branchcode": ${branchCode}`,
     `"branchcode":${branchCode}`,
     `"branchcode": ${branchCode}`,
+    `"Branchcode":"${branchCode}"`,
+    `"Branchcode": "${branchCode}"`,
+    `"branchcode":"${branchCode}"`,
+    `"branchcode": "${branchCode}"`,
   ]);
 
   const rows = await prisma.provisionedData.findMany({
     where: { OR: patterns.map((p) => ({ data: { contains: p } })) },
-    select: { borrowerId: true },
+    select: { borrowerId: true, data: true },
   });
 
-  return [...new Set(rows.map((r) => r.borrowerId))];
+  const wanted = new Set(branchCodes);
+  const borrowerIds = new Set<string>();
+  for (const row of rows) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(row.data);
+    } catch {
+      continue;
+    }
+    const code = extractBranchCode(parsed);
+    if (code != null && wanted.has(code)) borrowerIds.add(row.borrowerId);
+  }
+
+  return [...borrowerIds];
 }
 
 function intersectBorrowerIds(existing: string[], branchBorrowerIds: string[]): string[] {

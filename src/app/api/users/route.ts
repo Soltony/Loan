@@ -2,6 +2,7 @@
 
 import { NextRequest, NextResponse } from 'next/server';
 import prisma from '@/lib/prisma';
+import { Prisma } from '@prisma/client';
 import bcrypt from 'bcryptjs';
 import { z, ZodError } from 'zod';
 import { loginSchema, passwordSchema, phoneNumberSchema } from '@/lib/validators';
@@ -26,6 +27,35 @@ const userSchema = z.object({
   branchCode: z.number().int().positive().nullable().optional(),
   managedBranchCodes: z.array(z.number().int().positive()).nullable().optional(),
 });
+
+// User-facing message for a unique-constraint violation (duplicate email/phone),
+// so a duplicate registration doesn't surface as "Internal Server Error".
+function duplicateUserResponse(error: Prisma.PrismaClientKnownRequestError) {
+  const target = Array.isArray(error.meta?.target)
+    ? (error.meta?.target as string[]).join(',')
+    : String(error.meta?.target ?? '');
+  const normalized = target.toLowerCase();
+  let field = 'email address or phone number';
+  if (normalized.includes('email')) field = 'email address';
+  else if (normalized.includes('phone')) field = 'phone number';
+  return NextResponse.json(
+    { error: `A user with this ${field} already exists.` },
+    { status: 409 }
+  );
+}
+
+// Validation failures raised as plain Errors inside the handlers; these should
+// come back to the client as 400s with their message, not generic 500s.
+const KNOWN_VALIDATION_ERRORS = new Set([
+  'Password is required for new users.',
+  'Invalid role selected.',
+  'User ID is required for an update.',
+]);
+
+function zodIssuesMessage(err: ZodError): string {
+  const messages = err.errors.map((issue) => issue.message).filter(Boolean);
+  return messages.length ? messages.join(' ') : 'Invalid request';
+}
 
 // Map role-relevant branch fields to the persisted shape. `District` stores the
 // list as a JSON string; everyone except `Branch`/`District` clears both.
@@ -131,8 +161,8 @@ export async function POST(req: NextRequest) {
         const backoff = getBackoffSeconds(rateKey);
         if (backoff > 0) await new Promise((res) => setTimeout(res, backoff * 1000));
         const remaining = getRemainingAttempts(rateKey);
-        // Return sanitized validation issues
-        return NextResponse.json({ error: 'Invalid password.', retriesLeft: remaining, delaySeconds: backoff, issues: err.errors }, { status: 400 });
+        // Return sanitized validation issues with a readable description
+        return NextResponse.json({ error: `Invalid password: ${zodIssuesMessage(err)}`, retriesLeft: remaining, delaySeconds: backoff, issues: err.errors }, { status: 400 });
       }
       // Unexpected error: log & return generic message
       return handleApiError(err, { operation: 'POST /api/users' });
@@ -218,7 +248,13 @@ export async function POST(req: NextRequest) {
      await createAuditLog({ actorId: user.id, action: 'USER_CREATE_FAILED', entity: 'USER', details: failureLogDetails, ipAddress, userAgent });
      console.error(JSON.stringify({ ...failureLogDetails, action: 'USER_CREATE_FAILED', actorId: user.id }));
     if (error instanceof ZodError) {
-      return NextResponse.json({ error: 'Invalid request', issues: error.errors }, { status: 400 });
+      return NextResponse.json({ error: zodIssuesMessage(error), issues: error.errors }, { status: 400 });
+    }
+    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+      return duplicateUserResponse(error);
+    }
+    if (error instanceof Error && KNOWN_VALIDATION_ERRORS.has(error.message)) {
+      return NextResponse.json({ error: error.message }, { status: 400 });
     }
     return handleApiError(error, { operation: 'POST /api/users' });
   }
@@ -232,9 +268,10 @@ export async function PUT(req: NextRequest) {
 
     const ipAddress = req.ip || req.headers.get('x-forwarded-for') || 'N/A';
     const userAgent = req.headers.get('user-agent') || 'N/A';
+    let body: any = null;
   try {
 
-    const body = await req.json();
+    body = await req.json();
     const { id, role: roleName, providerId, password, branchCode, managedBranchCodes, ...userData } = body;
 
     if (!id) {
@@ -366,6 +403,15 @@ export async function PUT(req: NextRequest) {
     const failureLogDetails = { error: errorMessage };
     await createAuditLog({ actorId: user.id, action: 'USER_UPDATE_FAILED', entity: 'USER', details: failureLogDetails, ipAddress, userAgent });
     console.error(JSON.stringify({ ...failureLogDetails, action: 'USER_UPDATE_FAILED', actorId: user.id }));
+    if (error instanceof ZodError) {
+      return NextResponse.json({ error: zodIssuesMessage(error), issues: error.errors }, { status: 400 });
+    }
+    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+      return duplicateUserResponse(error);
+    }
+    if (error instanceof Error && KNOWN_VALIDATION_ERRORS.has(error.message)) {
+      return NextResponse.json({ error: error.message }, { status: 400 });
+    }
     return handleApiError(error, { operation: 'PUT /api/users', info: { userId: body?.id } });
   }
 }
