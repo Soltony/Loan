@@ -49,6 +49,17 @@ interface LoanOfferAndCalculatorProps {
   isSubmitting?: boolean;
 }
 
+/**
+ * Percentage core banking deducts from the principal at disbursement.
+ * Core performs this deduction itself — we always wire it the gross amount — so this
+ * rate is disclosure-only. It never changes what we send out or what we record on the loan.
+ * Set via NEXT_PUBLIC_CORE_DEDUCTED_TAX_RATE (e.g. "1" for 1%); 0 or unset hides the row.
+ */
+const CORE_DEDUCTED_TAX_RATE =
+  Number(process.env.NEXT_PUBLIC_CORE_DEDUCTED_TAX_RATE) || 0;
+
+const round2 = (value: number) => Math.round((value + Number.EPSILON) * 100) / 100;
+
 const formatCurrency = (amount: number) => {
   if (amount === null || amount === undefined || isNaN(amount))
     return "0.00 ETB";
@@ -188,6 +199,16 @@ export function LoanOfferAndCalculator({
       // Calculate inclusive tax (deducted from principal before disbursement)
       const inclusiveTax = calculateInclusiveTax(numericLoanAmount, taxConfigs);
 
+      // Tax core banking deducts on its own. Disclosure only — see CORE_DEDUCTED_TAX_RATE.
+      const coreDeductedTaxAmount =
+        CORE_DEDUCTED_TAX_RATE > 0
+          ? round2(numericLoanAmount * (CORE_DEDUCTED_TAX_RATE / 100))
+          : 0;
+
+      const totalDeductedAtDisbursement = round2(
+        inclusiveTax.taxAmount + coreDeductedTaxAmount,
+      );
+
       setCalculationResult({
         ...result,
         disbursedDate,
@@ -195,6 +216,12 @@ export function LoanOfferAndCalculator({
         penaltyAmount: 0,
         inclusiveTaxAmount: inclusiveTax.taxAmount,
         netDisbursedAmount: inclusiveTax.netDisbursedAmount,
+        coreDeductedTaxAmount,
+        totalDeductedAtDisbursement,
+        // What actually lands in the borrower's account, whoever performs the deduction.
+        netReceivedAmount: round2(
+          numericLoanAmount - totalDeductedAtDisbursement,
+        ),
       });
     };
 
@@ -402,8 +429,9 @@ export function LoanOfferAndCalculator({
                 </Collapsible>
               </div>
 
-              {/* Inclusive Tax Breakdown - show when tax is deducted from principal */}
-              {calculationResult.inclusiveTaxAmount > 0 && (
+              {/* Tax Breakdown - shown whenever the borrower receives less than the
+                  loan amount, whether this system or core banking performs the deduction. */}
+              {calculationResult.totalDeductedAtDisbursement > 0 && (
                 <div className="space-y-2 text-sm bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800 p-4 rounded-lg">
                   <div className="font-medium text-amber-800 dark:text-amber-300 mb-2">
                     Tax Deduction at Disbursement
@@ -418,13 +446,20 @@ export function LoanOfferAndCalculator({
                   </div>
                   <div className="flex justify-between items-center text-amber-700 dark:text-amber-400">
                     <div>
-                      {taxConfigs
-                        .filter((t) => t.isInclusive && t.rate > 0)
-                        .map((t) => t.name || `Tax (${t.rate}%)`)
-                        .join(" + ")}
+                      {[
+                        ...taxConfigs
+                          .filter((t) => t.isInclusive && t.rate > 0)
+                          .map((t) => t.name || `Tax (${t.rate}%)`),
+                        ...(calculationResult.coreDeductedTaxAmount > 0
+                          ? [`Tax Deducted (${CORE_DEDUCTED_TAX_RATE}%)`]
+                          : []),
+                      ].join(" + ")}
                     </div>
                     <div className="text-right font-medium">
-                      − {formatCurrency(calculationResult.inclusiveTaxAmount)}
+                      −{" "}
+                      {formatCurrency(
+                        calculationResult.totalDeductedAtDisbursement,
+                      )}
                     </div>
                   </div>
                   <div className="border-t border-amber-200 dark:border-amber-700 pt-2 flex justify-between items-center">
@@ -433,7 +468,7 @@ export function LoanOfferAndCalculator({
                       className="text-right font-bold"
                       style={{ color: providerColor }}
                     >
-                      {formatCurrency(calculationResult.netDisbursedAmount)}
+                      {formatCurrency(calculationResult.netReceivedAmount)}
                     </div>
                   </div>
                 </div>

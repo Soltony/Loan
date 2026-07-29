@@ -21,6 +21,10 @@ const INTEREST_ACCRUAL_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 const PENALTY_ACCRUAL_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 const CBS_NPL_UPLOAD_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 const NPL_STATUS_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const CBS_NPL_RETRY_INTERVAL_MS =
+  (Number(process.env.NPL_RETRY_INTERVAL_MINUTES) > 0
+    ? Math.floor(Number(process.env.NPL_RETRY_INTERVAL_MINUTES))
+    : 5) * 60 * 1000; // 5 minutes
 
 async function runProviderDistributionServiceLoop() {
   while (true) {
@@ -121,6 +125,25 @@ async function runCbsNplUploadServiceLoop() {
   }
 }
 
+async function runCbsNplRetryServiceLoop() {
+  logger.info('CBS NPL retry service started');
+  while (true) {
+    try {
+      const { retryFailedCreditNotificationsOnce } = await import('./actions/cbs-npl');
+      const result = await retryFailedCreditNotificationsOnce();
+      if (result.eligible > 0) {
+        logger.info(
+          `CBS NPL retry sweep finished scanned=${result.scanned} eligible=${result.eligible} retried=${result.retried} collected=${result.collected} stillFailing=${result.stillFailing}`,
+        );
+      }
+    } catch (error) {
+      console.error(`[${new Date().toISOString()}] Error during CBS NPL retry cycle:`, error);
+      logger.error(`Error during CBS NPL retry cycle: ${String(error)}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, CBS_NPL_RETRY_INTERVAL_MS));
+  }
+}
+
 async function main() {
   const task = process.argv[2];
 
@@ -199,6 +222,21 @@ async function main() {
       case 'cbs-npl-upload-service':
         logger.info('Starting cbs-npl-upload-service long-running loop');
         await runCbsNplUploadServiceLoop();
+        break;
+      case 'cbs-npl-retry':
+        logger.info('Running one-off cbs-npl-retry sweep');
+        {
+          const { retryFailedCreditNotificationsOnce } = await import('./actions/cbs-npl');
+          const result = await retryFailedCreditNotificationsOnce();
+          logger.info(
+            `One-off CBS NPL retry sweep finished scanned=${result.scanned} eligible=${result.eligible} retried=${result.retried} collected=${result.collected} stillFailing=${result.stillFailing}`,
+          );
+        }
+        process.exit(0);
+        break;
+      case 'cbs-npl-retry-service':
+        logger.info('Starting cbs-npl-retry-service long-running loop');
+        await runCbsNplRetryServiceLoop();
         break;
       default:
         console.error(`Error: Unknown task "${task}".`);

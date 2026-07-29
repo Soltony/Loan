@@ -645,9 +645,24 @@ export async function attemptRepayForNotification(
   if (!Number.isFinite(accountMinimumBalance)) accountMinimumBalance = 0;
 
   const availableBalance = Number((currentBalance - accountMinimumBalance).toFixed(2));
+
+  // The CBS sometimes notifies us before the credit has settled on the
+  // account, so `currentBalance` is a pre-credit snapshot and the available
+  // balance reads far lower than what is really there — sometimes zero,
+  // sometimes a small leftover. Whenever the reported available balance is
+  // below the credited amount the snapshot cannot include the credit, so
+  // collect against the credit instead. The CBS /repay call stays the
+  // authority and will reject if the funds genuinely are not there yet.
+  const creditedAmount = Number(notification.creditedAmount);
+  const hasCredit = Number.isFinite(creditedAmount) && creditedAmount > 0.01;
+  const usedCreditFallback = hasCredit && creditedAmount > availableBalance;
+  const collectableBalance = usedCreditFallback
+    ? Number(creditedAmount.toFixed(2))
+    : availableBalance;
+
   const amountToCollect = Math.min(
     Number(totalOutstanding.toFixed(2)),
-    availableBalance,
+    collectableBalance,
   );
 
   console.log("[CBS-NPL][Repay] Balance-based collection", {
@@ -656,8 +671,19 @@ export async function attemptRepayForNotification(
     currentBalance,
     accountMinimumBalance,
     availableBalance,
+    creditedAmount,
+    usedCreditFallback,
+    collectableBalance,
     amountToCollect,
   });
+
+  if (usedCreditFallback) {
+    void logger.warn(
+      `[CBS-NPL] Stale balance for notification=${notification.id} account=${notification.accountNumber} ` +
+        `(currentBalance=${currentBalance}, minimum=${accountMinimumBalance}, available=${availableBalance} < credited=${collectableBalance}); ` +
+        `collecting against the credited amount instead.`,
+    );
+  }
 
   // Nothing collectable: balance at/under the minimum. Keep retriable so a
   // future notification with more funds can collect later.
@@ -668,7 +694,7 @@ export async function attemptRepayForNotification(
         processStatus: "FAILED",
         borrowerId,
         loanId: loan.id,
-        resultMessage: `Insufficient available balance to collect (currentBalance=${currentBalance}, accountMinimumBalance=${accountMinimumBalance}, available=${availableBalance}).`,
+        resultMessage: `Insufficient available balance to collect (currentBalance=${currentBalance}, accountMinimumBalance=${accountMinimumBalance}, available=${availableBalance}, credited=${Number.isFinite(creditedAmount) ? creditedAmount : 0}).`,
         attempts: { increment: 1 },
         lastAttemptAt: new Date(),
       },
@@ -836,6 +862,112 @@ export async function attemptRepayForNotification(
       (repaySuccess ? "Repayment collected." : "Repayment failed."),
     repayResponse: repayData ?? null,
   };
+}
+
+// ------------------------------------------------------------------
+// 2b. Automatic retry sweep for failed collections
+// ------------------------------------------------------------------
+
+const readIntEnv = (key: string, fallback: number) => {
+  const parsed = Number(process.env[key]);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+};
+
+/** Stop retrying a notification once it has been attempted this many times. */
+const getRetryMaxAttempts = () => readIntEnv("NPL_RETRY_MAX_ATTEMPTS", 24);
+/** Stop retrying once the credit is this old — the funds are long gone. */
+const getRetryMaxAgeHours = () => readIntEnv("NPL_RETRY_MAX_AGE_HOURS", 48);
+/** Cap the work done in a single sweep so one tick can never run away. */
+const getRetryBatchSize = () => readIntEnv("NPL_RETRY_BATCH_SIZE", 50);
+
+// The only failure the sweep retries: our own pre-flight check found no
+// collectable balance, which resolves on its own once the CBS ledger catches up
+// with the credit. Every other FAILED message is left alone — transport errors
+// ("Request timed out after 20000ms", "3 failed") may have debited the
+// customer without us seeing the response, and the rest fail identically on
+// every attempt.
+const INSUFFICIENT_BALANCE_MESSAGE_PREFIX = "Insufficient available balance to collect";
+
+function isInsufficientBalanceFailure(resultMessage: string | null): boolean {
+  return Boolean(resultMessage?.startsWith(INSUFFICIENT_BALANCE_MESSAGE_PREFIX));
+}
+
+export interface RetrySweepResult {
+  scanned: number;
+  eligible: number;
+  retried: number;
+  collected: number;
+  stillFailing: number;
+}
+
+/**
+ * Re-attempt the FAILED credit notifications that failed our insufficient
+ * available balance check. Covers the CBS race where the balance snapshot had
+ * not caught up with the credit at notification time, so the first attempt
+ * found nothing to take. Intended to run on a short interval from the worker;
+ * safe to run concurrently with inbound webhooks because each notification
+ * carries a fixed correlationId that the CBS treats as an idempotency key.
+ */
+export async function retryFailedCreditNotificationsOnce(): Promise<RetrySweepResult> {
+  const maxAttempts = getRetryMaxAttempts();
+  const batchSize = getRetryBatchSize();
+  const cutoff = new Date(Date.now() - getRetryMaxAgeHours() * 60 * 60 * 1000);
+
+  // Scan wider than the batch because the message filter runs in JS: matching
+  // in SQL would depend on the column's collation for case handling.
+  const scanned = await prisma.nplCreditNotification.findMany({
+    where: {
+      processStatus: "FAILED",
+      creditedAmount: { gt: 0.01 },
+      attempts: { lt: maxAttempts },
+      receivedAt: { gte: cutoff },
+    },
+    orderBy: { receivedAt: "asc" },
+    take: batchSize * 4,
+    select: { id: true, accountNumber: true, resultMessage: true },
+  });
+
+  const candidates = scanned
+    .filter((n) => isInsufficientBalanceFailure(n.resultMessage))
+    .slice(0, batchSize);
+
+  const result: RetrySweepResult = {
+    scanned: scanned.length,
+    eligible: candidates.length,
+    retried: 0,
+    collected: 0,
+    stillFailing: 0,
+  };
+  if (candidates.length === 0) return result;
+
+  console.log("[CBS-NPL][RetrySweep] Starting", {
+    scanned: scanned.length,
+    candidates: candidates.length,
+  });
+
+  for (const candidate of candidates) {
+    try {
+      const attempt = await attemptRepayForNotification(candidate.id, "cbs-npl-retry-service");
+      result.retried += 1;
+      if (attempt.status === "REPAID" || attempt.status === "PARTIAL_REPAID") {
+        result.collected += 1;
+      } else if (attempt.status === "FAILED") {
+        result.stillFailing += 1;
+      }
+    } catch (error) {
+      result.stillFailing += 1;
+      console.error("[CBS-NPL][RetrySweep] Attempt threw", {
+        notificationId: candidate.id,
+        error: String(error),
+      });
+      void logger.error(
+        `[CBS-NPL] Retry sweep failed for notification=${candidate.id}: ${String(error)}`,
+      );
+    }
+  }
+
+  console.log("[CBS-NPL][RetrySweep] Finished", result);
+  return result;
 }
 
 /**
