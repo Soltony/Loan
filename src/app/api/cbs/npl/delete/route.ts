@@ -3,6 +3,7 @@ import { z } from "zod";
 import prisma from "@/lib/prisma";
 import { getUserFromSession } from "@/lib/user";
 import { deleteNplAccountFromCbs } from "@/actions/cbs-npl";
+import { parseDayEnd, parseDayStart } from "@/lib/date-utils";
 
 // Permission key used to gate access. Falls back to admin-level checks.
 const REQUIRED_PERMS = ["npl-collection", "npl"] as const;
@@ -11,6 +12,9 @@ function userHasAnyPerm(user: any, action: "read" | "update" | "create" | "delet
   if (!user?.permissions) return false;
   return REQUIRED_PERMS.some((key) => Boolean(user.permissions[key]?.[action]));
 }
+
+// Upper bound on rows returned to an export request, to keep the payload sane.
+const EXPORT_ROW_CAP = 10000;
 
 const bodySchema = z.object({
   accountNumbers: z.array(z.string().trim().min(1)).min(1).max(1000),
@@ -89,13 +93,27 @@ export async function GET(req: NextRequest) {
   const url = new URL(req.url);
   const page = Math.max(1, Number(url.searchParams.get("page") ?? 1));
   const limit = Math.min(100, Math.max(1, Number(url.searchParams.get("limit") ?? 20)));
+  const from = url.searchParams.get("from");
+  const to = url.searchParams.get("to");
+  // `all=1` returns every matching row (capped) for spreadsheet exports.
+  const exportAll = url.searchParams.get("all") === "1";
+
+  const where: any = {};
+  const fromDate = parseDayStart(from);
+  const toDate = parseDayEnd(to);
+  if (fromDate || toDate) {
+    where.createdAt = {};
+    if (fromDate) where.createdAt.gte = fromDate;
+    if (toDate) where.createdAt.lte = toDate;
+  }
 
   const [total, rows] = await Promise.all([
-    prisma.nplCbsDeletion.count(),
+    prisma.nplCbsDeletion.count({ where }),
     prisma.nplCbsDeletion.findMany({
+      where,
       orderBy: { createdAt: "desc" },
-      skip: (page - 1) * limit,
-      take: limit,
+      skip: exportAll ? undefined : (page - 1) * limit,
+      take: exportAll ? EXPORT_ROW_CAP : limit,
     }),
   ]);
 
@@ -104,6 +122,7 @@ export async function GET(req: NextRequest) {
     limit,
     total,
     totalPages: Math.max(1, Math.ceil(total / limit)),
+    truncated: exportAll && total > EXPORT_ROW_CAP,
     rows: rows.map((r) => ({
       id: r.id,
       accountNumber: r.accountNumber,
