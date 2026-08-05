@@ -2,11 +2,15 @@ import { NextRequest, NextResponse } from "next/server";
 import prisma from "@/lib/prisma";
 import { getUserFromSession } from "@/lib/user";
 
+const RESOLVABLE_STATUSES = ["PENDING", "FAILED"];
+
 /**
  * GET /api/pending-payments
  *
- * Returns pending payments (status = PENDING) with related loan and borrower info.
- * Supports pagination, search by transactionId or borrowerId, and date filtering.
+ * Returns unresolved payments (status = PENDING or FAILED) with related loan and
+ * borrower info. FAILED rows are payments the callback refused to post (e.g. an
+ * overpayment) and still need a manual resolution.
+ * Supports pagination, search by transactionId or borrowerId, status and date filtering.
  */
 export async function GET(req: NextRequest) {
   const user = await getUserFromSession();
@@ -27,9 +31,15 @@ export async function GET(req: NextRequest) {
   const from = url.searchParams.get("from");
   const to = url.searchParams.get("to");
   const search = url.searchParams.get("search")?.trim();
+  const statusParam = url.searchParams.get("status")?.trim().toUpperCase();
+
+  // Default to every unresolved status; a single valid status narrows it down.
+  const statuses = RESOLVABLE_STATUSES.includes(statusParam || "")
+    ? [statusParam as string]
+    : RESOLVABLE_STATUSES;
 
   const where: any = {
-    status: "PENDING",
+    status: { in: statuses },
   };
 
   if (from || to) {

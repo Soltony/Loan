@@ -222,6 +222,19 @@ export function PendingPaymentApprovalsClient({
     }
   };
 
+  // Requests raised against a FAILED payment (e.g. an overpayment the callback
+  // refused to post) are worth flagging to the checker.
+  const getOriginalStatus = (
+    change: PendingPaymentApproval
+  ): string | null => {
+    try {
+      const data = JSON.parse(change.payload);
+      return data?.created?.originalStatus || null;
+    } catch {
+      return null;
+    }
+  };
+
   const getPaymentDate = (change: PendingPaymentApproval): string | null => {
     try {
       const data = JSON.parse(change.payload);
@@ -265,10 +278,18 @@ export function PendingPaymentApprovalsClient({
                     const ftRef = getFtReference(change);
                     const amount = getAmount(change);
                     const pDate = getPaymentDate(change);
+                    const originalStatus = getOriginalStatus(change);
                     return (
                       <TableRow key={change.id}>
                         <TableCell className="font-medium">
-                          <div>Mark Payment Successful</div>
+                          <div className="flex items-center gap-2">
+                            <span>Mark Payment Successful</span>
+                            {originalStatus === "FAILED" && (
+                              <Badge className="bg-red-600 text-white">
+                                Was Failed
+                              </Badge>
+                            )}
+                          </div>
                           <div className="text-sm text-muted-foreground">
                             {change.entityName}
                           </div>

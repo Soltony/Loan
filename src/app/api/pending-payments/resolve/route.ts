@@ -3,10 +3,12 @@ import prisma from "@/lib/prisma";
 import { getUserFromSession } from "@/lib/user";
 import { createAuditLog } from "@/lib/audit-log";
 
+const RESOLVABLE_STATUSES = ["PENDING", "FAILED"];
+
 /**
  * POST /api/pending-payments/resolve
  *
- * Creates a maker-checker pending change request to mark a pending payment as successful.
+ * Creates a maker-checker pending change request to mark a pending or failed payment as successful.
  * The actual recording of the repayment happens when the request is approved.
  *
  * Body: { pendingPaymentId: string, ftReference: string }
@@ -70,7 +72,9 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  if (pendingPayment.status !== "PENDING") {
+  // FAILED payments (e.g. an overpayment the callback refused to post) can also be
+  // resolved manually; only already-COMPLETED ones are off limits.
+  if (!RESOLVABLE_STATUSES.includes(pendingPayment.status)) {
     return NextResponse.json(
       {
         error: `This payment has already been ${pendingPayment.status.toLowerCase()}`,
@@ -110,6 +114,7 @@ export async function POST(req: NextRequest) {
         created: {
           pendingPaymentId: pendingPayment.id,
           transactionId: pendingPayment.transactionId,
+          originalStatus: pendingPayment.status,
           ftReference,
           loanId: pendingPayment.loanId,
           borrowerId: pendingPayment.borrowerId,

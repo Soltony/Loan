@@ -36,6 +36,13 @@ import {
 import { Label } from "@/components/ui/label";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Calendar } from "@/components/ui/calendar";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { cn } from "@/lib/utils";
 
 type PendingPaymentRow = {
@@ -68,6 +75,8 @@ type PendingPaymentRow = {
 
 const ITEMS_PER_PAGE = 20;
 
+type StatusFilter = "ALL" | "PENDING" | "FAILED";
+
 export default function PendingPaymentsPage() {
   useRequirePermission("reversals");
 
@@ -80,6 +89,7 @@ export default function PendingPaymentsPage() {
   const [toDate, setToDate] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>("ALL");
   const [resolveDialogOpen, setResolveDialogOpen] = useState(false);
   const [resolvingRow, setResolvingRow] = useState<PendingPaymentRow | null>(
     null
@@ -104,8 +114,9 @@ export default function PendingPaymentsPage() {
     if (fromDate) p.set("from", fromDate);
     if (toDate) p.set("to", toDate);
     if (debouncedSearch) p.set("search", debouncedSearch);
+    if (statusFilter !== "ALL") p.set("status", statusFilter);
     return p.toString();
-  }, [page, fromDate, toDate, debouncedSearch]);
+  }, [page, fromDate, toDate, debouncedSearch, statusFilter]);
 
   useEffect(() => {
     const fetchRows = async () => {
@@ -189,6 +200,9 @@ export default function PendingPaymentsPage() {
     if (row.pendingApproval) {
       return <Badge variant="outline">Pending Approval</Badge>;
     }
+    if (row.status === "FAILED") {
+      return <Badge className="bg-red-600 text-white">Failed</Badge>;
+    }
     return <Badge className="bg-yellow-600 text-white">Pending</Badge>;
   };
 
@@ -200,11 +214,30 @@ export default function PendingPaymentsPage() {
             Pending Payments
           </h2>
           <p className="text-muted-foreground">
-            Pending payments that can be marked as successful by providing the FT
-            reference number.
+            Pending and failed payments that can be marked as successful by
+            providing the FT reference number.
           </p>
         </div>
         <div className="flex items-end gap-2">
+          <div className="flex flex-col gap-1">
+            <span className="text-xs text-muted-foreground">Status</span>
+            <Select
+              value={statusFilter}
+              onValueChange={(v) => {
+                setStatusFilter(v as StatusFilter);
+                setPage(1);
+              }}
+            >
+              <SelectTrigger className="w-[140px]">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="ALL">All</SelectItem>
+                <SelectItem value="PENDING">Pending</SelectItem>
+                <SelectItem value="FAILED">Failed</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
           <div className="flex flex-col gap-1">
             <span className="text-xs text-muted-foreground">From</span>
             <Input
@@ -254,7 +287,8 @@ export default function PendingPaymentsPage() {
           <CardTitle>Pending Payments</CardTitle>
           <CardDescription>
             Submit a resolve request with an FT reference number to mark a
-            pending payment as successful. Requires approval from another user.
+            pending or failed payment as successful. Requires approval from
+            another user.
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -324,7 +358,7 @@ export default function PendingPaymentsPage() {
               ) : (
                 <TableRow>
                   <TableCell colSpan={9} className="h-24 text-center">
-                    No pending payments found.
+                    No unresolved payments found.
                   </TableCell>
                 </TableRow>
               )}
@@ -370,6 +404,13 @@ export default function PendingPaymentsPage() {
           </DialogHeader>
           {resolvingRow && (
             <div className="space-y-4 py-4">
+              {resolvingRow.status === "FAILED" && (
+                <div className="rounded-md border border-red-200 bg-red-50 p-3 text-xs text-red-700">
+                  This payment was rejected by the payment callback (typically an
+                  overpayment) and never posted. Confirm the amount against the
+                  loan balance before resolving it.
+                </div>
+              )}
               <div className="grid grid-cols-2 gap-2 text-sm">
                 <div className="text-muted-foreground">Borrower:</div>
                 <div className="font-mono">{resolvingRow.phoneNumber}</div>

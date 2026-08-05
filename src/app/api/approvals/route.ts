@@ -1539,7 +1539,8 @@ async function applyChange(
         });
 
         if (!pendingPayment) throw new Error("Pending payment not found");
-        if (pendingPayment.status !== "PENDING") {
+        // PENDING and FAILED are both resolvable; anything else (COMPLETED) is done.
+        if (!["PENDING", "FAILED"].includes(pendingPayment.status)) {
           return; // Already processed, silently succeed
         }
 
