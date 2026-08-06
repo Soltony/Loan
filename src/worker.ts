@@ -131,9 +131,9 @@ async function runCbsNplRetryServiceLoop() {
     try {
       const { retryFailedCreditNotificationsOnce } = await import('./actions/cbs-npl');
       const result = await retryFailedCreditNotificationsOnce();
-      if (result.eligible > 0) {
+      if (result.eligible > 0 || result.releasedClaims > 0) {
         logger.info(
-          `CBS NPL retry sweep finished scanned=${result.scanned} eligible=${result.eligible} retried=${result.retried} collected=${result.collected} stillFailing=${result.stillFailing}`,
+          `CBS NPL retry sweep finished scanned=${result.scanned} eligible=${result.eligible} retried=${result.retried} collected=${result.collected} stillFailing=${result.stillFailing} releasedClaims=${result.releasedClaims}`,
         );
       }
     } catch (error) {
@@ -229,7 +229,7 @@ async function main() {
           const { retryFailedCreditNotificationsOnce } = await import('./actions/cbs-npl');
           const result = await retryFailedCreditNotificationsOnce();
           logger.info(
-            `One-off CBS NPL retry sweep finished scanned=${result.scanned} eligible=${result.eligible} retried=${result.retried} collected=${result.collected} stillFailing=${result.stillFailing}`,
+            `One-off CBS NPL retry sweep finished scanned=${result.scanned} eligible=${result.eligible} retried=${result.retried} collected=${result.collected} stillFailing=${result.stillFailing} releasedClaims=${result.releasedClaims}`,
           );
         }
         process.exit(0);

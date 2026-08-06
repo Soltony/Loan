@@ -454,6 +454,88 @@ const REPAY_TRIGGERING_STATUSES = new Set([
 ]);
 
 /**
+ * Held on a notification from just before we read the balance we will collect
+ * against until the resulting payment has been posted. Deliberately not a
+ * repay-triggering status, so nothing re-enters the pipeline while it is set.
+ */
+const IN_PROGRESS_STATUS = "IN_PROGRESS";
+
+/** A claim older than this belonged to a process that died; stop honouring it. */
+const CLAIM_STALE_MS = 10 * 60 * 1000;
+
+type ClaimResult =
+  /** We hold the loan; nobody else is collecting against it. */
+  | "ACQUIRED"
+  /** Another notification is mid-collection on the same loan. */
+  | "BUSY"
+  /** This same notification is already being processed elsewhere. */
+  | "TAKEN";
+
+/**
+ * Take an exclusive claim on a loan before collecting against it.
+ *
+ * Two credit notifications for the same loan that arrive together each used to
+ * read the full outstanding balance and then ask the CBS to debit all of it,
+ * so the customer was debited twice while our ledger — which caps every posting
+ * at what is still due — only ever recorded the outstanding once.
+ *
+ * Both racers claim first and only then look for a competitor, so a genuine tie
+ * ends with both backing off rather than either proceeding on a stale balance.
+ * The loser is left retriable and the retry sweep picks it up once the winner
+ * has posted and the outstanding reflects it.
+ */
+async function claimLoanForCollection(
+  notificationId: string,
+  loanId: string,
+): Promise<ClaimResult> {
+  const now = new Date();
+
+  const claimed = await prisma.nplCreditNotification.updateMany({
+    where: {
+      id: notificationId,
+      processStatus: { in: Array.from(REPAY_TRIGGERING_STATUSES) },
+    },
+    data: { processStatus: IN_PROGRESS_STATUS, loanId, lastAttemptAt: now },
+  });
+  if (claimed.count === 0) return "TAKEN";
+
+  const competing = await prisma.nplCreditNotification.count({
+    where: {
+      id: { not: notificationId },
+      loanId,
+      processStatus: IN_PROGRESS_STATUS,
+      lastAttemptAt: { gte: new Date(now.getTime() - CLAIM_STALE_MS) },
+    },
+  });
+  return competing === 0 ? "ACQUIRED" : "BUSY";
+}
+
+/**
+ * Recompute a single loan's outstanding balance from current data. Called once
+ * the collection claim is held, because the balance read while locating the
+ * loan predates the claim and a competing collection may have landed since.
+ */
+async function computeLoanOutstanding(loanId: string): Promise<number> {
+  const [loan, taxConfigs] = await Promise.all([
+    prisma.loan.findUnique({
+      where: { id: loanId },
+      include: { product: true, payments: { orderBy: { date: "asc" } }, installments: true },
+    }),
+    prisma.tax.findMany({ where: { status: "ACTIVE" } }),
+  ]);
+  if (!loan) return 0;
+
+  const totals = calculateTotalRepayable(
+    loan as any,
+    loan.product as any,
+    taxConfigs as any,
+    startOfDay(new Date()),
+    true,
+  );
+  return Math.max(0, totals.total - (loan.repaidAmount || 0));
+}
+
+/**
  * Persist an incoming credit notification (if new) and attempt an immediate
  * /repay against the CBS for the matched loan. Safe to retry.
  */
@@ -601,14 +683,61 @@ export async function attemptRepayForNotification(
     };
   }
 
-  const { loan, totalOutstanding, borrowerId } = match;
+  const { loan, borrowerId } = match;
   console.log("[CBS-NPL][Repay] Loan matched", {
     notificationId: notification.id,
     borrowerId,
     loanId: loan.id,
-    totalOutstanding,
+    totalOutstanding: match.totalOutstanding,
     creditedAmount: notification.creditedAmount,
   });
+
+  // 1b. Claim the loan, then re-read what is still owed. Everything from here
+  // to the terminal status update below runs with no other collection in flight
+  // against this loan.
+  const claim = await claimLoanForCollection(notification.id, loan.id);
+  if (claim === "TAKEN") {
+    console.log("[CBS-NPL][Repay] Notification already in flight elsewhere", {
+      notificationId: notification.id,
+    });
+    return {
+      notificationId: notification.id,
+      status: IN_PROGRESS_STATUS,
+      message: "Another attempt for this notification is already in flight.",
+    };
+  }
+  if (claim === "BUSY") {
+    const updated = await prisma.nplCreditNotification.update({
+      where: { id: notification.id },
+      data: {
+        processStatus: "FAILED",
+        borrowerId,
+        loanId: loan.id,
+        resultMessage: `${CONCURRENT_COLLECTION_MESSAGE_PREFIX} on loan ${loan.id}; this credit will be collected on the next retry sweep.`,
+        attempts: { increment: 1 },
+        lastAttemptAt: new Date(),
+      },
+    });
+    console.log("[CBS-NPL][Repay] Deferred — another collection in flight", {
+      notificationId: notification.id,
+      loanId: loan.id,
+    });
+    return {
+      notificationId: updated.id,
+      status: updated.processStatus,
+      message: updated.resultMessage ?? "Deferred: another collection is in progress.",
+    };
+  }
+
+  const totalOutstanding = await computeLoanOutstanding(loan.id);
+  if (totalOutstanding !== match.totalOutstanding) {
+    console.log("[CBS-NPL][Repay] Outstanding changed while claiming", {
+      notificationId: notification.id,
+      before: match.totalOutstanding,
+      after: totalOutstanding,
+    });
+  }
+
   if (totalOutstanding <= 0.01) {
     const updated = await prisma.nplCreditNotification.update({
       where: { id: notification.id },
@@ -880,16 +1009,50 @@ const getRetryMaxAgeHours = () => readIntEnv("NPL_RETRY_MAX_AGE_HOURS", 48);
 /** Cap the work done in a single sweep so one tick can never run away. */
 const getRetryBatchSize = () => readIntEnv("NPL_RETRY_BATCH_SIZE", 50);
 
-// The only failure the sweep retries: our own pre-flight check found no
-// collectable balance, which resolves on its own once the CBS ledger catches up
-// with the credit. Every other FAILED message is left alone — transport errors
-// ("Request timed out after 20000ms", "3 failed") may have debited the
-// customer without us seeing the response, and the rest fail identically on
-// every attempt.
+// The sweep retries exactly two failures, both of which stopped before we sent
+// anything to the CBS and both of which resolve on their own. First: our
+// pre-flight check found no collectable balance, which clears once the CBS
+// ledger catches up with the credit. Every other FAILED message is left alone —
+// transport errors ("Request timed out after 20000ms", "3 failed") may have
+// debited the customer without us seeing the response, and the rest fail
+// identically on every attempt.
 const INSUFFICIENT_BALANCE_MESSAGE_PREFIX = "Insufficient available balance to collect";
 
-function isInsufficientBalanceFailure(resultMessage: string | null): boolean {
-  return Boolean(resultMessage?.startsWith(INSUFFICIENT_BALANCE_MESSAGE_PREFIX));
+// The other retriable failure: we backed off because a sibling notification held
+// the loan. Nothing was sent to the CBS, so re-attempting is always safe, and by
+// the next sweep the winner's payment has landed and the balance is current.
+const CONCURRENT_COLLECTION_MESSAGE_PREFIX = "Deferred: another collection is in progress";
+
+function isRetriableFailure(resultMessage: string | null): boolean {
+  return Boolean(
+    resultMessage?.startsWith(INSUFFICIENT_BALANCE_MESSAGE_PREFIX) ||
+      resultMessage?.startsWith(CONCURRENT_COLLECTION_MESSAGE_PREFIX),
+  );
+}
+
+/**
+ * Clear collection claims left behind by a process that stopped mid-flight, so
+ * the loan is collectable again. They are released to FAILED with a message
+ * that the sweep will not retry: the CBS may already have debited the customer
+ * before we lost the process, and only a human can tell.
+ */
+async function releaseAbandonedClaims(): Promise<number> {
+  const { count } = await prisma.nplCreditNotification.updateMany({
+    where: {
+      processStatus: IN_PROGRESS_STATUS,
+      lastAttemptAt: { lt: new Date(Date.now() - CLAIM_STALE_MS) },
+    },
+    data: {
+      processStatus: "FAILED",
+      resultMessage:
+        "Collection claim abandoned mid-flight (the processing worker stopped). " +
+        "The CBS may already have debited the customer — verify at the CBS before retrying.",
+    },
+  });
+  if (count > 0) {
+    void logger.warn(`[CBS-NPL] Released ${count} abandoned collection claim(s).`);
+  }
+  return count;
 }
 
 export interface RetrySweepResult {
@@ -898,13 +1061,16 @@ export interface RetrySweepResult {
   retried: number;
   collected: number;
   stillFailing: number;
+  releasedClaims: number;
 }
 
 /**
- * Re-attempt the FAILED credit notifications that failed our insufficient
- * available balance check. Covers the CBS race where the balance snapshot had
- * not caught up with the credit at notification time, so the first attempt
- * found nothing to take. Intended to run on a short interval from the worker;
+ * Re-attempt the FAILED credit notifications that never reached the CBS: those
+ * that failed our insufficient available balance check — the CBS race where the
+ * balance snapshot had not caught up with the credit at notification time, so
+ * the first attempt found nothing to take — and those that backed off because a
+ * sibling notification was collecting against the same loan. Also releases
+ * claims abandoned by a stopped worker. Intended to run on a short interval;
  * safe to run concurrently with inbound webhooks because each notification
  * carries a fixed correlationId that the CBS treats as an idempotency key.
  */
@@ -912,6 +1078,9 @@ export async function retryFailedCreditNotificationsOnce(): Promise<RetrySweepRe
   const maxAttempts = getRetryMaxAttempts();
   const batchSize = getRetryBatchSize();
   const cutoff = new Date(Date.now() - getRetryMaxAgeHours() * 60 * 60 * 1000);
+
+  // Free up loans held by claims whose process never came back, before scanning.
+  const releasedClaims = await releaseAbandonedClaims();
 
   // Scan wider than the batch because the message filter runs in JS: matching
   // in SQL would depend on the column's collation for case handling.
@@ -928,7 +1097,7 @@ export async function retryFailedCreditNotificationsOnce(): Promise<RetrySweepRe
   });
 
   const candidates = scanned
-    .filter((n) => isInsufficientBalanceFailure(n.resultMessage))
+    .filter((n) => isRetriableFailure(n.resultMessage))
     .slice(0, batchSize);
 
   const result: RetrySweepResult = {
@@ -937,6 +1106,7 @@ export async function retryFailedCreditNotificationsOnce(): Promise<RetrySweepRe
     retried: 0,
     collected: 0,
     stillFailing: 0,
+    releasedClaims,
   };
   if (candidates.length === 0) return result;
 

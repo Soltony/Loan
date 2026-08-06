@@ -126,6 +126,7 @@ const statusBadgeVariant = (status: string) => {
     case "REPAID":
       return "default" as const;
     case "PARTIAL_REPAID":
+    case "IN_PROGRESS":
       return "secondary" as const;
     case "FAILED":
     case "UNMATCHED_ACCOUNT":
@@ -934,6 +935,7 @@ export default function NplCollectionPage() {
               <SelectContent>
                 <SelectItem value="all">All statuses</SelectItem>
                 <SelectItem value="PENDING">Pending</SelectItem>
+                <SelectItem value="IN_PROGRESS">In Progress</SelectItem>
                 <SelectItem value="REPAID">Repaid</SelectItem>
                 <SelectItem value="PARTIAL_REPAID">Partial Repaid</SelectItem>
                 <SelectItem value="NO_OUTSTANDING">No Outstanding</SelectItem>
