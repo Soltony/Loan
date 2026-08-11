@@ -31,7 +31,8 @@ import {
 } from "@/lib/types";
 import { Badge } from "../ui/badge";
 import { cn } from "@/lib/utils";
-import { format } from "date-fns";
+import { endOfMonth, format, startOfMonth } from "date-fns";
+import { ReportsOverview } from "./reports-overview";
 import { useAuth } from "@/hooks/use-auth";
 import { branchLabel } from "@/lib/branches";
 import { Card, CardContent, CardHeader, CardTitle } from "../ui/card";
@@ -61,12 +62,26 @@ const TIMEFRAMES = [
   { value: "daily", label: "Daily" },
   { value: "weekly", label: "This Week" },
   { value: "monthly", label: "This Month" },
+  { value: "month", label: "Specific Month" },
   { value: "quarterly", label: "Quarterly" },
   { value: "semiAnnually", label: "Semi-Annually" },
   { value: "annually", label: "Annually" },
   { value: "custom", label: "Custom Range" },
   { value: "overall", label: "Overall" },
 ];
+
+const MONTH_OPTIONS = Array.from({ length: 12 }, (_, index) => ({
+  value: String(index),
+  label: format(new Date(2000, index, 1), "MMMM"),
+}));
+
+// "Specific Month" is resolved client-side into a from/to range, which every
+// report endpoint already honours ahead of its own timeframe window — so the
+// picker works across all tabs without a server change.
+const YEAR_OPTIONS = Array.from({ length: 6 }, (_, index) => {
+  const year = new Date().getFullYear() - index;
+  return { value: String(year), label: String(year) };
+});
 
 export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
   const { toast } = useToast();
@@ -78,8 +93,12 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
   // District users can narrow all report tabs to one of their managed branches.
   const [selectedBranch, setSelectedBranch] = useState("all");
   const [isLoading, setIsLoading] = useState(true);
-  const [activeTab, setActiveTab] = useState("providerReport");
-  
+  const [activeTab, setActiveTab] = useState("overview");
+
+  // "Specific Month" selection, kept separate from the free-form custom range.
+  const [selectedMonth, setSelectedMonth] = useState(String(new Date().getMonth()));
+  const [selectedYear, setSelectedYear] = useState(String(new Date().getFullYear()));
+
   // Search state
   const [searchQuery, setSearchQuery] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
@@ -141,6 +160,31 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
     }, 300);
     return () => clearTimeout(timer);
   }, [searchQuery]);
+
+  // Turn a month/year choice into the concrete range the report endpoints read.
+  const applyMonthSelection = useCallback((month: string, year: string) => {
+    const anchor = new Date(parseInt(year, 10), parseInt(month, 10), 1);
+    setDateRange({ from: startOfMonth(anchor), to: endOfMonth(anchor) });
+  }, []);
+
+  const handleTimeframeChange = (value: string) => {
+    setTimeframe(value);
+    if (value === "month") {
+      applyMonthSelection(selectedMonth, selectedYear);
+    } else {
+      setDateRange(undefined);
+    }
+  };
+
+  // Human-readable description of the active period, shown on the Overview tab.
+  const periodLabel = useMemo(() => {
+    if (dateRange?.from && dateRange?.to) {
+      return timeframe === "month"
+        ? format(dateRange.from, "MMMM yyyy")
+        : `${format(dateRange.from, "LLL dd, y")} – ${format(dateRange.to, "LLL dd, y")}`;
+    }
+    return TIMEFRAMES.find((t) => t.value === timeframe)?.label ?? "Overall";
+  }, [dateRange, timeframe]);
 
   type SortDir = "asc" | "desc";
   type TableState = {
@@ -449,7 +493,12 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
       currentSearch?: string
     ) => {
       if (!currentProviderId || currentProviderId === "none") return;
-      
+      // The Overview tab owns its own aggregate fetch.
+      if (tab === "overview") {
+        setIsLoading(false);
+        return;
+      }
+
       setIsLoading(true);
       try {
         const buildUrl = (baseUrl: string, page: number = 1, pageSize: number = DEFAULT_PAGE_SIZE) => {
@@ -1363,13 +1412,7 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
       <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-2">
         <h2 className="text-3xl font-bold tracking-tight">Reports</h2>
         <div className="flex flex-wrap items-center gap-2">
-          <Select
-            onValueChange={(value) => {
-              setTimeframe(value);
-              setDateRange(undefined);
-            }}
-            value={timeframe}
-          >
+          <Select onValueChange={handleTimeframeChange} value={timeframe}>
             <SelectTrigger className="w-[180px]">
               <SelectValue placeholder="Select Timeframe" />
             </SelectTrigger>
@@ -1381,6 +1424,46 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
               ))}
             </SelectContent>
           </Select>
+          {timeframe === "month" && (
+            <>
+              <Select
+                value={selectedMonth}
+                onValueChange={(value) => {
+                  setSelectedMonth(value);
+                  applyMonthSelection(value, selectedYear);
+                }}
+              >
+                <SelectTrigger className="w-[140px]">
+                  <SelectValue placeholder="Month" />
+                </SelectTrigger>
+                <SelectContent>
+                  {MONTH_OPTIONS.map((m) => (
+                    <SelectItem key={m.value} value={m.value}>
+                      {m.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <Select
+                value={selectedYear}
+                onValueChange={(value) => {
+                  setSelectedYear(value);
+                  applyMonthSelection(selectedMonth, value);
+                }}
+              >
+                <SelectTrigger className="w-[110px]">
+                  <SelectValue placeholder="Year" />
+                </SelectTrigger>
+                <SelectContent>
+                  {YEAR_OPTIONS.map((y) => (
+                    <SelectItem key={y.value} value={y.value}>
+                      {y.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </>
+          )}
           <Popover>
             <PopoverTrigger asChild>
               <Button
@@ -1465,34 +1548,36 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
         </div>
       </div>
 
-      {/* Search Bar */}
-      <div className="flex items-center gap-2">
-        <div className="relative flex-1 max-w-sm">
-          <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-          <Input
-            type="text"
-            placeholder="Search by account number or phone number..."
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            className="pl-9"
-          />
-        </div>
-        {isLoading && (
-          <div className="flex items-center text-sm text-muted-foreground gap-2">
-            <Loader2 className="h-4 w-4 animate-spin" />
-            Loading…
+      {/* Search Bar — the Overview tab is aggregate-only, so search does not apply */}
+      {activeTab !== "overview" && (
+        <div className="flex items-center gap-2">
+          <div className="relative flex-1 max-w-sm">
+            <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+            <Input
+              type="text"
+              placeholder="Search by account number or phone number..."
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              className="pl-9"
+            />
           </div>
-        )}
-        {searchQuery && (
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => setSearchQuery("")}
-          >
-            Clear
-          </Button>
-        )}
-      </div>
+          {isLoading && (
+            <div className="flex items-center text-sm text-muted-foreground gap-2">
+              <Loader2 className="h-4 w-4 animate-spin" />
+              Loading…
+            </div>
+          )}
+          {searchQuery && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => setSearchQuery("")}
+            >
+              Clear
+            </Button>
+          )}
+        </div>
+      )}
 
       <Tabs
         value={activeTab}
@@ -1501,6 +1586,7 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
       >
         <div className="overflow-x-auto pb-1">
           <TabsList className="w-max">
+            <TabsTrigger value="overview">Overall</TabsTrigger>
             <TabsTrigger value="providerReport">Provider Loans</TabsTrigger>
             <TabsTrigger value="disbursementsReport">Disbursements</TabsTrigger>
             <TabsTrigger value="repaymentsReport">Repayments</TabsTrigger>
@@ -1516,6 +1602,18 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
             <TabsTrigger value="nationalBankReport">National Bank Reporting</TabsTrigger>
           </TabsList>
         </div>
+        {/* The Overview is card-based, so it sits outside the fixed-height
+            scroll box the data tables share. */}
+        <TabsContent value="overview" className="m-0">
+          <ReportsOverview
+            providerId={providerId}
+            timeframe={timeframe}
+            dateRange={dateRange}
+            branchCode={selectedBranch}
+            periodLabel={periodLabel}
+          />
+        </TabsContent>
+        {activeTab !== "overview" && (
         <div className="overflow-y-auto overflow-x-hidden rounded-md border h-[60vh]">
           <TabsContent value="providerReport" className="space-y-4 m-0">
             <Table>
@@ -2843,6 +2941,7 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
             />
           </TabsContent>
         </div>
+        )}
       </Tabs>
     </div>
   );
