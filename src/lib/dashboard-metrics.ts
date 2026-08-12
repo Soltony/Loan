@@ -29,6 +29,8 @@ export async function getPortfolioLedgerMetrics(
   // When provided, scope all metrics to these borrowers (Branch/District users).
   // An empty array means "no borrowers in scope" and yields all-zero metrics.
   borrowerIds?: string[] | null,
+  // When provided, only loans disbursed inside this window are counted.
+  disbursedRange?: { gte: Date; lte: Date } | null,
 ): Promise<{
   totalDisbursed: number;
   receivables: {
@@ -51,6 +53,7 @@ export async function getPortfolioLedgerMetrics(
       repaymentStatus: { not: 'REVERSED' },
       ...(providerId ? { product: { providerId } } : {}),
       ...(borrowerIds ? { borrowerId: { in: borrowerIds } } : {}),
+      ...(disbursedRange ? { disbursedDate: disbursedRange } : {}),
     },
     select: { id: true, loanAmount: true },
   });

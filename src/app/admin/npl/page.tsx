@@ -9,7 +9,8 @@ import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-import { Loader2, RefreshCw, Download, Search, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, ArrowUpDown, ArrowUp, ArrowDown } from 'lucide-react';
+import { StatTile } from '@/components/ui/stat-tile';
+import { Loader2, RefreshCw, Download, Search, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, ArrowUpDown, ArrowUp, ArrowDown, Users, Banknote, Landmark, AlertTriangle } from 'lucide-react';
 import { useToast } from '@/hooks/use-toast';
 import { updateNplStatus } from '@/actions/npl';
 import { usePermissions } from '@/hooks/use-permissions';
@@ -183,6 +184,34 @@ export default function NplManagementPage() {
 
     const totalPages = Math.ceil(sortedEntries.length / pageSize);
 
+    // Headline figures for the rows currently in view, so the cards always
+    // describe what the table below is showing.
+    const summary = useMemo(() => {
+        const totals = filteredEntries.reduce(
+            (acc, entry) => {
+                acc.principal += entry.principalOutstanding;
+                acc.interest += entry.interestOutstanding;
+                acc.serviceFee += entry.serviceFeeOutstanding;
+                acc.penalty += entry.penaltyOutstanding;
+                acc.total += entry.totalOutstanding;
+                acc.overdueDays += entry.daysOverdue;
+                acc.maxOverdue = Math.max(acc.maxOverdue, entry.daysOverdue);
+                return acc;
+            },
+            { principal: 0, interest: 0, serviceFee: 0, penalty: 0, total: 0, overdueDays: 0, maxOverdue: 0 },
+        );
+        const count = filteredEntries.length;
+        return {
+            ...totals,
+            count,
+            charges: totals.interest + totals.serviceFee + totals.penalty,
+            avgOverdue: count > 0 ? Math.round(totals.overdueDays / count) : 0,
+            providerCount: new Set(filteredEntries.map((e) => e.providerName)).size,
+        };
+    }, [filteredEntries]);
+
+    const isFiltered = filteredEntries.length !== entries.length;
+
     const toggleSort = (field: keyof NplEntry) => {
         if (sortBy === field) {
             setSortDir(sortDir === 'asc' ? 'desc' : 'asc');
@@ -286,6 +315,45 @@ export default function NplManagementPage() {
                         </Button>
                     )}
                 </div>
+            </div>
+
+            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+                <StatTile
+                    label="NPL Borrowers"
+                    value={summary.count.toLocaleString()}
+                    hint={
+                        isFiltered
+                            ? `of ${entries.length.toLocaleString()} flagged, matching the current filters`
+                            : `Across ${summary.providerCount} provider(s)`
+                    }
+                    icon={Users}
+                    tone="info"
+                    loading={isLoading}
+                />
+                <StatTile
+                    label="Total Outstanding"
+                    value={formatCurrency(summary.total)}
+                    hint="Principal, interest, fees and penalty"
+                    icon={Banknote}
+                    tone={summary.total > 0 ? 'danger' : 'success'}
+                    loading={isLoading}
+                />
+                <StatTile
+                    label="Principal at Risk"
+                    value={formatCurrency(summary.principal)}
+                    hint={`Plus ${formatCurrency(summary.charges)} in interest, fees & penalty`}
+                    icon={Landmark}
+                    tone="warning"
+                    loading={isLoading}
+                />
+                <StatTile
+                    label="Longest Overdue"
+                    value={`${summary.maxOverdue.toLocaleString()} day(s)`}
+                    hint={`${summary.avgOverdue.toLocaleString()} day(s) overdue on average`}
+                    icon={AlertTriangle}
+                    tone={summary.maxOverdue > 0 ? 'danger' : 'success'}
+                    loading={isLoading}
+                />
             </div>
 
             <div className="flex flex-col gap-4">

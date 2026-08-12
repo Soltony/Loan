@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import {
   Select,
   SelectContent,
@@ -10,7 +10,16 @@ import {
 } from "@/components/ui/select";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Download, Loader2, Calendar as CalendarIcon, Search } from "lucide-react";
+import { Checkbox } from "@/components/ui/checkbox";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Download, Loader2, Search } from "lucide-react";
 import ExcelJS from "exceljs";
 import { saveAs } from "file-saver";
 import { useToast } from "@/hooks/use-toast";
@@ -37,8 +46,8 @@ import { useAuth } from "@/hooks/use-auth";
 import { branchLabel } from "@/lib/branches";
 import { Card, CardContent, CardHeader, CardTitle } from "../ui/card";
 import { useReportExport } from "./report-export-provider";
-import { Popover, PopoverContent, PopoverTrigger } from "../ui/popover";
-import { Calendar } from "../ui/calendar";
+import { DateRangeFilter, toDayValue } from "../ui/date-range-filter";
+import { parseDayStart } from "@/lib/date-utils";
 import { DateRange } from "react-day-picker";
 
 const formatCurrency = (amount: number | null | undefined) => {
@@ -82,6 +91,70 @@ const YEAR_OPTIONS = Array.from({ length: 6 }, (_, index) => {
   const year = new Date().getFullYear() - index;
   return { value: String(year), label: String(year) };
 });
+
+// Which endpoint each export sheet is built from. Picking a subset of sheets
+// only fetches the sources those sheets actually need.
+type ExportSource =
+  | "loans"
+  | "collections"
+  | "disbursements"
+  | "repayments"
+  | "failedRepayments"
+  | "postedRepayments"
+  | "nationalBank"
+  | "providerSummary";
+
+const EXPORT_SHEETS: {
+  id: string;
+  label: string;
+  source: ExportSource;
+  /** Sheets tied to the Fund Utilization tab are hidden from District/Branch users. */
+  utilizationOnly?: boolean;
+}[] = [
+  { id: "providerLoans", label: "Provider Loans", source: "loans" },
+  { id: "collections", label: "Collections", source: "collections" },
+  {
+    id: "utilization",
+    label: "Fund Utilization",
+    source: "providerSummary",
+    utilizationOnly: true,
+  },
+  { id: "disbursements", label: "Disbursements", source: "disbursements" },
+  { id: "repayments", label: "Repayments", source: "repayments" },
+  {
+    id: "failedDisbursements",
+    label: "Failed Disbursements with Repayments",
+    source: "failedRepayments",
+  },
+  {
+    id: "postedDisbursements",
+    label: "Posted Disbursements with Repayments",
+    source: "postedRepayments",
+  },
+  { id: "aging", label: "Aging Report", source: "providerSummary" },
+  { id: "borrowerAging", label: "Borrower Aging", source: "providerSummary" },
+  {
+    id: "borrowerPerformance",
+    label: "Borrower Performance",
+    source: "loans",
+  },
+  { id: "nationalBank", label: "National Bank Report", source: "nationalBank" },
+];
+
+/** Sheets each tab produces, for the export dialog's "Current tab only" shortcut. */
+const TAB_EXPORT_SHEETS: Record<string, string[]> = {
+  providerReport: ["providerLoans"],
+  disbursementsReport: ["disbursements"],
+  repaymentsReport: ["repayments"],
+  failedDisbursementRepaymentReport: ["failedDisbursements"],
+  postedDisbursementRepaymentReport: ["postedDisbursements"],
+  collectionsReport: ["collections"],
+  utilizationReport: ["utilization"],
+  // The Aging tab shows both the per-provider buckets and the borrower breakdown.
+  agingReport: ["aging", "borrowerAging"],
+  borrowerReport: ["borrowerPerformance"],
+  nationalBankReport: ["nationalBank"],
+};
 
 export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
   const { toast } = useToast();
@@ -131,6 +204,12 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
   const [providerSummaryData, setProviderSummaryData] = useState<
     Record<string, ProviderReportData>
   >({});
+
+  // Export sheet picker: every sheet is selected by default.
+  const [isExportDialogOpen, setIsExportDialogOpen] = useState(false);
+  const [selectedSheets, setSelectedSheets] = useState<string[]>(() =>
+    EXPORT_SHEETS.map((s) => s.id)
+  );
   // Export runs in ReportExportProvider (admin layout level) so it keeps
   // going and stays visible in the floating widget across page navigation
   const { isExporting, runExport } = useReportExport();
@@ -146,6 +225,30 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
   // District and Branch users don't manage provider funds, so the Fund
   // Utilization report is hidden for them.
   const showUtilizationTab = !isDistrictUser && !isBranchUser;
+
+  const availableExportSheets = useMemo(
+    () => EXPORT_SHEETS.filter((s) => showUtilizationTab || !s.utilizationOnly),
+    [showUtilizationTab]
+  );
+
+  const currentTabSheetIds = useMemo(
+    () =>
+      (TAB_EXPORT_SHEETS[activeTab] ?? []).filter((id) =>
+        availableExportSheets.some((s) => s.id === id)
+      ),
+    [activeTab, availableExportSheets]
+  );
+
+  const toggleExportSheet = (id: string) =>
+    setSelectedSheets((prev) =>
+      prev.includes(id) ? prev.filter((s) => s !== id) : [...prev, id]
+    );
+
+  // Sheets the user picked, minus any hidden from their role.
+  const sheetsToExport = useMemo(
+    () => availableExportSheets.filter((s) => selectedSheets.includes(s.id)),
+    [availableExportSheets, selectedSheets]
+  );
 
   // Check if user can view all providers (either super admin/recon OR has reports permission with multiple providers)
   // Users with a loanProviderId are bound to a specific provider and should only see that provider's reports
@@ -176,15 +279,38 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
     }
   };
 
+  // A half-filled range is ignored: the report endpoints only honour a window
+  // when both ends are present, so this is what every fetch reads.
+  const appliedRange = useMemo(
+    () => (dateRange?.from && dateRange?.to ? dateRange : undefined),
+    [dateRange]
+  );
+
+  // From/To inputs write straight into `dateRange`; picking either end switches
+  // the timeframe to "custom" so the two controls can't contradict each other.
+  const handleRangeEndChange = (end: "from" | "to", value: string) => {
+    const parsed = parseDayStart(value) ?? undefined;
+    setDateRange((prev) => {
+      const next = { from: prev?.from, to: prev?.to, [end]: parsed } as DateRange;
+      return next.from || next.to ? next : undefined;
+    });
+    if (parsed && timeframe !== "custom") setTimeframe("custom");
+  };
+
+  const clearDateRange = () => {
+    setDateRange(undefined);
+    if (timeframe === "custom" || timeframe === "month") setTimeframe("overall");
+  };
+
   // Human-readable description of the active period, shown on the Overview tab.
   const periodLabel = useMemo(() => {
-    if (dateRange?.from && dateRange?.to) {
+    if (appliedRange?.from && appliedRange?.to) {
       return timeframe === "month"
-        ? format(dateRange.from, "MMMM yyyy")
-        : `${format(dateRange.from, "LLL dd, y")} – ${format(dateRange.to, "LLL dd, y")}`;
+        ? format(appliedRange.from, "MMMM yyyy")
+        : `${format(appliedRange.from, "LLL dd, y")} – ${format(appliedRange.to, "LLL dd, y")}`;
     }
     return TIMEFRAMES.find((t) => t.value === timeframe)?.label ?? "Overall";
-  }, [dateRange, timeframe]);
+  }, [appliedRange, timeframe]);
 
   type SortDir = "asc" | "desc";
   type TableState = {
@@ -345,7 +471,7 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
   const fetchLoansData = useCallback(async (page: number = 1, pageSize: number = DEFAULT_PAGE_SIZE) => {
     if (!providerId || providerId === "none") return;
     try {
-      const response = await fetch(buildPaginatedUrl("/api/reports/loans", providerId, timeframe, dateRange, page, pageSize, debouncedSearch));
+      const response = await fetch(buildPaginatedUrl("/api/reports/loans", providerId, timeframe, appliedRange, page, pageSize, debouncedSearch));
       if (!response.ok) throw new Error("Failed to fetch loans data");
       const result = await response.json();
       setLoansData(result.data || []);
@@ -353,7 +479,7 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
     } catch (error: any) {
       toast({ title: "Error", description: error.message, variant: "destructive" });
     }
-  }, [providerId, timeframe, dateRange, debouncedSearch, buildPaginatedUrl, toast]);
+  }, [providerId, timeframe, appliedRange, debouncedSearch, buildPaginatedUrl, toast]);
 
   const fetchCollectionsData = useCallback(async (page: number = 1, pageSize: number = DEFAULT_PAGE_SIZE) => {
     if (!providerId || providerId === "none") return;
@@ -363,7 +489,7 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
           "/api/reports/collections",
           providerId,
           timeframe,
-          dateRange,
+          appliedRange,
           page,
           pageSize,
           debouncedSearch
@@ -376,7 +502,7 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
     } catch (error: any) {
       toast({ title: "Error", description: error.message, variant: "destructive" });
     }
-  }, [providerId, timeframe, dateRange, debouncedSearch, buildPaginatedUrl, toast]);
+  }, [providerId, timeframe, appliedRange, debouncedSearch, buildPaginatedUrl, toast]);
 
   const fetchDisbursementsData = useCallback(async (page: number = 1, pageSize: number = DEFAULT_PAGE_SIZE) => {
     if (!providerId || providerId === "none") return;
@@ -386,7 +512,7 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
           "/api/reports/transactions",
           providerId,
           timeframe,
-          dateRange,
+          appliedRange,
           page,
           pageSize,
           debouncedSearch
@@ -399,7 +525,7 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
     } catch (error: any) {
       toast({ title: "Error", description: error.message, variant: "destructive" });
     }
-  }, [providerId, timeframe, dateRange, debouncedSearch, buildPaginatedUrl, toast]);
+  }, [providerId, timeframe, appliedRange, debouncedSearch, buildPaginatedUrl, toast]);
 
   const fetchRepaymentsData = useCallback(async (page: number = 1, pageSize: number = DEFAULT_PAGE_SIZE) => {
     if (!providerId || providerId === "none") return;
@@ -409,7 +535,7 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
           "/api/reports/transactions",
           providerId,
           timeframe,
-          dateRange,
+          appliedRange,
           page,
           pageSize,
           debouncedSearch
@@ -422,7 +548,7 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
     } catch (error: any) {
       toast({ title: "Error", description: error.message, variant: "destructive" });
     }
-  }, [providerId, timeframe, dateRange, debouncedSearch, buildPaginatedUrl, toast]);
+  }, [providerId, timeframe, appliedRange, debouncedSearch, buildPaginatedUrl, toast]);
 
   const fetchFailedDisbursementRepaymentData = useCallback(async (page: number = 1, pageSize: number = DEFAULT_PAGE_SIZE) => {
     if (!providerId || providerId === "none") return;
@@ -432,7 +558,7 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
           "/api/reports/transactions",
           providerId,
           timeframe,
-          dateRange,
+          appliedRange,
           page,
           pageSize,
           debouncedSearch
@@ -445,7 +571,7 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
     } catch (error: any) {
       toast({ title: "Error", description: error.message, variant: "destructive" });
     }
-  }, [providerId, timeframe, dateRange, debouncedSearch, buildPaginatedUrl, toast]);
+  }, [providerId, timeframe, appliedRange, debouncedSearch, buildPaginatedUrl, toast]);
 
   const fetchPostedDisbursementRepaymentData = useCallback(async (page: number = 1, pageSize: number = DEFAULT_PAGE_SIZE) => {
     if (!providerId || providerId === "none") return;
@@ -455,7 +581,7 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
           "/api/reports/transactions",
           providerId,
           timeframe,
-          dateRange,
+          appliedRange,
           page,
           pageSize,
           debouncedSearch
@@ -468,12 +594,12 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
     } catch (error: any) {
       toast({ title: "Error", description: error.message, variant: "destructive" });
     }
-  }, [providerId, timeframe, dateRange, debouncedSearch, buildPaginatedUrl, toast]);
+  }, [providerId, timeframe, appliedRange, debouncedSearch, buildPaginatedUrl, toast]);
 
   const fetchNationalBankData = useCallback(async (page: number = 1, pageSize: number = DEFAULT_PAGE_SIZE) => {
     if (!providerId || providerId === "none") return;
     try {
-      const response = await fetch(buildPaginatedUrl("/api/reports/national-bank", providerId, timeframe, dateRange, page, pageSize, debouncedSearch));
+      const response = await fetch(buildPaginatedUrl("/api/reports/national-bank", providerId, timeframe, appliedRange, page, pageSize, debouncedSearch));
       if (!response.ok) throw new Error("Failed to fetch national bank report data");
       const result = await response.json();
       setNationalBankData(result.data || []);
@@ -481,7 +607,7 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
     } catch (error: any) {
       toast({ title: "Error", description: error.message, variant: "destructive" });
     }
-  }, [providerId, timeframe, dateRange, debouncedSearch, buildPaginatedUrl, toast]);
+  }, [providerId, timeframe, appliedRange, debouncedSearch, buildPaginatedUrl, toast]);
 
   // Generic fetch function for the active tab
   const fetchActiveTabData = useCallback(
@@ -491,12 +617,12 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
       currentTimeframe: string,
       currentDateRange?: DateRange,
       currentSearch?: string
-    ) => {
-      if (!currentProviderId || currentProviderId === "none") return;
+    ): Promise<boolean> => {
+      if (!currentProviderId || currentProviderId === "none") return false;
       // The Overview tab owns its own aggregate fetch.
       if (tab === "overview") {
         setIsLoading(false);
-        return;
+        return true;
       }
 
       setIsLoading(true);
@@ -661,12 +787,14 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
             setProviderSummaryData(newSummaryData as Record<string, any>);
             break;
         }
+        return true;
       } catch (error: any) {
         toast({
           title: "Error fetching report data",
           description: error.message,
           variant: "destructive",
         });
+        return false;
       } finally {
         setIsLoading(false);
       }
@@ -693,23 +821,61 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
       initialProviderId = "none"; // No providers available
     }
 
+    // Resolving the provider is enough — the loader effect below picks it up
+    // and fetches whichever tab is open.
     setProviderId(initialProviderId);
-
-    if (initialProviderId && initialProviderId !== "none") {
-      fetchActiveTabData(activeTab, initialProviderId, "overall", undefined);
-    } else {
-      setIsLoading(false);
-    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isAuthLoading, currentUser?.loanProviderId, canViewAllProviders, providers]);
 
-  // Effect to refetch data when filters change, but not on initial load
+  // Signature of everything that invalidates a tab's data. Any change here
+  // means every tab has to be re-fetched the next time it is opened.
+  const filterKey = useMemo(
+    () =>
+      JSON.stringify({
+        providerId,
+        timeframe,
+        from: appliedRange?.from?.toISOString() ?? null,
+        to: appliedRange?.to?.toISOString() ?? null,
+        search: debouncedSearch,
+        branch: selectedBranch,
+      }),
+    [providerId, timeframe, appliedRange, debouncedSearch, selectedBranch]
+  );
+
+  // Tab -> the filter signature its data was loaded with. Tabs the user never
+  // opens are never fetched, and re-opening one with unchanged filters reuses
+  // what is already in memory instead of hitting the API again.
+  const loadedTabsRef = useRef<Record<string, string>>({});
+
   useEffect(() => {
-    // This check prevents refetching on the initial render where providerId is still null
-    if (providerId !== null) {
-      fetchActiveTabData(activeTab, providerId, timeframe, dateRange, debouncedSearch);
+    // Still resolving the provider on first render.
+    if (providerId === null) return;
+    if (providerId === "none") {
+      setIsLoading(false);
+      return;
     }
-  }, [activeTab, providerId, timeframe, dateRange, debouncedSearch, fetchActiveTabData]);
+    if (loadedTabsRef.current[activeTab] === filterKey) {
+      setIsLoading(false);
+      return;
+    }
+
+    const tab = activeTab;
+    // Claim the slot before awaiting so a re-render can't start a duplicate fetch.
+    loadedTabsRef.current[tab] = filterKey;
+    void fetchActiveTabData(
+      tab,
+      providerId,
+      timeframe,
+      appliedRange,
+      debouncedSearch
+    ).then((ok) => {
+      // A failed tab stays uncached so re-opening it retries.
+      if (!ok && loadedTabsRef.current[tab] === filterKey) {
+        delete loadedTabsRef.current[tab];
+      }
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, filterKey]);
 
 
   const handleExcelExport = async () => {
@@ -720,10 +886,24 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
       });
       return;
     }
+    if (sheetsToExport.length === 0) {
+      toast({
+        description: "Select at least one report to export.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    // Snapshot the selection so a later dialog change can't alter a run in flight.
+    const wanted = new Set(sheetsToExport.map((s) => s.id));
+    const needs = (source: ExportSource) =>
+      sheetsToExport.some((s) => s.source === source);
 
     await runExport("Exporting reports to Excel", async (ctl) => {
-      // Start with 1 page per report endpoint; totals grow as each reports its page count
-      ctl.update(() => ({ done: 0, total: 7, phase: "fetching" }));
+      // Start with 1 page per report endpoint we actually have to hit;
+      // totals grow as each endpoint reports its page count.
+      const sourceCount = new Set(sheetsToExport.map((s) => s.source)).size;
+      ctl.update(() => ({ done: 0, total: sourceCount, phase: "fetching" }));
 
       const wb = new ExcelJS.Workbook();
       const providerList = (
@@ -807,11 +987,56 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
           base,
           providerId,
           timeframe,
-          dateRange,
+          appliedRange,
           page,
           pageSize,
           debouncedSearch
         );
+
+      // Only the endpoints the selected sheets are built from get fetched.
+      const fetchIfNeeded = (
+        source: ExportSource,
+        buildUrl: (page: number, pageSize: number) => string
+      ): Promise<any[]> =>
+        needs(source) ? fetchAllPages(buildUrl) : Promise.resolve([]);
+
+      // Fund Utilization / Aging / Borrower Aging are built from the provider
+      // summaries. Fetch them here rather than relying on the tab having been
+      // opened, so those sheets are never silently empty.
+      const fetchProviderSummaries = async () => {
+        if (!needs("providerSummary"))
+          return providerSummaryData as Record<string, any>;
+        const results = await Promise.all(
+          providerList.map(async (p) => {
+            try {
+              const url = buildPaginatedUrl(
+                "/api/reports/provider-summary",
+                p.id,
+                timeframe,
+                appliedRange,
+                1,
+                DEFAULT_PAGE_SIZE,
+                debouncedSearch
+              );
+              const resp = await fetch(url);
+              if (!resp.ok) throw new Error("Failed to fetch provider summary.");
+              return { [p.id]: await resp.json() };
+            } catch (err) {
+              console.error(`Failed to fetch summary for provider ${p.id}:`, err);
+              return {} as Record<string, any>;
+            } finally {
+              ctl.update((prev) => ({ ...prev, done: prev.done + 1 }));
+            }
+          })
+        );
+        return results.reduce((acc, cur) => ({ ...acc, ...cur }), {} as Record<string, any>);
+      };
+
+      // The summaries count as one unit in the seeded total but hit the API
+      // once per provider, so make room for the extra calls.
+      if (needs("providerSummary") && providerList.length > 1) {
+        ctl.update((p) => ({ ...p, total: p.total + providerList.length - 1 }));
+      }
 
       const [
         allLoans,
@@ -821,36 +1046,42 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
         allFailedRepayments,
         allPostedRepayments,
         allNationalBank,
+        summaries,
       ] = await Promise.all([
-        fetchAllPages(buildBaseUrl("/api/reports/loans")),
-        fetchAllPages(buildBaseUrl("/api/reports/collections")),
-        fetchAllPages(
+        fetchIfNeeded("loans", buildBaseUrl("/api/reports/loans")),
+        fetchIfNeeded("collections", buildBaseUrl("/api/reports/collections")),
+        fetchIfNeeded(
+          "disbursements",
           (page, pageSize) =>
             buildBaseUrl("/api/reports/transactions")(page, pageSize) +
             "&type=disbursement"
         ),
-        fetchAllPages(
+        fetchIfNeeded(
+          "repayments",
           (page, pageSize) =>
             buildBaseUrl("/api/reports/transactions")(page, pageSize) +
             "&type=repayment"
         ),
-        fetchAllPages(
+        fetchIfNeeded(
+          "failedRepayments",
           (page, pageSize) =>
             buildBaseUrl("/api/reports/transactions")(page, pageSize) +
             "&type=failed-disbursement-with-repayment"
         ),
-        fetchAllPages(
+        fetchIfNeeded(
+          "postedRepayments",
           (page, pageSize) =>
             buildBaseUrl("/api/reports/transactions")(page, pageSize) +
             "&type=posted-disbursement-with-repayment"
         ),
-        fetchAllPages(buildBaseUrl("/api/reports/national-bank")),
+        fetchIfNeeded("nationalBank", buildBaseUrl("/api/reports/national-bank")),
+        fetchProviderSummaries(),
       ]);
 
       ctl.update((p) => ({ ...p, phase: "generating" }));
 
       // 1. Provider Loans
-      if (allLoans.length > 0) {
+      if (wanted.has("providerLoans") && allLoans.length > 0) {
         const providerLoanData = allLoans.map((d: any) => ({
           Provider: d.provider,
           "Loan ID": d.loanId,
@@ -884,9 +1115,9 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
       }
 
       // 4. Fund Utilization (hidden from District/Branch users)
-      const utilizationExportData = (showUtilizationTab ? providerList : [])
+      const utilizationExportData = (wanted.has("utilization") ? providerList : [])
         .map((p) => {
-          const data = providerSummaryData[p.id];
+          const data = summaries[p.id];
           if (!data) return null;
           const availableFund =
             p.startingCapital - data.portfolioSummary.outstanding;
@@ -1028,9 +1259,9 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
       }
 
       // 5. Aging Report
-      const agingExportData = providerList
+      const agingExportData = (wanted.has("aging") ? providerList : [])
         .map((p) => {
-          const data = providerSummaryData[p.id];
+          const data = summaries[p.id];
           if (!data) return null;
           const aging = data.agingReport;
           return {
@@ -1052,8 +1283,8 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
 
       // Borrower-level Aging export (flattened across providers)
       const borrowerAgingExport: any[] = [];
-      providerList.forEach((p) => {
-        const data = providerSummaryData[p.id];
+      (wanted.has("borrowerAging") ? providerList : []).forEach((p) => {
+        const data = summaries[p.id];
         const borrowers = data?.agingReport?.byBorrower || [];
         borrowers.forEach((b: any) => {
           borrowerAgingExport.push({
@@ -1077,7 +1308,7 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
       }
 
       // 6. Borrower Performance
-      if (allLoans.length > 0) {
+      if (wanted.has("borrowerPerformance") && allLoans.length > 0) {
         const borrowerPerfData = allLoans.map((d: any) => ({
           "Borrower ID": d.borrowerId,
           "Borrower Name": d.borrowerName,
@@ -1409,9 +1640,11 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
 
   return (
     <div className="flex-1 space-y-4 p-8 pt-6">
-      <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-2">
+      <div className="flex flex-col md:flex-row items-start md:items-end justify-between gap-2">
         <h2 className="text-3xl font-bold tracking-tight">Reports</h2>
-        <div className="flex flex-wrap items-center gap-2">
+        {/* Bottom-aligned so the labelled From/To inputs line up with the
+            unlabelled selects and buttons beside them. */}
+        <div className="flex flex-wrap items-end gap-2">
           <Select onValueChange={handleTimeframeChange} value={timeframe}>
             <SelectTrigger className="w-[180px]">
               <SelectValue placeholder="Select Timeframe" />
@@ -1464,45 +1697,13 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
               </Select>
             </>
           )}
-          <Popover>
-            <PopoverTrigger asChild>
-              <Button
-                id="date"
-                variant={"outline"}
-                className={cn(
-                  "w-[300px] justify-start text-left font-normal",
-                  !dateRange && "text-muted-foreground"
-                )}
-              >
-                <CalendarIcon className="mr-2 h-4 w-4" />
-                {dateRange?.from ? (
-                  dateRange.to ? (
-                    <>
-                      {format(dateRange.from, "LLL dd, y")} -{" "}
-                      {format(dateRange.to, "LLL dd, y")}
-                    </>
-                  ) : (
-                    format(dateRange.from, "LLL dd, y")
-                  )
-                ) : (
-                  <span>Pick a date</span>
-                )}
-              </Button>
-            </PopoverTrigger>
-            <PopoverContent className="w-auto p-0" align="end">
-              <Calendar
-                initialFocus
-                mode="range"
-                defaultMonth={dateRange?.from}
-                selected={dateRange}
-                onSelect={(range) => {
-                  setDateRange(range);
-                  if (range?.from) setTimeframe("custom");
-                }}
-                numberOfMonths={2}
-              />
-            </PopoverContent>
-          </Popover>
+          <DateRangeFilter
+            from={toDayValue(dateRange?.from)}
+            to={toDayValue(dateRange?.to)}
+            onFromChange={(value) => handleRangeEndChange("from", value)}
+            onToChange={(value) => handleRangeEndChange("to", value)}
+            onClear={clearDateRange}
+          />
           {canViewAllProviders && (
             <Select onValueChange={setProviderId} value={providerId || ""}>
               <SelectTrigger className="w-[180px]">
@@ -1535,7 +1736,7 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
           )}
           <Button
             variant="outline"
-            onClick={handleExcelExport}
+            onClick={() => setIsExportDialogOpen(true)}
             disabled={isExporting || providerId === "none"}
           >
             {isExporting ? (
@@ -1547,6 +1748,77 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
           </Button>
         </div>
       </div>
+
+      <Dialog open={isExportDialogOpen} onOpenChange={setIsExportDialogOpen}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>Choose reports to export</DialogTitle>
+            <DialogDescription>
+              Each selected report becomes its own sheet in the workbook. Only
+              the selected reports are fetched, so a smaller selection exports
+              faster. The current filters ({periodLabel}) apply to all of them.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="max-h-[50vh] space-y-1 overflow-y-auto pr-1">
+            {availableExportSheets.map((sheet) => (
+              <label
+                key={sheet.id}
+                className="flex cursor-pointer items-center gap-3 rounded-md px-2 py-2 hover:bg-muted"
+              >
+                <Checkbox
+                  checked={selectedSheets.includes(sheet.id)}
+                  onCheckedChange={() => toggleExportSheet(sheet.id)}
+                />
+                <span className="text-sm">{sheet.label}</span>
+              </label>
+            ))}
+          </div>
+          <DialogFooter className="sm:justify-between">
+            <div className="flex gap-2">
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                onClick={() =>
+                  setSelectedSheets(availableExportSheets.map((s) => s.id))
+                }
+              >
+                Select all
+              </Button>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                onClick={() => setSelectedSheets([])}
+              >
+                Clear
+              </Button>
+              {currentTabSheetIds.length > 0 && (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setSelectedSheets(currentTabSheetIds)}
+                >
+                  Current tab only
+                </Button>
+              )}
+            </div>
+            <Button
+              type="button"
+              onClick={() => {
+                setIsExportDialogOpen(false);
+                handleExcelExport();
+              }}
+              disabled={selectedSheets.length === 0 || isExporting}
+            >
+              <Download className="mr-2 h-4 w-4" />
+              Export {selectedSheets.length} report
+              {selectedSheets.length === 1 ? "" : "s"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {/* Search Bar — the Overview tab is aggregate-only, so search does not apply */}
       {activeTab !== "overview" && (
@@ -1608,7 +1880,7 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
           <ReportsOverview
             providerId={providerId}
             timeframe={timeframe}
-            dateRange={dateRange}
+            dateRange={appliedRange}
             branchCode={selectedBranch}
             periodLabel={periodLabel}
           />

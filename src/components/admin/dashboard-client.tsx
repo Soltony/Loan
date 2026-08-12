@@ -2,7 +2,7 @@
 'use client';
 
 import React, { useMemo } from 'react';
-import { useRouter, useSearchParams } from 'next/navigation';
+import { useRouter, useSearchParams, usePathname } from 'next/navigation';
 import {
   Card,
   CardContent,
@@ -20,6 +20,7 @@ import {
 } from '@/components/ui/table';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
 import { useAuth } from '@/hooks/use-auth';
 import {
   BarChart,
@@ -37,11 +38,22 @@ import {
   Cell,
 } from 'recharts';
 import type { LoanProvider, DashboardData } from '@/lib/types';
-import { FileCheck2, Wallet, TrendingUp, DollarSign, Receipt, Banknote, AlertCircle, TrendingDown, Users, Landmark, ArrowUpNarrowWide, ArrowDownWideNarrow } from 'lucide-react';
+import { FileCheck2, Wallet, TrendingUp, DollarSign, Receipt, Banknote, AlertCircle, TrendingDown, Users, Landmark, ArrowUpNarrowWide, ArrowDownWideNarrow, X } from 'lucide-react';
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '../ui/tabs';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../ui/select';
 import { branchLabel } from '@/lib/branches';
+import { format } from 'date-fns';
 import { cn } from '@/lib/utils';
+
+const MONTH_OPTIONS = Array.from({ length: 12 }, (_, index) => ({
+  value: String(index),
+  label: format(new Date(2000, index, 1), 'MMMM'),
+}));
+
+const YEAR_OPTIONS = Array.from({ length: 6 }, (_, index) => {
+  const year = new Date().getFullYear() - index;
+  return { value: String(year), label: String(year) };
+});
 // ...existing code...
 
 interface LedgerData {
@@ -77,7 +89,11 @@ const LedgerDetailRow = ({ title, value }: { title: string; value: number }) => 
     </div>
 );
 
-const DashboardView = ({ data, color, hideFunds = false }: { data: DashboardData, color: string, hideFunds?: boolean }) => {
+// `periodLabel` is set when a month/year period is selected; the cards that
+// would otherwise read "today" or "all-time" relabel to that period.
+// `dayLabel` is set when a specific day is picked, and takes precedence on the
+// two daily cards — the only figures it changes.
+const DashboardView = ({ data, color, hideFunds = false, periodLabel, dayLabel }: { data: DashboardData, color: string, hideFunds?: boolean, periodLabel?: string | null, dayLabel?: string | null }) => {
     const {
         totalLoans,
         totalDisbursed,
@@ -98,6 +114,11 @@ const DashboardView = ({ data, color, hideFunds = false }: { data: DashboardData
     } = data;
     
     const totalIncome = Object.values(income).reduce((sum, val) => sum + val, 0);
+
+    // What the two daily cards are actually counting: a picked day wins over
+    // the period, and with neither they stay on today.
+    const flowSuffix = dayLabel ? `on ${dayLabel}` : periodLabel ? `in ${periodLabel}` : null;
+    const flowIsPeriod = !dayLabel && !!periodLabel;
 
     const loanStatusData = useMemo(() => [
       { name: 'Paid', value: rawLoanStatusData.find(d => d.name === 'Paid')?.value || 0, color: color },
@@ -132,7 +153,7 @@ const DashboardView = ({ data, color, hideFunds = false }: { data: DashboardData
                 </CardHeader>
                 <CardContent>
                     <div className="text-2xl font-bold">{formatCurrency(initialFund)}</div>
-                    <p className="text-xs text-muted-foreground">Total starting capital</p>
+                    <p className="text-xs text-muted-foreground">Total starting capital{periodLabel ? ' (all-time)' : ''}</p>
                 </CardContent>
             </Card>
              )}
@@ -144,7 +165,7 @@ const DashboardView = ({ data, color, hideFunds = false }: { data: DashboardData
                 </CardHeader>
                 <CardContent>
                     <div className="text-2xl font-bold">{formatCurrency(providerFund)}</div>
-                    <p className="text-xs text-muted-foreground">Capital remaining for disbursement</p>
+                    <p className="text-xs text-muted-foreground">Capital remaining for disbursement{periodLabel ? ' (all-time)' : ''}</p>
                 </CardContent>
             </Card>
              )}
@@ -155,29 +176,29 @@ const DashboardView = ({ data, color, hideFunds = false }: { data: DashboardData
                 </CardHeader>
                 <CardContent>
                     <div className="text-2xl font-bold">{formatCurrency(totalDisbursed)}</div>
-                    <p className="text-xs text-muted-foreground">All-time total capital disbursed</p>
+                    <p className="text-xs text-muted-foreground">{periodLabel ? `Capital disbursed in ${periodLabel}` : 'All-time total capital disbursed'}</p>
                 </CardContent>
             </Card>
         </div>
         <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
             <Card>
                 <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-                    <CardTitle className="text-sm font-medium">Daily Disbursement</CardTitle>
+                    <CardTitle className="text-sm font-medium">{flowIsPeriod ? 'Disbursed in Period' : 'Daily Disbursement'}</CardTitle>
                     <ArrowUpNarrowWide className="h-4 w-4 text-muted-foreground" />
                 </CardHeader>
                 <CardContent>
                     <div className="text-2xl font-bold">{formatCurrency(dailyDisbursement)}</div>
-                    <p className="text-xs text-muted-foreground">Total disbursed today</p>
+                    <p className="text-xs text-muted-foreground">{flowSuffix ? `Disbursed ${flowSuffix}` : 'Total disbursed today'}</p>
                 </CardContent>
             </Card>
              <Card>
                 <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-                    <CardTitle className="text-sm font-medium">Daily Repayments</CardTitle>
+                    <CardTitle className="text-sm font-medium">{flowIsPeriod ? 'Repaid in Period' : 'Daily Repayments'}</CardTitle>
                     <ArrowDownWideNarrow className="h-4 w-4 text-muted-foreground" />
                 </CardHeader>
                 <CardContent>
                     <div className="text-2xl font-bold">{formatCurrency(dailyRepayments)}</div>
-                    <p className="text-xs text-muted-foreground">Total repaid today</p>
+                    <p className="text-xs text-muted-foreground">{flowSuffix ? `Repaid ${flowSuffix}` : 'Total repaid today'}</p>
                 </CardContent>
             </Card>
             <Card>
@@ -187,7 +208,7 @@ const DashboardView = ({ data, color, hideFunds = false }: { data: DashboardData
                 </CardHeader>
                 <CardContent>
                     <div className="text-2xl font-bold">{totalLoans}</div>
-                    <p className="text-xs text-muted-foreground">All-time total loans issued</p>
+                    <p className="text-xs text-muted-foreground">{periodLabel ? `Loans issued in ${periodLabel}` : 'All-time total loans issued'}</p>
                 </CardContent>
             </Card>
             <Card>
@@ -197,7 +218,7 @@ const DashboardView = ({ data, color, hideFunds = false }: { data: DashboardData
                 </CardHeader>
                 <CardContent>
                     <div className="text-2xl font-bold">{totalUsers}</div>
-                    <p className="text-xs text-muted-foreground">Unique customers with loans</p>
+                    <p className="text-xs text-muted-foreground">{periodLabel ? `Customers with loans in ${periodLabel}` : 'Unique customers with loans'}</p>
                 </CardContent>
             </Card>
         </div>
@@ -205,7 +226,7 @@ const DashboardView = ({ data, color, hideFunds = false }: { data: DashboardData
             <Card className="lg:col-span-4">
                 <CardHeader>
                     <CardTitle>Loan Disbursement Over Time</CardTitle>
-                    <CardDescription>Last 7 days</CardDescription>
+                    <CardDescription>{periodLabel ?? 'Last 7 days'}</CardDescription>
                 </CardHeader>
                 <CardContent>
                     <ResponsiveContainer width="100%" height={300}>
@@ -223,7 +244,7 @@ const DashboardView = ({ data, color, hideFunds = false }: { data: DashboardData
             <Card className="lg:col-span-3">
                 <CardHeader>
                     <CardTitle>Loan Status Distribution</CardTitle>
-                    <CardDescription>A breakdown of all loans by their current status.</CardDescription>
+                    <CardDescription>{periodLabel ? `Loans issued in ${periodLabel}, by current status.` : 'A breakdown of all loans by their current status.'}</CardDescription>
                 </CardHeader>
                 <CardContent>
                    <ResponsiveContainer width="100%" height={300}>
@@ -336,6 +357,7 @@ export function DashboardClient({ dashboardData: initialDashboardData }: Dashboa
   const { currentUser } = useAuth();
   const router = useRouter();
   const searchParams = useSearchParams();
+  const pathname = usePathname();
 
   // Use prop directly so Server Component re-renders (on URL change) are reflected immediately.
   const { providers, overallData, providerSpecificData } = initialDashboardData;
@@ -347,21 +369,88 @@ export function DashboardClient({ dashboardData: initialDashboardData }: Dashboa
 
   const managedBranchCodes = currentUser?.managedBranchCodes ?? [];
   const selectedBranch = searchParams?.get('branch') ?? 'all';
+  const selectedMonth = searchParams?.get('month') ?? 'all';
+  const selectedYear = searchParams?.get('year') ?? 'all';
+  const selectedDay = searchParams?.get('day') ?? '';
 
-  const handleBranchChange = (value: string) => {
+  // Filters live in the URL so the Server Component re-runs the queries.
+  // Stay on the current route — the dashboard renders at both /admin and
+  // /admin/dashboard.
+  const basePath = pathname || '/admin';
+  const updateParams = (mutate: (params: URLSearchParams) => void) => {
     const params = new URLSearchParams(Array.from(searchParams?.entries() ?? []));
-    if (value === 'all') {
-      params.delete('branch');
-    } else {
-      params.set('branch', value);
-    }
+    mutate(params);
     const qs = params.toString();
-    router.push(qs ? `/admin?${qs}` : '/admin');
+    router.push(qs ? `${basePath}?${qs}` : basePath);
   };
 
+  const handleBranchChange = (value: string) => {
+    updateParams((params) => {
+      if (value === 'all') {
+        params.delete('branch');
+      } else {
+        params.set('branch', value);
+      }
+    });
+  };
+
+  // Clearing the year clears the month with it — a month can't stand alone.
+  const handleYearChange = (value: string) => {
+    updateParams((params) => {
+      if (value === 'all') {
+        params.delete('year');
+        params.delete('month');
+      } else {
+        params.set('year', value);
+      }
+    });
+  };
+
+  const handleMonthChange = (value: string) => {
+    updateParams((params) => {
+      if (value === 'all') {
+        params.delete('month');
+      } else {
+        params.set('month', value);
+        // Picking a month with no year yet anchors it to the current one.
+        if (!params.get('year')) {
+          params.set('year', String(new Date().getFullYear()));
+        }
+      }
+    });
+  };
+
+  const handleDayChange = (value: string) => {
+    updateParams((params) => {
+      if (value) {
+        params.set('day', value);
+      } else {
+        params.delete('day');
+      }
+    });
+  };
+
+  const dayLabel = React.useMemo(() => {
+    const [year, month, dayOfMonth] = selectedDay.split('-').map(Number);
+    if (!year || !month || !dayOfMonth) return null;
+    return format(new Date(year, month - 1, dayOfMonth), 'LLL dd, y');
+  }, [selectedDay]);
+
+  // Mirrors `parseDashboardPeriod`: the year is what makes a period, and the
+  // month only narrows it.
+  const periodLabel = React.useMemo(() => {
+    const year = Number(selectedYear);
+    if (selectedYear === 'all' || !Number.isInteger(year)) return null;
+    const month = Number(selectedMonth);
+    if (selectedMonth !== 'all' && Number.isInteger(month) && month >= 0 && month <= 11) {
+      return format(new Date(year, month, 1), 'MMMM yyyy');
+    }
+    return String(year);
+  }, [selectedMonth, selectedYear]);
+
   const districtFilter = isDistrictUser ? (
-    <div className="flex items-center gap-2">
-      <span className="text-sm text-muted-foreground">Branch:</span>
+    <div className="flex flex-col gap-1">
+      <span className="text-xs text-muted-foreground">Branch</span>
       <Select value={selectedBranch} onValueChange={handleBranchChange}>
         <SelectTrigger className="w-[260px]">
           <SelectValue placeholder="All branches" />
@@ -377,6 +466,67 @@ export function DashboardClient({ dashboardData: initialDashboardData }: Dashboa
       </Select>
     </div>
   ) : null;
+
+  const filterBar = (
+    <div className="flex flex-wrap items-end gap-3">
+      {districtFilter}
+      <div className="flex flex-col gap-1">
+        <span className="text-xs text-muted-foreground">Month</span>
+        <Select value={selectedMonth} onValueChange={handleMonthChange}>
+          <SelectTrigger className="w-[160px]">
+            <SelectValue placeholder="All months" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">All months</SelectItem>
+            {MONTH_OPTIONS.map((m) => (
+              <SelectItem key={m.value} value={m.value}>
+                {m.label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
+      <div className="flex flex-col gap-1">
+        <span className="text-xs text-muted-foreground">Year</span>
+        <Select value={selectedYear} onValueChange={handleYearChange}>
+          <SelectTrigger className="w-[140px]">
+            <SelectValue placeholder="All time" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">All time</SelectItem>
+            {YEAR_OPTIONS.map((y) => (
+              <SelectItem key={y.value} value={y.value}>
+                {y.label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
+      {/* Retargets only the Daily Disbursement / Daily Repayments cards,
+          which otherwise show today. */}
+      <div className="flex flex-col gap-1">
+        <span className="text-xs text-muted-foreground">Day (daily totals)</span>
+        <div className="flex items-end gap-1">
+          <Input
+            type="date"
+            value={selectedDay}
+            onChange={(e) => handleDayChange(e.target.value)}
+            className="w-[170px]"
+          />
+          {selectedDay && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => handleDayChange('')}
+              title="Back to today"
+            >
+              <X className="h-4 w-4" />
+            </Button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
 
   const themeColor = React.useMemo(() => {
     if (isSuperAdmin) {
@@ -398,11 +548,11 @@ export function DashboardClient({ dashboardData: initialDashboardData }: Dashboa
     const providerData = overallData;
     return (
       <div className="flex-1 space-y-4 p-8 pt-6">
-          <div className="flex items-center justify-between gap-4">
+          <div className="flex flex-col md:flex-row md:items-end justify-between gap-4">
             <h2 className="text-3xl font-bold tracking-tight">Dashboard</h2>
-            {districtFilter}
+            {filterBar}
           </div>
-          <DashboardView data={providerData} color={themeColor} hideFunds={isBranchScoped} />
+          <DashboardView data={providerData} color={themeColor} hideFunds={isBranchScoped} periodLabel={periodLabel} dayLabel={dayLabel} />
       </div>
     );
   }
@@ -410,7 +560,10 @@ export function DashboardClient({ dashboardData: initialDashboardData }: Dashboa
   // Super admin view with tabs
   return (
     <div className="flex-1 space-y-4 p-8 pt-6">
-        <h2 className="text-3xl font-bold tracking-tight">Dashboard</h2>
+        <div className="flex flex-col md:flex-row md:items-end justify-between gap-4">
+            <h2 className="text-3xl font-bold tracking-tight">Dashboard</h2>
+            {filterBar}
+        </div>
         <Tabs defaultValue="overall">
             <TabsList>
                 <TabsTrigger value="overall">Overall</TabsTrigger>
@@ -418,17 +571,17 @@ export function DashboardClient({ dashboardData: initialDashboardData }: Dashboa
                     <TabsTrigger key={provider.id} value={provider.id}>{provider.name}</TabsTrigger>
                 ))}
             </TabsList>
-            
+
             <TabsContent value="overall" className="mt-4">
-                <DashboardView data={overallData} color={themeColor} />
+                <DashboardView data={overallData} color={themeColor} periodLabel={periodLabel} dayLabel={dayLabel} />
             </TabsContent>
-            
+
             {providers.map((provider) => {
                  const data = providerSpecificData[provider.id];
                  return (
                     <TabsContent key={provider.id} value={provider.id} className="mt-4">
                         {data ? (
-                            <DashboardView data={data} color={provider.colorHex || themeColor} />
+                            <DashboardView data={data} color={provider.colorHex || themeColor} periodLabel={periodLabel} dayLabel={dayLabel} />
                         ) : <p>Loading data for {provider.name}...</p>}
                     </TabsContent>
                  )

@@ -10,7 +10,6 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { Badge } from '@/components/ui/badge';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
 import { AddUserDialog } from '@/components/user/add-user-dialog';
-import { AddRoleDialog } from '@/components/user/add-role-dialog';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import type { User, Role, LoanProvider, Permissions } from '@/lib/types';
 import { cn } from '@/lib/utils';
@@ -344,8 +343,6 @@ function RolesTab() {
     const [isLoading, setIsLoading] = useState(true);
     const [providers, setProviders] = useState<LoanProvider[]>([]);
     const { currentUser } = useAuth();
-    const [isDialogOpen, setIsDialogOpen] = useState(false);
-    const [editingRole, setEditingRole] = useState<Role | null>(null);
     const [deletingRoleId, setDeletingRoleId] = useState<string | null>(null);
     const [currentPage, setCurrentPage] = useState(1);
     const { toast } = useToast();
@@ -390,55 +387,6 @@ function RolesTab() {
         fetchRolesAndProviders();
     }, []);
 
-    const handleOpenDialog = (role: Role | null = null) => {
-        setEditingRole(role);
-        setIsDialogOpen(true);
-    };
-
-    const handleCloseDialog = () => {
-        setEditingRole(null);
-        setIsDialogOpen(false);
-    };
-
-    const handleSaveRole = async (roleData: Omit<Role, 'id'>) => {
-        if (editingRole && !canUpdate) {
-            toast({ title: 'Not authorized', description: 'Not authorized to perform this action.', variant: 'destructive' });
-            return;
-        }
-        if (!editingRole && !canCreate) {
-            toast({ title: 'Not authorized', description: 'Not authorized to perform this action.', variant: 'destructive' });
-            return;
-        }
-        const method = editingRole ? 'PUT' : 'POST';
-        const endpoint = '/api/roles';
-        const body = JSON.stringify(editingRole ? { ...roleData, id: editingRole.id } : roleData);
-
-        try {
-            const response = await fetch(endpoint, {
-                method,
-                headers: { 'Content-Type': 'application/json' },
-                body,
-            });
-
-            if (!response.ok) {
-                const errorData = await response.json();
-                throw new Error(errorData.error || 'Failed to save role.');
-            }
-            
-            toast({
-                title: `Role ${editingRole ? 'Updated' : 'Added'}`,
-                description: `${roleData.name} has been successfully ${editingRole ? 'updated' : 'added'}.`,
-            });
-            fetchRolesAndProviders();
-        } catch (error: any) {
-            toast({
-                title: 'Error',
-                description: error.message,
-                variant: 'destructive',
-            });
-        }
-    };
-    
     const handleDeleteRole = async () => {
         if (!deletingRoleId) return;
         if (!canDelete) {
@@ -561,7 +509,7 @@ function RolesTab() {
             <div className="flex items-center justify-between space-y-2 mb-4">
                 <div />
                 {canCreate ? (
-                    <Button onClick={() => handleOpenDialog()} style={{ backgroundColor: themeColor }} className="text-white">
+                    <Button onClick={() => router.push('/admin/access-control/roles/new')} style={{ backgroundColor: themeColor }} className="text-white">
                         <PlusCircle className="mr-2 h-4 w-4" /> Add Role
                     </Button>
                 ) : null}
@@ -624,13 +572,6 @@ function RolesTab() {
                     )}
                 </CardContent>
             </Card>
-            <AddRoleDialog
-                isOpen={isDialogOpen}
-                onClose={handleCloseDialog}
-                onSave={handleSaveRole}
-                role={editingRole}
-                primaryColor={themeColor}
-            />
             <AlertDialog open={!!deletingRoleId} onOpenChange={(isOpen) => !isOpen && setDeletingRoleId(null)}>
                 <AlertDialogContent>
                     <AlertDialogHeader>

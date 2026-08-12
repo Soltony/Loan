@@ -7,6 +7,40 @@ import { differenceInDays, startOfDay } from 'date-fns';
 import { calculateTotalRepayable } from '@/lib/loan-calculator';
 import { resolveBranchBorrowerIdsForUser, parseBranchCodeQueryParam } from '@/lib/branch-filter';
 
+// SQL Server rejects a statement carrying more than 2100 parameters, so an
+// `IN` list built from every NPL borrower has to be split across several
+// queries and the rows re-joined in memory.
+const ID_CHUNK_SIZE = 1000;
+
+async function findInChunks<TId, TRow>(
+    ids: TId[],
+    query: (chunk: TId[]) => Promise<TRow[]>,
+): Promise<TRow[]> {
+    if (ids.length === 0) return [];
+    if (ids.length <= ID_CHUNK_SIZE) return query(ids);
+
+    const rows: TRow[] = [];
+    for (let i = 0; i < ids.length; i += ID_CHUNK_SIZE) {
+        rows.push(...(await query(ids.slice(i, i + ID_CHUNK_SIZE))));
+    }
+    return rows;
+}
+
+// Shared by both branches of the NPL loan query below.
+const NPL_LOAN_SELECT = {
+    id: true,
+    borrowerId: true,
+    productId: true,
+    dueDate: true,
+    disbursedDate: true,
+    loanAmount: true,
+    repaidAmount: true,
+    // Include installments for penalty calculation if needed
+    installments: true,
+    // Include payments for interest calculation
+    payments: true,
+} as const;
+
 export async function GET(req: NextRequest) {
     const session = await getSession();
     if (!session?.userId) {
@@ -34,28 +68,23 @@ export async function GET(req: NextRequest) {
         }
 
         // Step 1: Find all unpaid loans for borrowers with NPL status
-        const nplLoans = await prisma.loan.findMany({
-            where: {
-                borrower: {
-                    status: 'NPL'
+        const nplLoans = branchBorrowerIds
+            ? await findInChunks(branchBorrowerIds, (chunk) =>
+                prisma.loan.findMany({
+                    where: {
+                        borrower: { status: 'NPL' },
+                        repaymentStatus: 'Unpaid',
+                        borrowerId: { in: chunk },
+                    },
+                    select: NPL_LOAN_SELECT,
+                }))
+            : await prisma.loan.findMany({
+                where: {
+                    borrower: { status: 'NPL' },
+                    repaymentStatus: 'Unpaid',
                 },
-                repaymentStatus: 'Unpaid',
-                ...(branchBorrowerIds ? { borrowerId: { in: branchBorrowerIds } } : {}),
-            },
-            select: {
-                id: true,
-                borrowerId: true,
-                productId: true,
-                dueDate: true,
-                disbursedDate: true,
-                loanAmount: true,
-                repaidAmount: true,
-                // Include installments for penalty calculation if needed
-                installments: true,
-                // Include payments for interest calculation
-                payments: true
-            }
-        });
+                select: NPL_LOAN_SELECT,
+            });
 
         if (nplLoans.length === 0) return NextResponse.json([]);
 
@@ -64,23 +93,26 @@ export async function GET(req: NextRequest) {
         const uniqueProductIds = Array.from(new Set(nplLoans.map(l => l.productId)));
 
         const [phoneAccounts, borrowers, products, taxConfigs] = await Promise.all([
-            prisma.phoneAccount.findMany({ 
-                where: { phoneNumber: { in: uniqueBorrowerIds }, isActive: true },
-                select: { phoneNumber: true, accountNumber: true, customerName: true }
-            }),
-            prisma.borrower.findMany({
-                where: { id: { in: uniqueBorrowerIds } },
-                include: {
-                    provisionedData: {
-                        orderBy: { createdAt: 'desc' },
-                        take: 1
+            findInChunks(uniqueBorrowerIds, (chunk) =>
+                prisma.phoneAccount.findMany({
+                    where: { phoneNumber: { in: chunk }, isActive: true },
+                    select: { phoneNumber: true, accountNumber: true, customerName: true }
+                })),
+            findInChunks(uniqueBorrowerIds, (chunk) =>
+                prisma.borrower.findMany({
+                    where: { id: { in: chunk } },
+                    include: {
+                        provisionedData: {
+                            orderBy: { createdAt: 'desc' },
+                            take: 1
+                        }
                     }
-                }
-            }),
-            prisma.loanProduct.findMany({
-                where: { id: { in: uniqueProductIds } },
-                include: { provider: true }
-            }),
+                })),
+            findInChunks(uniqueProductIds, (chunk) =>
+                prisma.loanProduct.findMany({
+                    where: { id: { in: chunk } },
+                    include: { provider: true }
+                })),
             prisma.tax.findMany()
         ]);
 

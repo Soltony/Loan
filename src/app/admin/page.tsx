@@ -1,7 +1,7 @@
 
 import { DashboardClient } from '@/components/admin/dashboard-client';
 import { getUserFromSession } from '@/lib/user';
-import { getDashboardData } from './dashboard/page';
+import { getDashboardData, parseDashboardPeriod, parseDashboardDay } from './dashboard/page';
 import { redirect } from 'next/navigation';
 import { allMenuItems } from '@/lib/menu-items';
 import { parseBranchCodeQueryParam } from '@/lib/branch-filter';
@@ -11,7 +11,7 @@ export const dynamic = 'force-dynamic';
 export default async function AdminRootPage({
     searchParams,
 }: {
-    searchParams?: Promise<{ branch?: string }>;
+    searchParams?: Promise<{ branch?: string; month?: string; year?: string; day?: string }>;
 }) {
     const user = await getUserFromSession();
     if (!user) {
@@ -45,7 +45,9 @@ export default async function AdminRootPage({
     // Original logic for users who have dashboard access
     const sp = (await searchParams) ?? {};
     const requestedBranch = parseBranchCodeQueryParam(sp.branch);
-    const data = await getDashboardData(user.id, requestedBranch);
+    const range = parseDashboardPeriod(sp.month, sp.year);
+    const day = parseDashboardDay(sp.day);
+    const data = await getDashboardData(user.id, requestedBranch, range, day);
 
     if (!data || !data.overallData) {
         return <div>Loading dashboard...</div>;

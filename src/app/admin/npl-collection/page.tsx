@@ -9,7 +9,8 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Checkbox } from "@/components/ui/checkbox";
-import { Skeleton } from "@/components/ui/skeleton";
+import { StatTile } from "@/components/ui/stat-tile";
+import { DateRangeFilter } from "@/components/ui/date-range-filter";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import {
   AlertDialog,
@@ -38,7 +39,6 @@ import {
   Send,
   Trash2,
   Upload,
-  X,
 } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import { format } from "date-fns";
@@ -138,99 +138,6 @@ const statusBadgeVariant = (status: string) => {
       return "secondary" as const;
   }
 };
-
-type StatTone = "default" | "success" | "warning" | "danger" | "info";
-
-const TONE_CLASSES: Record<StatTone, string> = {
-  default: "bg-muted text-foreground",
-  success: "bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-400",
-  warning: "bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-400",
-  danger: "bg-red-100 text-red-700 dark:bg-red-500/15 dark:text-red-400",
-  info: "bg-sky-100 text-sky-700 dark:bg-sky-500/15 dark:text-sky-400",
-};
-
-/** Summary card shown above each tab's table. */
-function StatTile({
-  label,
-  value,
-  hint,
-  icon: Icon,
-  tone = "default",
-  loading,
-}: {
-  label: string;
-  value: string;
-  hint?: string;
-  icon: typeof Inbox;
-  tone?: StatTone;
-  loading?: boolean;
-}) {
-  return (
-    <Card>
-      <CardContent className="flex items-start justify-between gap-3 p-4">
-        <div className="min-w-0">
-          <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">{label}</p>
-          {loading ? (
-            <Skeleton className="mt-2 h-7 w-24" />
-          ) : (
-            <p className="mt-1 truncate text-2xl font-bold" title={value}>
-              {value}
-            </p>
-          )}
-          {hint ? <p className="mt-0.5 truncate text-xs text-muted-foreground">{hint}</p> : null}
-        </div>
-        <div className={cn("flex h-9 w-9 shrink-0 items-center justify-center rounded-lg", TONE_CLASSES[tone])}>
-          <Icon className="h-4 w-4" />
-        </div>
-      </CardContent>
-    </Card>
-  );
-}
-
-/** From/To day filter shared by the three history tables. Values are `yyyy-MM-dd`. */
-function DateRangeFilter({
-  from,
-  to,
-  onFromChange,
-  onToChange,
-  onClear,
-}: {
-  from: string;
-  to: string;
-  onFromChange: (v: string) => void;
-  onToChange: (v: string) => void;
-  onClear: () => void;
-}) {
-  return (
-    <div className="flex flex-wrap items-end gap-2">
-      <div className="flex flex-col gap-1">
-        <span className="text-xs text-muted-foreground">From</span>
-        <Input
-          type="date"
-          value={from}
-          max={to || undefined}
-          onChange={(e) => onFromChange(e.target.value)}
-          className="w-[160px]"
-        />
-      </div>
-      <div className="flex flex-col gap-1">
-        <span className="text-xs text-muted-foreground">To</span>
-        <Input
-          type="date"
-          value={to}
-          min={from || undefined}
-          onChange={(e) => onToChange(e.target.value)}
-          className="w-[160px]"
-        />
-      </div>
-      {(from || to) && (
-        <Button variant="ghost" size="sm" onClick={onClear} title="Clear date filter">
-          <X className="mr-1 h-4 w-4" /> Clear
-        </Button>
-      )}
-    </div>
-  );
-}
 
 /** Export trigger used on every table; only one export runs at a time. */
 function ExportButton({
