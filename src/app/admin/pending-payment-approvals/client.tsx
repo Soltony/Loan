@@ -55,7 +55,7 @@ export function PendingPaymentApprovalsClient({
   paginatedData: PaginatedPendingPaymentApprovals;
   currentUser: User;
 }) {
-  useRequirePermission("approvals");
+  useRequirePermission(["payment-approvals", "approvals"]);
   const [removedIds, setRemovedIds] = useState<Set<string>>(new Set());
   const [processingId, setProcessingId] = useState<string | null>(null);
 
@@ -67,6 +67,7 @@ export function PendingPaymentApprovalsClient({
   const router = useRouter();
   const { canModule } = usePermissions();
   const canProcessApprovals =
+    canModule("payment-approvals", "update") ||
     canModule("approvals", "update") ||
     canModule("reversal-approval", "update");
 

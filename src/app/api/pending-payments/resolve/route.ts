@@ -17,7 +17,8 @@ export async function POST(req: NextRequest) {
   const user = await getUserFromSession();
   if (
     !user ||
-    (!user.permissions?.["approvals"]?.update &&
+    (!user.permissions?.["pending-payments"]?.update &&
+      !user.permissions?.["approvals"]?.update &&
       !user.permissions?.["reversals"]?.update)
   ) {
     return NextResponse.json({ error: "Not authorized" }, { status: 403 });

@@ -78,7 +78,7 @@ const ITEMS_PER_PAGE = 20;
 type StatusFilter = "ALL" | "PENDING" | "FAILED";
 
 export default function PendingPaymentsPage() {
-  useRequirePermission("reversals");
+  useRequirePermission(["pending-payments", "reversals", "approvals"]);
 
   const { toast } = useToast();
   const [rows, setRows] = useState<PendingPaymentRow[]>([]);

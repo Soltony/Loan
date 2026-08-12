@@ -63,6 +63,11 @@ const protectedAdminRoutes = [
 ];
 const publicRoutes = ['/admin/login', '/loan/connect', '/admin/change-password'];
 
+// Pages any authenticated admin may open regardless of module permissions.
+// This is where the permission guards themselves redirect, so gating it makes a
+// denied page bounce to an unrelated module instead of showing "Unauthorized".
+const permissionExemptAdminRoutes = ['/admin/forbidden'];
+
 const protectedMiniAppRoutes = ['/loan', '/dashboard', '/history'];
 const publicMiniAppRoutes = ['/loan/connect'];
 
@@ -250,6 +255,12 @@ export default async function middleware(req: NextRequest) {
         cspHeader,
         nonce
       );
+    }
+
+    // Authenticated, password is current: let the shared "no permission" pages
+    // through without running module checks against them.
+    if (permissionExemptAdminRoutes.includes(path)) {
+      return withSecurityHeaders(response, cspHeader, nonce);
     }
 
     let permissions: Permissions = session.permissions || {};

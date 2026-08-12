@@ -1815,7 +1815,15 @@ async function applyChange(
 
 export async function POST(req: NextRequest) {
   const user = await getUserFromSession();
-  if (!user || (!user.permissions?.["approvals"]?.update && !user.permissions?.["reversal-approval"]?.update)) {
+  // General approvers can process any pending change. Roles that only hold the
+  // "Payment Approvals" module are limited to PendingPaymentResolve changes,
+  // which is enforced once the change has been loaded below.
+  const canApproveAnyChange =
+    !!user?.permissions?.["approvals"]?.update ||
+    !!user?.permissions?.["reversal-approval"]?.update;
+  const canApprovePaymentResolves =
+    !!user?.permissions?.["payment-approvals"]?.update;
+  if (!user || (!canApproveAnyChange && !canApprovePaymentResolves)) {
     return NextResponse.json({ error: "Not authorized" }, { status: 403 });
   }
 
@@ -1835,6 +1843,13 @@ export async function POST(req: NextRequest) {
       return NextResponse.json(
         { error: "Change request not found." },
         { status: 404 }
+      );
+    }
+
+    if (!canApproveAnyChange && change.entityType !== "PendingPaymentResolve") {
+      return NextResponse.json(
+        { error: "Not authorized to process this type of change." },
+        { status: 403 }
       );
     }
 
