@@ -352,7 +352,7 @@ model ProvisionedData {
   config     DataProvisioningConfig  @relation(fields: [configId], references: [id], onDelete: NoAction, onUpdate: NoAction)
   uploadId   String?
   upload     DataProvisioningUpload? @relation(fields: [uploadId], references: [id], onDelete: SetNull, onUpdate: NoAction)
-  data       String // JSON string of the uploaded data for this borrower
+  data       String                  @db.NVarChar(Max) // JSON string of the uploaded data for this borrower
   createdAt  DateTime                @default(now())
   updatedAt  DateTime                @updatedAt
 
@@ -699,6 +699,34 @@ model AccountStatementMetrics {
   @@unique([borrowerId, accountNumber, periodStart, periodEnd])
   @@index([borrowerId])
   @@index([accountNumber])
+}
+
+// How customer data is fetched, set in the Scoring Engine (see src/lib/data-fetch-settings.ts).
+// Single row, id = "global".
+model DataFetchSetting {
+  id                      String   @id @default("global")
+  statementMonths         Int      @default(6) // complete months of statement the figures cover
+  statementRefreshDays    Int      @default(7) // how often an account's statement is fetched again
+  statementMaxAgeDays     Int      @default(31) // older figures are not used for scoring
+  customerInfoRefreshDays Int      @default(0) // 0 = fetch once and keep
+  updatedById             String?
+  createdAt               DateTime @default(now())
+  updatedAt               DateTime @updatedAt
+}
+
+// Statement figures defined in the Scoring Engine (see src/lib/statement-parameters.ts).
+// Created, changed and removed through maker-checker approval (PendingChange "StatementParameter").
+model StatementParameter {
+  id           String   @id @default(cuid())
+  field        String   @unique // name scoring rules use, e.g. telebirrTransactions; never changes
+  name         String // shown in the rule field list
+  direction    String // IN | OUT | BOTH
+  matchWords   String   @db.NVarChar(1000) // comma-separated, matched in description or narrative
+  excludeWords String?  @db.NVarChar(1000)
+  measure      String // COUNT_PER_MONTH | AMOUNT_PER_MONTH | MONTHS_WITH_ANY | SHARE_OF_INCOME
+  minAmount    Float?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
 }
 
 // --------------------------------------

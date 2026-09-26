@@ -121,30 +121,9 @@ export default function AccountSelector({ phoneNumber, onSelected }: Props) {
       // refresh
       await fetchAssociations();
       setSelected(saved.accountNumber);
+      // The parent's onSelected calls /api/phone-accounts/fetch-customer, which also
+      // refreshes the account's statement figures in the background.
       onSelected?.(saved);
-      // fetch account statement for the selected account (last 12 months)
-      // COMMENTED OUT: Statement fetching disabled
-      // (async () => {
-      //   try {
-      //     const end = new Date();
-      //     const start = new Date();
-      //     start.setFullYear(end.getFullYear() - 1);
-      //     const fmt = (d: Date) => `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`;
-      //       const resp = await fetch('/api/phone-accounts/fetch-statement', {
-      //       method: 'POST',
-      //       headers: { 'Content-Type': 'application/json' },
-      //       body: JSON.stringify({ phoneNumber, accountNumber, startDate: fmt(start), endDate: fmt(end) })
-      //     });
-      //     if (!resp.ok) {
-      //       const txt = await resp.text().catch(() => null);
-      //       console.warn('[AccountSelector] fetch-statement failed', resp.status, txt);
-      //     } else {
-      //       console.info('[AccountSelector] fetch-statement triggered', await resp.json().catch(() => null));
-      //     }
-      //   } catch (e) {
-      //     // ignore background errors
-      //   }
-      // })();
     } catch (err: any) {
       console.error("[AccountSelector] handleSave error", err);
       setError(String(err?.message ?? err));
@@ -173,27 +152,6 @@ export default function AccountSelector({ phoneNumber, onSelected }: Props) {
         await fetchAssociations();
         setSelected(updated.accountNumber);
         onSelected?.(updated);
-        // fetch account statement for the activated account (last 12 months)
-        // COMMENTED OUT: Statement fetching disabled
-        // (async () => {
-        //   try {
-        //     const end = new Date();
-        //     const start = new Date();
-        //     start.setFullYear(end.getFullYear() - 1);
-        //     const fmt = (d: Date) => `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`;
-        //     const resp = await fetch('/api/phone-accounts/fetch-statement', {
-        //       method: 'POST',
-        //       headers: { 'Content-Type': 'application/json' },
-        //       body: JSON.stringify({ phoneNumber, accountNumber, startDate: fmt(start), endDate: fmt(end) })
-        //     });
-        //     if (!resp.ok) {
-        //       const txt = await resp.text().catch(() => null);
-        //       console.warn('[AccountSelector] fetch-statement failed', resp.status, txt);
-        //     } else {
-        //       console.info('[AccountSelector] fetch-statement triggered', await resp.json().catch(() => null));
-        //     }
-        //   } catch (e) {}
-        // })();
       }
     } catch (err: any) {
       console.error("[AccountSelector] handleSetActive error", err);

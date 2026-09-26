@@ -14,6 +14,10 @@ import sendSms from "@/lib/sms";
 import { calculateTotalRepayable } from "@/lib/loan-calculator";
 import { reverseAllLoanJournalEntries } from "@/lib/loan-ledger-reversal";
 import { isSafeOnlyProductUpdate } from "@/lib/loan-product-changes";
+import {
+  applyStatementParameterChange,
+  checkStatementParameterChange,
+} from "@/lib/statement-parameters";
 
 const approvalSchema = z.object({
   changeId: z.string(),
@@ -955,6 +959,9 @@ async function applyChange(
         await applyDataProvisioningUpload(change, data);
       }
       break;
+    case "StatementParameter":
+      await applyStatementParameterChange(change);
+      break;
     case "LoanProvider":
       if (changeType === "UPDATE") {
         const {
@@ -1868,6 +1875,19 @@ export async function POST(req: NextRequest) {
     }
 
     if (approved) {
+      // Things may have changed since the request (e.g. a rule now uses a parameter being removed):
+      // tell the approver why instead of failing inside applyChange.
+      if (change.entityType === "StatementParameter") {
+        const checked = await checkStatementParameterChange(
+          change.changeType as "CREATE" | "UPDATE" | "DELETE",
+          change.entityId,
+          JSON.parse(change.payload)
+        );
+        if (!checked.ok) {
+          return NextResponse.json({ error: checked.error }, { status: 409 });
+        }
+      }
+
       await applyChange(change, { actorId: user.id, ipAddress, userAgent });
 
       await prisma.pendingChange.update({

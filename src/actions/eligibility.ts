@@ -11,6 +11,8 @@ import prisma from '@/lib/prisma';
 import { getSalaryEntryForProduct, computeAllowedFromSalary } from '@/lib/salary-advance';
 import { evaluateCondition } from '@/lib/utils';
 import { getPhoneNumbersForAccount } from '@/lib/account-utils';
+import { parseStoredPayload } from '@/lib/customer-data-api';
+import { statementScoringData } from '@/lib/statement-figures';
 import type { ScoringParameter as ScoringParameterType } from '@/lib/types';
 import { Loan, LoanProduct, Prisma } from '@prisma/client';
 
@@ -92,29 +94,14 @@ async function getBorrowerDataForScoring(
             console.error(`Failed to parse data for entry ${entry.id}:`, e);
         }
     }
-    // Merge latest account statement metrics for borrower (if any)
-    // Check all phone numbers linked to this account to find metrics after phone changes
-    try {
-        const metric = await prisma.accountStatementMetrics.findFirst({
-            where: { borrowerId: { in: allPhoneNumbersForAccount } },
-            orderBy: { computedAt: 'desc' }
-        });
-        if (metric) {
-            // Expose metric fields as top-level properties for scoring rules
-            const m = metric as any;
-            combinedData['monthsAtEbirr'] = m.monthsAtEbirr ?? combinedData['monthsAtEbirr'];
-            combinedData['txCountRelevant'] = m.txCountRelevant ?? combinedData['txCountRelevant'];
-            combinedData['billPaymentsCount'] = m.billPaymentsCount ?? combinedData['billPaymentsCount'];
-            combinedData['avgMonthlyDeposit'] = m.avgMonthlyDeposit ?? combinedData['avgMonthlyDeposit'];
-            combinedData['avgUniqueDepositSources'] = m.avgUniqueDepositSources ?? combinedData['avgUniqueDepositSources'];
-            combinedData['avgMonthlyAirtimeCount'] = m.avgMonthlyAirtimeCount ?? combinedData['avgMonthlyAirtimeCount'];
-            combinedData['avgMonthlyAirtimeValue'] = m.avgMonthlyAirtimeValue ?? combinedData['avgMonthlyAirtimeValue'];
-            combinedData['withdrawalToDepositRatio'] = m.withdrawalToDepositRatio ?? combinedData['withdrawalToDepositRatio'];
-            combinedData['avgBalance'] = m.avgBalance ?? combinedData['avgBalance'];
-            try { combinedData['accountMetricsRaw'] = JSON.parse(m.derived || '{}'); } catch(e) { combinedData['accountMetricsRaw'] = m.derived || {}; }
-        }
-    } catch (e) {
-        console.error('Failed to load account statement metrics for scoring:', e);
+    // Statement figures live in the customer-info copy (see statement-figures.ts) and only count
+    // for the active account, when recent enough. Until the background fetch stores them, scoring
+    // goes ahead without.
+    const statementData = activeAccount?.accountNumber
+        ? await statementScoringData(provisionedDataEntries.map(e => parseStoredPayload(e.data as string)), activeAccount.accountNumber)
+        : {};
+    for (const [key, value] of Object.entries(statementData)) {
+        if (value != null) combinedData[key] = value;
     }
     
     // Fetch all previous loans across all phone numbers linked to this account

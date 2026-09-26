@@ -1,10 +1,12 @@
-import { NextResponse } from "next/server";
+import { NextResponse, after } from "next/server";
 import prisma from "../../../../lib/prisma";
 import { Prisma } from "@prisma/client";
 import {
   MiniAppAuthError,
   requireMiniAppAuthContext,
 } from "@/lib/miniapp-auth";
+import { syncCustomerInfo } from "@/lib/customer-info";
+import { refreshStatementFigures } from "@/lib/statement-figures";
 
 // POST { phoneNumber, accountNumber }
 export async function POST(req: Request) {
@@ -194,147 +196,47 @@ export async function POST(req: Request) {
     // Ensure Borrower exists. Use phoneNumber as borrower id (as used in auth/connect).
     const borrowerId = String(phoneNumber);
     // Create borrower defensively. Prisma `upsert` on SQL Server can fail under
-    // concurrency (unique constraint) so we use create + catch fallback to update.
+    // concurrency (unique constraint) so we use create and ignore P2002.
     try {
       await prisma.borrower.create({
         data: { id: borrowerId, status: "Active" },
       });
     } catch (e: any) {
+      // P2002: the borrower already exists. Leave its status alone: resetting it
+      // here cleared the NPL flag every time the dashboard loaded.
       if (
-        e instanceof Prisma.PrismaClientKnownRequestError &&
-        e.code === "P2002"
+        !(
+          e instanceof Prisma.PrismaClientKnownRequestError &&
+          e.code === "P2002"
+        )
       ) {
-        try {
-          await prisma.borrower.update({
-            where: { id: borrowerId },
-            data: { status: "Active" },
-          });
-        } catch (err) {
-          // ignore
-        }
-      } else {
         throw e;
       }
     }
 
-    // Try to reuse an existing provisioned payload for the same borrower+accountNumber
-    // Search across all ExternalCustomerInfo configs for this borrower and look for a matching accountNumber
-    const existingAcross = await prisma.provisionedData.findMany({
-      where: { borrowerId, config: { name: "ExternalCustomerInfo" } },
-    });
-    for (const ex of existingAcross) {
-      try {
-        const parsed = JSON.parse(ex.data as string);
-        const candidate = parsed?.detail ?? parsed;
-        const candidateAccount =
-          candidate?.AccountNumber ??
-          candidate?.accountNumber ??
-          candidate?.account_number ??
-          null;
-        if (candidateAccount != null) {
-          // Compare loosely since DB may store numbers or strings
-          if (String(candidateAccount) === String(accountNumber)) {
-            // Reuse this payload for the target provider config by upserting into its provisionedData
-            const payload = parsed;
-            const existingForTarget = await prisma.provisionedData.findFirst({
-              where: { borrowerId, configId: config.id },
-            });
-            if (existingForTarget) {
-              const updated = await prisma.provisionedData.update({
-                where: { id: existingForTarget.id },
-                data: { data: JSON.stringify(payload) },
-              });
-              return NextResponse.json({
-                ok: true,
-                copied: true,
-                provisionedDataId: updated.id,
-              });
-            } else {
-              const created = await prisma.provisionedData.create({
-                data: {
-                  borrowerId,
-                  configId: config.id,
-                  data: JSON.stringify(payload),
-                },
-              });
-              return NextResponse.json({
-                ok: true,
-                copied: true,
-                provisionedDataId: created.id,
-              });
-            }
-          }
-        }
-      } catch (e) {
-        // ignore parse errors for unrelated rows
-      }
-    }
-
-    // No existing matched payload found: call the external customer info service
-    const apiUrl = process.env.EXTERNAL_CUSTOMER_INFO_URL ?? "";
-    const user = process.env.EXTERNAL_API_USERNAME;
-    const pass = process.env.EXTERNAL_API_PASSWORD;
-    const auth = "Basic " + Buffer.from(`${user}:${pass}`).toString("base64");
-
-    // Call upstream customer info service
-    const res = await fetch(apiUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: auth },
-      body: JSON.stringify({ accountNumber }),
-    });
-
-    if (!res.ok) {
-      const text = await res.text().catch(() => null);
-      console.warn(
-        "[phone-accounts][fetch-customer] upstream returned",
-        res.status,
-        text
-      );
-
+    const account = String(accountNumber).trim();
+    const result = await syncCustomerInfo(borrowerId, account, config.id);
+    if (!result.ok) {
       return NextResponse.json(
-        { error: "Upstream error", status: res.status, body: text },
+        { error: "Upstream error", status: result.status, body: result.body },
         { status: 502 }
       );
     }
-
-    const data = await res.json().catch(() => null);
-    const detail = data?.detail ?? data?.details ?? data;
-
-    // Save provisioned data as JSON string. We keep a single latest row per (borrower, config) per simplicity.
-    const payload = {
-      source: "external-customer-info",
-      accountNumber,
-      fetchedAt: new Date().toISOString(),
-      detail,
-    };
-
-    const existing = await prisma.provisionedData.findFirst({
-      where: { borrowerId, configId: config.id },
-    });
-    if (existing) {
-      const updated = await prisma.provisionedData.update({
-        where: { id: existing.id },
-        data: { data: JSON.stringify(payload) },
-      });
-      return NextResponse.json({
-        ok: true,
-        saved: true,
-        provisionedDataId: updated.id,
-      });
-    } else {
-      const created = await prisma.provisionedData.create({
-        data: {
-          borrowerId,
-          configId: config.id,
-          data: JSON.stringify(payload),
-        },
-      });
-      return NextResponse.json({
-        ok: true,
-        saved: true,
-        provisionedDataId: created.id,
-      });
+    if (result.outcome !== "stale") {
+      // The first statement fetch of the day can take minutes: run it after responding.
+      // Scoring goes ahead without statement figures until they are stored.
+      // Does nothing while statement fetching is switched off (see statementFiguresEnabled).
+      after(() =>
+        refreshStatementFigures(borrowerId, account).catch((err) =>
+          console.error("[phone-accounts][fetch-customer] statement refresh failed", err)
+        )
+      );
     }
+    return NextResponse.json({
+      ok: true,
+      [result.outcome]: true,
+      provisionedDataId: result.provisionedDataId,
+    });
   } catch (err: any) {
     if (err instanceof MiniAppAuthError) {
       return NextResponse.json({ error: err.message }, { status: err.status });

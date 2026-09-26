@@ -30,6 +30,7 @@ const ENTITY_TO_MODULE: Record<string, string[]> = {
   loancycleconfig: ['settings'],
   dataprovisioningconfig: ['scoring-engine', 'settings'],
   scoringrules: ['scoring-engine'],
+  statementparameter: ['scoring-engine'],
   smstemplate: ['sms-management'],
   smscampaign: ['sms-management'],
   smslog: ['sms-management'],
