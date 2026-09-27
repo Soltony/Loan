@@ -14,7 +14,8 @@ import { runWithFetchSlot } from './fetch-queue';
  * transactions themselves stay in the data API's shared store.
  *
  * The first statement fetch of the day can take minutes, so /api/phone-accounts/fetch-customer
- * starts it in the background and scoring goes ahead without the figures until they are stored.
+ * starts it in the background (see borrower-data-sync.ts) and scoring goes ahead without the
+ * figures until they are stored; the dashboard then recalculates the limit.
  */
 
 export type StatementFigures = ReturnType<typeof computeMetrics> & {
@@ -136,6 +137,11 @@ export function refreshStatementFigures(borrowerId: string, accountNumber: strin
   return job;
 }
 
+/** The refresh running for this borrower's account right now, if any. */
+export function statementRefreshInProgress(borrowerId: string, accountNumber: string): Promise<StatementRefreshResult> | null {
+  return state.running.get(`${borrowerId}|${accountNumber}`) ?? null;
+}
+
 async function refresh(borrowerId: string, accountNumber: string, key: string): Promise<StatementRefreshResult> {
   const payloads = (await loadCustomerInfoCopies(borrowerId)).map((c) => parseStoredPayload(c.data));
   if (!payloads.some((p) => storedAccountNumber(p) === accountNumber)) {
@@ -161,7 +167,7 @@ async function refresh(borrowerId: string, accountNumber: string, key: string): 
     return { ok: false, reason: 'recent-failure' };
   }
 
-  // The slow part runs a few at a time; the rest is dropped and happens on the next visit.
+  // The slow part runs a few at a time; the rest wait their turn (see fetch-queue.ts).
   return runWithFetchSlot<StatementRefreshResult>(
     () => fetchAndStore(borrowerId, accountNumber, key, settings, definitions, version),
     () => ({ ok: false, reason: 'busy' })

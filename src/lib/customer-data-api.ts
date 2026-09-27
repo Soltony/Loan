@@ -20,7 +20,10 @@ export type UpstreamResult =
     }
   | { ok: false; status: number; body: string | null };
 
-const CUSTOMER_INFO_TIMEOUT_MS = 30_000;
+// The data API reads customer info from ODS a few at a time; in a rush of new customers the rest
+// wait their turn there. Wait long enough to keep that place: the fetch runs in the background
+// (see borrower-data-sync.ts), so nobody looks at a spinner this long.
+const CUSTOMER_INFO_TIMEOUT_MS = 180_000;
 // The data API gives up on an ODS statement query after 240 s (QUERY_TIMEOUT_SECONDS in api.py).
 // Wait longer than that, so a slow first fetch still reaches us instead of being abandoned.
 const STATEMENT_TIMEOUT_MS = 300_000;

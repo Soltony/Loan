@@ -488,11 +488,21 @@ export function ApplyClient({
                               variant: "destructive",
                             });
                           } else {
-                            toast({
-                              title: "Customer data saved",
-                              description:
-                                "Customer details were saved for scoring.",
-                            });
+                            // pending without a result: the details are still being
+                            // fetched in the background.
+                            toast(
+                              data?.pending && !data?.saved && !data?.reused
+                                ? {
+                                    title: "Fetching your details",
+                                    description:
+                                      "They will be ready in a moment.",
+                                  }
+                                : {
+                                    title: "Customer data saved",
+                                    description:
+                                      "Customer details were saved for scoring.",
+                                  },
+                            );
                           }
                         } catch (err: any) {
                           toast({

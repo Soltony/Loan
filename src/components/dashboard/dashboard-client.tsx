@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useMemo, useEffect, useCallback } from "react";
+import { useState, useMemo, useEffect, useCallback, useRef } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import {
@@ -95,6 +95,11 @@ export function DashboardClient({
     limits: {},
     reasons: {},
   });
+  // Customer info or statement figures are still being fetched: the limit will be redone.
+  const [isUpdatingLimit, setIsUpdatingLimit] = useState(false);
+  const calculationRef = useRef(0);
+  const dataWatchRef = useRef<AbortController | null>(null);
+  const selectedProviderIdRef = useRef(selectedProviderId);
 
   const [agreementState, setAgreementState] = useState<AgreementState>({});
   const [selectedAccount, setSelectedAccount] = useState<any | null>(null);
@@ -162,6 +167,10 @@ export function DashboardClient({
     async (providerId: string) => {
       if (!borrowerId) return;
 
+      // Only the newest calculation may show: an older one can finish later and would put back
+      // a limit worked out before new data landed (or for the provider the user just left).
+      const calculation = ++calculationRef.current;
+      const isLatest = () => calculation === calculationRef.current;
       setIsRecalculating(true);
       const provider = providers.find((p) => p.id === providerId);
       if (!provider) {
@@ -180,8 +189,10 @@ export function DashboardClient({
           newReasons[product.id] = reason;
         }
 
+        if (!isLatest()) return;
         setEligibility({ limits: newLimits, reasons: newReasons });
       } catch (error) {
+        if (!isLatest()) return;
         console.error("Error recalculating eligibility:", error);
         const defaultReason =
           "Could not calculate loan eligibility for this provider.";
@@ -196,10 +207,67 @@ export function DashboardClient({
           variant: "destructive",
         });
       } finally {
-        setIsRecalculating(false);
+        if (isLatest()) setIsRecalculating(false);
       }
     },
     [borrowerId, providers, toast]
+  );
+
+  useEffect(() => {
+    selectedProviderIdRef.current = selectedProviderId;
+  }, [selectedProviderId]);
+
+  useEffect(() => () => dataWatchRef.current?.abort(), []);
+
+  // After /api/phone-accounts/fetch-customer: redo the limit when new data has been stored, and
+  // while more is still being fetched (a new customer's statement can take minutes in a rush),
+  // keep asking and redo it each time something lands - so the limit appears in this visit.
+  const followDataFetch = useCallback(
+    async (accountNumber: string, fetched: any) => {
+      dataWatchRef.current?.abort();
+      const recalculate = () => {
+        const providerId = selectedProviderIdRef.current;
+        if (providerId) recalculateEligibility(providerId);
+      };
+      if (fetched?.changed) recalculate();
+      if (!fetched?.pending) return;
+
+      const controller = new AbortController();
+      dataWatchRef.current = controller;
+      let stamp = `${fetched.customerInfoFetchedAt}|${fetched.figuresComputedAt}`;
+      setIsUpdatingLimit(true);
+      try {
+        const giveUpAt = Date.now() + 15 * 60 * 1000;
+        while (Date.now() < giveUpAt) {
+          const askedAt = Date.now();
+          // Waits up to 20 s on the server for the data to land.
+          const res = await fetch(
+            `/api/phone-accounts/data-status?accountNumber=${encodeURIComponent(accountNumber)}`,
+            { cache: "no-store", signal: controller.signal }
+          );
+          if (!res.ok) break;
+          const status = await res.json();
+          const next = `${status.customerInfoFetchedAt}|${status.figuresComputedAt}`;
+          if (next !== stamp) {
+            stamp = next;
+            recalculate();
+          }
+          if (!status.busy) break;
+          if (Date.now() - askedAt < 2000) {
+            await new Promise((resolve) => setTimeout(resolve, 2000));
+          }
+        }
+      } catch {
+        // Stopped (left the page, or another account was chosen) or offline: the limit is
+        // worked out again on the next visit.
+      } finally {
+        if (dataWatchRef.current === controller) {
+          dataWatchRef.current = null;
+          setIsUpdatingLimit(false);
+        }
+      }
+    },
+    [recalculateEligibility]
   );
 
   useEffect(() => {
@@ -248,8 +316,10 @@ export function DashboardClient({
                 providerId: providerIdToUse,
               }),
             })
-              .then(() => {
-                /* fire-and-forget */
+              .then((res) => (res.ok ? res.json() : null))
+              .then((data) => {
+                // The limit on screen was worked out before this data landed.
+                if (data) followDataFetch(active.accountNumber, data);
               })
               .catch(() => {
                 /* ignore */
@@ -266,6 +336,7 @@ export function DashboardClient({
     };
 
     checkActive();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [borrowerId, providerIdFromUrl, providers]);
 
   useEffect(() => {
@@ -706,6 +777,13 @@ export function DashboardClient({
                         )}
                       </div>
                     </div>
+                    {isUpdatingLimit && (
+                      <p className="mt-3 flex items-center gap-2 text-xs opacity-80">
+                        <Loader2 className="h-3 w-3 animate-spin" />
+                        Checking your account activity. Your limit will
+                        update shortly.
+                      </p>
+                    )}
                   </CardContent>
                 </Card>
               )}
@@ -886,11 +964,20 @@ export function DashboardClient({
                           variant: "destructive",
                         });
                       } else {
-                        toast({
-                          title: "Customer data saved",
-                          description:
-                            "Customer details were saved for scoring.",
-                        });
+                        toast(
+                          data?.pending && !data?.saved && !data?.reused
+                            ? {
+                                title: "Fetching your details",
+                                description:
+                                  "Your limit will update in a moment.",
+                              }
+                            : {
+                                title: "Customer data saved",
+                                description:
+                                  "Customer details were saved for scoring.",
+                              }
+                        );
+                        followDataFetch(acc.accountNumber, data);
                       }
                     } catch (err: any) {
                       toast({

@@ -5,10 +5,25 @@ import {
   MiniAppAuthError,
   requireMiniAppAuthContext,
 } from "@/lib/miniapp-auth";
-import { syncCustomerInfo } from "@/lib/customer-info";
-import { refreshStatementFigures } from "@/lib/statement-figures";
+import {
+  storedDataStamps,
+  syncBorrowerData,
+  within,
+} from "@/lib/borrower-data-sync";
+
+// How long this route waits before answering. Customer info usually comes within 20 s, but a new
+// customer in a rush waits their turn at the data API; the fetch carries on after we answer.
+const CUSTOMER_INFO_WAIT_MS = 20_000;
+// Enough for figures that are still fresh, or a statement the data API already holds. A read from
+// ODS takes a minute or more and carries on after we answer.
+const STATEMENT_WAIT_MS = 3_000;
 
 // POST { phoneNumber, accountNumber }
+//
+// Answers { ok, saved | reused | stale, provisionedDataId, changed, pending, customerInfoFetchedAt,
+// figuresComputedAt }. changed = new data was stored while we waited (recalculate the limit now);
+// pending = more is still being fetched (202 while even the customer info is): ask
+// /api/phone-accounts/data-status when it has landed.
 export async function POST(req: Request) {
   try {
     const ctx = await requireMiniAppAuthContext();
@@ -215,28 +230,35 @@ export async function POST(req: Request) {
     }
 
     const account = String(accountNumber).trim();
-    const result = await syncCustomerInfo(borrowerId, account, config.id);
-    if (!result.ok) {
+    // Customer info, then the statement figures (unless they are fresh or statement fetching is
+    // switched off). Scoring goes ahead without what has not landed yet.
+    const sync = syncBorrowerData(borrowerId, account, config.id);
+    after(sync.done);
+
+    const result = await within(sync.customerInfo, CUSTOMER_INFO_WAIT_MS);
+    if (result && !result.ok) {
       return NextResponse.json(
         { error: "Upstream error", status: result.status, body: result.body },
         { status: 502 }
       );
     }
-    if (result.outcome !== "stale") {
-      // The first statement fetch of the day can take minutes: run it after responding.
-      // Scoring goes ahead without statement figures until they are stored.
-      // Does nothing while statement fetching is switched off (see statementFiguresEnabled).
-      after(() =>
-        refreshStatementFigures(borrowerId, account).catch((err) =>
-          console.error("[phone-accounts][fetch-customer] statement refresh failed", err)
-        )
-      );
-    }
-    return NextResponse.json({
-      ok: true,
-      [result.outcome]: true,
-      provisionedDataId: result.provisionedDataId,
-    });
+    const statement = result
+      ? await within(sync.statement, STATEMENT_WAIT_MS)
+      : undefined;
+    return NextResponse.json(
+      {
+        ok: true,
+        ...(result
+          ? { [result.outcome]: true, provisionedDataId: result.provisionedDataId }
+          : {}),
+        changed:
+          result?.outcome === "saved" ||
+          (statement?.ok === true && statement.outcome === "saved"),
+        pending: result === undefined || statement === undefined,
+        ...(await storedDataStamps(borrowerId, account)),
+      },
+      { status: result ? 200 : 202 }
+    );
   } catch (err: any) {
     if (err instanceof MiniAppAuthError) {
       return NextResponse.json({ error: err.message }, { status: err.status });

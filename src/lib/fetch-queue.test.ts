@@ -44,7 +44,7 @@ describe('runWithFetchSlot', () => {
     expect(fetchQueueState()).toEqual({ active: 0, waiting: 0 });
   });
 
-  it('drops a task when too many are waiting instead of queueing forever', async () => {
+  it('drops a task only past STATEMENT_FETCH_QUEUE waiting', async () => {
     process.env.STATEMENT_FETCH_CONCURRENCY = '1';
     process.env.STATEMENT_FETCH_QUEUE = '1';
     const a = pending(), b = pending();
@@ -62,6 +62,44 @@ describe('runWithFetchSlot', () => {
     b.finish();
     expect(await waiting).toBe('done');
     expect(fetchQueueState()).toEqual({ active: 0, waiting: 0 });
+  });
+
+  it('by default keeps far more than 50 waiting, and serves them in arrival order', async () => {
+    delete process.env.STATEMENT_FETCH_QUEUE;
+    process.env.STATEMENT_FETCH_CONCURRENCY = '3';
+    const started: number[] = [];
+    let running = 0;
+    let peak = 0;
+    const job = (n: number) => async () => {
+      started.push(n);
+      peak = Math.max(peak, ++running);
+      await tick();
+      running--;
+      return n;
+    };
+    const results = Array.from({ length: 120 }, (_, n) => runWithFetchSlot(job(n), () => -1));
+    expect(fetchQueueState()).toEqual({ active: 3, waiting: 117 });
+
+    expect(await Promise.all(results)).toEqual(Array.from({ length: 120 }, (_, n) => n)); // none dropped
+    expect(started).toEqual(Array.from({ length: 120 }, (_, n) => n));
+    expect(peak).toBe(3);
+    expect(fetchQueueState()).toEqual({ active: 0, waiting: 0 });
+  });
+
+  it('a newcomer waits behind those already waiting, even when a slot is free at that moment', async () => {
+    process.env.STATEMENT_FETCH_CONCURRENCY = '1';
+    const order: string[] = [];
+    const job = (name: string) => async () => {
+      order.push(name);
+      await tick();
+      return name;
+    };
+    const a = runWithFetchSlot(job('a'), () => 'busy');
+    const b = runWithFetchSlot(job('b'), () => 'busy');
+    // 'c' asks the moment 'a' is done: the slot is 'b''s, so 'c' goes after it.
+    const c = a.then(() => runWithFetchSlot(job('c'), () => 'busy'));
+    expect(await Promise.all([a, b, c])).toEqual(['a', 'b', 'c']);
+    expect(order).toEqual(['a', 'b', 'c']);
   });
 
   it('frees the slot when a task fails', async () => {
