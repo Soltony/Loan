@@ -112,10 +112,14 @@ export function LoanDetailClient({ loanDetails }: LoanDetailClientProps) {
                                         {loanDetails.payments.map(payment => (
                                              <div key={payment.id} className="py-3 flex justify-between items-center">
                                                  <div>
-                                                    <p className="font-medium">Repayment (ETB)</p>
+                                                    <p className="font-medium">{payment.amount < 0 ? 'Refund (ETB)' : 'Repayment (ETB)'}</p>
                                                     <p className="text-xs text-muted-foreground">{format(payment.date, 'yyyy-MM-dd HH:mm:ss')}</p>
                                                  </div>
-                                                 <p className="font-mono text-green-600 font-semibold text-right">+ {formatCurrency(payment.amount)}</p>
+                                                 {payment.amount < 0 ? (
+                                                    <p className="font-mono text-red-600 font-semibold text-right">− {formatCurrency(-payment.amount)}</p>
+                                                 ) : (
+                                                    <p className="font-mono text-green-600 font-semibold text-right">+ {formatCurrency(payment.amount)}</p>
+                                                 )}
                                              </div>
                                         ))}
                                         {loanDetails.payments.length === 0 && <p className="text-sm text-muted-foreground text-center py-4">No repayments made yet.</p>}

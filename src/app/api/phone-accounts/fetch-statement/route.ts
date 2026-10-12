@@ -24,19 +24,14 @@ export async function POST(req: Request) {
 
     // Ensure borrower exists
     const borrowerId = String(phoneNumber);
-    // Use create with a fallback update to avoid SQL Server race-condition where
-    // concurrent upserts can trigger unique constraint failures.
+    // Use create and accept "already exists" to avoid the SQL Server race where
+    // concurrent upserts trigger unique constraint failures. An existing borrower
+    // keeps its status — resetting it to Active cleared the NPL flag of borrowers
+    // who still owe.
     try {
       await prisma.borrower.create({ data: { id: borrowerId, status: 'Active' } });
     } catch (e: any) {
-      if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002') {
-        // Another concurrent request created the borrower first — ensure status is set
-        try {
-          await prisma.borrower.update({ where: { id: borrowerId }, data: { status: 'Active' } });
-        } catch (err) {
-          // swallow update errors — we'll continue
-        }
-      } else {
+      if (!(e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002')) {
         throw e;
       }
     }

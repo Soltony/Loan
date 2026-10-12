@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import prisma from "@/lib/prisma";
 import { getUserFromSession } from "@/lib/user";
 import { createAuditLog } from "@/lib/audit-log";
+import { normalizeFtReference } from "@/lib/repayment-reference";
 
 const RESOLVABLE_STATUSES = ["PENDING", "FAILED"];
 
@@ -32,14 +33,21 @@ export async function POST(req: NextRequest) {
   const pendingPaymentId = body?.pendingPaymentId
     ? String(body.pendingPaymentId).trim()
     : null;
-  const ftReference = body?.ftReference
-    ? String(body.ftReference).trim()
-    : null;
+  const enteredFt = body?.ftReference ? String(body.ftReference).trim() : null;
   const paymentDate = body?.paymentDate ? String(body.paymentDate).trim() : null;
 
-  if (!pendingPaymentId || !ftReference) {
+  if (!pendingPaymentId || !enteredFt) {
     return NextResponse.json(
       { error: "Missing pendingPaymentId or ftReference" },
+      { status: 400 }
+    );
+  }
+  const ftReference = normalizeFtReference(enteredFt);
+  if (!ftReference) {
+    return NextResponse.json(
+      {
+        error: `"${enteredFt}" is not an FT reference. Enter the FT of the CBS transaction: FT, 5 digits, then 5 letters or digits (e.g. FT26123AB4CD) — not an account or phone number.`,
+      },
       { status: 400 }
     );
   }

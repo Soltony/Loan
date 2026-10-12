@@ -44,6 +44,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
+import { normalizeFtReference } from "@/lib/repayment-reference";
 
 type PendingPaymentRow = {
   id: string;
@@ -149,7 +150,7 @@ export default function PendingPaymentsPage() {
   };
 
   const submitResolve = async () => {
-    if (!resolvingRow || !ftReference.trim()) {
+    if (!resolvingRow || !normalizeFtReference(ftReference)) {
       toast({
         title: "Error",
         description: "Please enter a valid FT reference number",
@@ -435,8 +436,13 @@ export default function PendingPaymentsPage() {
                     value={ftReference}
                     onChange={(e) => setFtReference(e.target.value)}
                     className="col-span-3"
-                    placeholder="e.g. FT123456789"
+                    placeholder="e.g. FT26123AB4CD"
                   />
+                  {ftReference.trim() && !normalizeFtReference(ftReference) && (
+                    <p className="col-span-3 col-start-2 text-xs text-destructive">
+                      An FT is FT, 5 digits, then 5 letters or digits — copy it from the CBS transaction, not the account number.
+                    </p>
+                  )}
                 </div>
                 <div className="grid grid-cols-4 items-center gap-4">
                    <Label className="text-right">
@@ -472,7 +478,7 @@ export default function PendingPaymentsPage() {
             </Button>
             <Button
               onClick={submitResolve}
-              disabled={isResolving || !ftReference.trim()}
+              disabled={isResolving || !normalizeFtReference(ftReference)}
             >
               {isResolving ? (
                 <span className="inline-flex items-center gap-2">

@@ -3,6 +3,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { createHash, randomUUID } from 'crypto';
 import { format } from 'date-fns';
 import prisma from '@/lib/prisma';
+import { calculateTotalRepayable } from '@/lib/loan-calculator';
+import { getAsOfDate } from '@/lib/date-utils';
 import { createAuditLog } from '@/lib/audit-log';
 import { getSession } from '@/lib/session';
 import { auditExternalApiRequest, auditExternalApiResponse, newAuditCorrelationId } from '@/lib/audit-log';
@@ -42,13 +44,49 @@ export async function POST(req: NextRequest) {
         }
 
         // --- Step 3: Fetch Loan Data ---
-        const loan = await prisma.loan.findUnique({
-            where: { id: loanId },
-            select: { borrowerId: true },
-        });
+        const [loan, taxConfigs] = await Promise.all([
+            prisma.loan.findUnique({
+                where: { id: loanId },
+                include: {
+                    product: {
+                        select: {
+                            duration: true,
+                            serviceFee: true,
+                            serviceFeeEnabled: true,
+                            dailyFee: true,
+                            dailyFeeEnabled: true,
+                            penaltyRules: true,
+                            penaltyRulesEnabled: true,
+                            penaltyPerInstallment: true,
+                        },
+                    },
+                    payments: { select: { amount: true, date: true } },
+                    installments: true,
+                },
+            }),
+            prisma.tax.findMany({ where: { status: 'ACTIVE' } }),
+        ]);
 
         if (!loan) {
             return NextResponse.json({ error: 'Loan not found.' }, { status: 404 });
+        }
+
+        // The gateway debits the customer before our callback runs, and the callback
+        // refuses an amount the loan does not owe — leaving money taken from the
+        // customer that never reaches the loan. Refuse it here, before any debit.
+        if (loan.repaymentStatus !== 'Unpaid') {
+            return NextResponse.json({ error: 'This loan is not open for repayment.' }, { status: 400 });
+        }
+        const outstanding = Math.max(
+            0,
+            calculateTotalRepayable(loan as any, loan.product as any, taxConfigs as any, getAsOfDate(), true).total -
+                (loan.repaidAmount || 0),
+        );
+        if (!(Number(amount) > 0) || Number(amount) > outstanding + 0.01) {
+            return NextResponse.json(
+                { error: `Amount must be between 0.01 and the outstanding balance of ${outstanding.toFixed(2)} ETB.` },
+                { status: 400 },
+            );
         }
 
         // --- Step 4: Retrieve Session ---

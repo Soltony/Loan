@@ -1,8 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
+import type { Prisma } from "@prisma/client";
 import prisma from "@/lib/prisma";
 import {
+  calculateInstallmentDueBreakdown,
   calculateTotalRepayable,
-  calculateTotalRepayableDetailed,
   splitInstallmentPaidAmount,
 } from "@/lib/loan-calculator";
 import { startOfDay, isBefore, isEqual } from "date-fns";
@@ -65,6 +66,21 @@ const calculatePenaltyForInstallment = (
   });
   return Math.max(0, penalty);
 };
+
+class AlreadyProcessedError extends Error {}
+
+/**
+ * Mark the pending payment COMPLETED only if it is still PENDING. A concurrent
+ * delivery of the same callback finds it already completed and rolls its own
+ * posting back, so one FT is never booked twice.
+ */
+async function completePendingPayment(tx: Prisma.TransactionClient, txnRef: string) {
+  const { count } = await tx.pendingPayment.updateMany({
+    where: { transactionId: txnRef, status: "PENDING" },
+    data: { status: "COMPLETED" },
+  });
+  if (count !== 1) throw new AlreadyProcessedError(txnRef);
+}
 
 // Function to validate the token from the Authorization header
 async function validateAuthHeader(authHeader: string | null) {
@@ -193,6 +209,13 @@ export async function POST(request: NextRequest) {
         { status: 200 }
       );
     }
+    // Gateways re-send callbacks; posting one twice would book the same FT twice.
+    if (pendingPayment.status !== "PENDING") {
+      return NextResponse.json(
+        { message: `Transaction already processed (status ${pendingPayment.status}).` },
+        { status: 200 }
+      );
+    }
 
     const { loanId, amount: paymentAmount, borrowerId } = pendingPayment;
 
@@ -277,57 +300,39 @@ export async function POST(request: NextRequest) {
 
         // Loan-level due buckets (service fee / interest / tax) are payable alongside installment repayments.
         // Only installment-level penalty+principal count toward installment.paidAmount.
-        // Use detailed calculation to get accurate paid amounts from day-by-day simulation
-        const totals = calculateTotalRepayableDetailed(
-          loan as any,
-          loan.product as any,
-          taxConfigs,
-          paymentDate
-        );
+        // The shared breakdown is the one the borrower app shows, bounded by what the
+        // loan still owes: amounts collected through another channel (CBS auto-debit)
+        // are not billed again, and paying the balance the app showed is not refused.
+        const loanWithInstallments = { ...loan, installments: refreshedInstallments };
         const alreadyRepaid = loan.repaidAmount || 0;
+        const due = calculateInstallmentDueBreakdown({
+          loanDetails: loanWithInstallments as any,
+          loanProduct: loan.product as any,
+          taxConfigs: taxConfigs as any,
+          activeInstallment,
+          asOfDate: paymentDate,
+        });
+        const { serviceFeeDue, interestDue, taxDue, penaltyRemaining, principalRemaining } = due;
+        const totalDueForInstallment = due.totalDue;
 
-        // Use actual tracked values from the simulation
-        const serviceFeeDue = Math.max(
-          0,
-          totals.serviceFee - totals.serviceFeePaid
-        );
-        const interestDue = Math.max(0, totals.interest - totals.interestPaid);
-        // Tax allocation: tax is paid after interest in priority
-        const taxPaidSoFar = Math.max(
-          0,
-          alreadyRepaid -
-            totals.penalty -
-            totals.serviceFeePaid -
-            totals.interestPaid -
-            totals.principalPaidFromInterestCalc
-        );
-        const taxDue = Math.max(0, totals.tax - taxPaidSoFar);
-
-        const paidAmountForInstallment = Number(activeInstallment.paidAmount || 0);
-        const installmentAmount = Number(activeInstallment.amount || 0);
-
-        // Split installment.paidAmount into penalty vs principal using the shared helper.
-        // Payments settle penalty first, and the penalty depends on outstanding principal,
-        // so this is a small fixed-point. The helper converges from full-principal-outstanding
-        // to avoid the degenerate root that mis-reported unpaid principal as 0 on overdue
-        // installments (the cause of interest being re-charged on each repayment).
-        const installmentSplit = splitInstallmentPaidAmount({
-          installmentAmount,
-          installmentPaidAmount: paidAmountForInstallment,
+        // Penalty accrued on the installment, stored on the installment row.
+        const penaltyForInstallment = splitInstallmentPaidAmount({
+          installmentAmount: Number(activeInstallment.amount || 0),
+          installmentPaidAmount: Number(activeInstallment.paidAmount || 0),
           penaltyRules,
           penaltyDueDate: new Date(penaltyDueDate),
           asOfDate: paymentDate,
-        });
-        const penaltyForInstallment = installmentSplit.penaltyAccrued;
-        const penaltyRemaining = installmentSplit.penaltyRemaining;
-        const principalRemaining = installmentSplit.principalRemaining;
+        }).penaltyAccrued;
 
-        const totalDueForInstallment =
-          principalRemaining +
-          penaltyRemaining +
-          serviceFeeDue +
-          interestDue +
-          taxDue;
+        // Loan total as of today, to close the loan once it is repaid in full even
+        // when the installment counter lags (see calculateInstallmentDueBreakdown).
+        const loanTotal = calculateTotalRepayable(
+          loanWithInstallments as any,
+          loan.product as any,
+          taxConfigs as any,
+          paymentDate,
+          true
+        ).total;
 
         if (paymentAmount > totalDueForInstallment + 0.01) {
           console.error(
@@ -585,9 +590,12 @@ export async function POST(request: NextRequest) {
 
         const newPaidAmount =
           (activeInstallment.paidAmount || 0) + penaltyToPay + principalToPay;
+        // A lagging installment counter must not keep a fully repaid loan open.
+        const loanFullyRepaid = alreadyRepaid + paymentAmount >= loanTotal - 0.01;
         const isInstallmentFullyPaid =
+          loanFullyRepaid ||
           newPaidAmount >=
-          (activeInstallment.amount || 0) + penaltyForInstallment - 1e-9;
+            (activeInstallment.amount || 0) + penaltyForInstallment - 1e-9;
 
         await tx.loanInstallment.update({
           where: { id: activeInstallment.id },
@@ -605,7 +613,20 @@ export async function POST(request: NextRequest) {
           data: { repaidAmount: alreadyRepaid + paymentAmount },
         });
 
-        if (isInstallmentFullyPaid) {
+        if (loanFullyRepaid) {
+          await tx.loanInstallment.updateMany({
+            where: {
+              loanId,
+              id: { not: activeInstallment.id },
+              status: { notIn: ["PAID", "Paid"] },
+            },
+            data: { status: "PAID", isActive: false, paidAt: paymentDate },
+          });
+          await tx.loan.update({
+            where: { id: loanId },
+            data: { repaymentStatus: "Paid" },
+          });
+        } else if (isInstallmentFullyPaid) {
           // Mark all merged installments (that were merged INTO this active installment) as Paid
           // These are installments with status 'MERGED' and installmentNumber > activeInstallment.installmentNumber
           // that had their amount rolled into the active installment
@@ -661,10 +682,7 @@ export async function POST(request: NextRequest) {
           },
         });
 
-        await tx.pendingPayment.update({
-          where: { transactionId: txnRef },
-          data: { status: "COMPLETED" },
-        });
+        await completePendingPayment(tx, txnRef);
 
         return await tx.loan.findUniqueOrThrow({ where: { id: loanId } });
       }
@@ -1000,10 +1018,7 @@ export async function POST(request: NextRequest) {
         },
       });
 
-      await tx.pendingPayment.update({
-        where: { transactionId: txnRef },
-        data: { status: "COMPLETED" },
-      });
+      await completePendingPayment(tx, txnRef);
 
       return finalLoan;
     });
@@ -1017,6 +1032,12 @@ export async function POST(request: NextRequest) {
       { status: 200 }
     );
   } catch (error: any) {
+    if (error instanceof AlreadyProcessedError) {
+      return NextResponse.json(
+        { message: "Transaction already processed." },
+        { status: 200 }
+      );
+    }
     console.error("Callback Error: Failed to process payment update.", error);
     return NextResponse.json(
       {

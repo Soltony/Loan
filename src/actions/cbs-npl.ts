@@ -11,6 +11,7 @@
  *       account, and posts the corresponding repayment in our ledgers.
  */
 import prisma from "@/lib/prisma";
+import type { LoanInstallment, Prisma } from "@prisma/client";
 import { randomUUID } from "crypto";
 import { differenceInDays, startOfDay } from "date-fns";
 import {
@@ -23,7 +24,7 @@ import type {
   CbsCreditNotificationPayload,
   CbsRepayResponse,
 } from "@/lib/cbs-npl/types";
-import { calculateTotalRepayable } from "@/lib/loan-calculator";
+import { calculateTotalRepayable, splitInstallmentPaidAmount } from "@/lib/loan-calculator";
 import { createAuditLog } from "@/lib/audit-log";
 import logger from "@/lib/logger";
 import sendSms from "@/lib/sms";
@@ -339,10 +340,10 @@ export async function deleteNplAccountFromCbs(args: {
 }
 
 /**
- * Best-effort: when a borrower no longer has any unpaid loans, remove their
- * account(s) from CBS NPL monitoring. Safe to call after every repayment —
- * it no-ops while unpaid loans remain, and skips accounts already deleted
- * since the last upload. Never throws.
+ * Best-effort: when a borrower no longer has any unpaid loans, clear their NPL
+ * flag and remove their account(s) from CBS NPL monitoring. Safe to call after
+ * every repayment — it no-ops while unpaid loans remain, and skips accounts
+ * already deleted since the last upload. Never throws.
  */
 export async function syncCbsDeletionForBorrower(
   borrowerId: string,
@@ -355,6 +356,13 @@ export async function syncCbsDeletionForBorrower(
       where: { borrowerId, repaymentStatus: "Unpaid" },
     });
     if (remainingUnpaid > 0) return; // still has unpaid loans → keep monitored
+
+    // Out of NPL. Opening the app used to reset every borrower to Active, which
+    // un-flagged borrowers who still owed; repayment is now what clears it.
+    await prisma.borrower.updateMany({
+      where: { id: borrowerId, status: "NPL" },
+      data: { status: "Active" },
+    });
 
     const accounts = await resolveAccountNumbersForBorrower(borrowerId);
     if (accounts.length === 0) return;
@@ -498,6 +506,21 @@ async function claimLoanForCollection(
     data: { processStatus: IN_PROGRESS_STATUS, loanId, lastAttemptAt: now },
   });
   if (claimed.count === 0) return "TAKEN";
+
+  // A CBS debit on this loan that never reached the ledger is still counted as
+  // outstanding; collecting now would debit the customer for it a second time.
+  // Wait until the retry sweep has posted it.
+  const unpostedDebits = await prisma.nplCreditNotification.findMany({
+    where: {
+      id: { not: notificationId },
+      loanId,
+      processStatus: "FAILED",
+      paymentId: null,
+      repayTransactionId: { not: null },
+    },
+    select: { resultMessage: true },
+  });
+  if (unpostedDebits.some(isUnpostedDebit)) return "BUSY";
 
   const competing = await prisma.nplCreditNotification.count({
     where: {
@@ -879,7 +902,7 @@ export async function attemptRepayForNotification(
         loanId: loan.id,
         amount: amountToCollect,
       });
-      breakdown = await recordCbsRepayment({
+      breakdown = await postCbsRepaymentWithRetry({
         loanId: loan.id,
         amount: amountToCollect,
         correlationId: notification.correlationId,
@@ -913,6 +936,32 @@ export async function attemptRepayForNotification(
       ? "DUPLICATE"
       : "FAILED";
 
+  // The ledger caps a posting at what the loan still owes. Whatever the CBS
+  // debited beyond that is the customer's money with no loan to go to — flag it
+  // for a refund rather than letting it vanish between the two systems.
+  const debitedAmount = Number(repayData?.debitAmount ?? amountToCollect);
+  const overCollected = !repaySuccess
+    ? 0
+    : breakdown
+      ? Number((debitedAmount - breakdown.paymentAmount).toFixed(2))
+      : internalError?.includes(NOTHING_LEFT_TO_COLLECT)
+        ? debitedAmount
+        : 0;
+  const overCollectionNote =
+    overCollected > 0.01
+      ? ` OVER-COLLECTED ${overCollected.toFixed(2)}: the CBS debited ${debitedAmount.toFixed(2)} but the loan ` +
+        `owed ${(breakdown?.paymentAmount ?? 0).toFixed(2)}. Refund the difference to the customer.`
+      : "";
+  if (overCollectionNote) {
+    void logger.error(
+      `[CBS-NPL] Over-collection on notification=${notification.id} loan=${loan.id} ` +
+        `cbsTxn=${repayData?.transactionId ?? "?"}:${overCollectionNote}`,
+    );
+  }
+  const baseMessage = internalError
+    ? `CBS debited but internal posting failed: ${internalError}`
+    : repayData?.message ?? repayCall.error ?? null;
+
   const updated = await prisma.nplCreditNotification.update({
     where: { id: notification.id },
     data: {
@@ -920,9 +969,7 @@ export async function attemptRepayForNotification(
       loanId: loan.id,
       paymentId: paymentId ?? null,
       processStatus: finalStatus,
-      resultMessage: internalError
-        ? `CBS debited but internal posting failed: ${internalError}`
-        : repayData?.message ?? repayCall.error ?? null,
+      resultMessage: baseMessage || overCollectionNote ? `${baseMessage ?? ""}${overCollectionNote}`.trim() : null,
       repayHttpStatus: repayCall.status || null,
       repayTransactionId: repayData?.transactionId ?? null,
       repayDebitAmount: repayData?.debitAmount ?? amountToCollect,
@@ -954,6 +1001,7 @@ export async function attemptRepayForNotification(
       borrowerId,
       requestedAmount: amountToCollect,
       creditedAmount: notification.creditedAmount,
+      overCollected: overCollected > 0.01 ? overCollected : 0,
       cbsStatus: repayCall.status,
       cbsTransactionId: repayData?.transactionId,
       cbsMessage: repayData?.message,
@@ -1030,6 +1078,107 @@ function isRetriableFailure(resultMessage: string | null): boolean {
   );
 }
 
+const DEBITED_UNPOSTED_MESSAGE_PREFIX = "CBS debited but internal posting failed";
+
+/**
+ * The CBS took the money but our posting failed for a reason that may clear on
+ * its own. (A debit against a loan that owed nothing is an over-collection to
+ * refund, not a posting to retry.)
+ */
+function isUnpostedDebit(n: { resultMessage: string | null }): boolean {
+  return Boolean(
+    n.resultMessage?.startsWith(DEBITED_UNPOSTED_MESSAGE_PREFIX) &&
+      !n.resultMessage.includes(NOTHING_LEFT_TO_COLLECT),
+  );
+}
+
+/** Only re-post debits this recent; see repostUnpostedDebits. */
+const getRepostMaxAgeHours = () => readIntEnv("NPL_REPOST_MAX_AGE_HOURS", 6);
+
+/**
+ * Post CBS debits whose internal posting failed after the CBS had already taken
+ * the money, so the loan stops showing a balance the customer has paid. Only
+ * recent ones: an older unposted debit may since have been reversed at the CBS
+ * by hand, and posting it then would credit a payment the customer no longer
+ * made. Anything older stays FAILED for a person to settle.
+ */
+async function repostUnpostedDebits(): Promise<number> {
+  const since = new Date(Date.now() - getRepostMaxAgeHours() * 60 * 60 * 1000);
+  const candidates = await prisma.nplCreditNotification.findMany({
+    where: {
+      processStatus: "FAILED",
+      paymentId: null,
+      loanId: { not: null },
+      repayTransactionId: { not: null },
+      repayDebitAmount: { gt: 0 },
+      lastAttemptAt: { gte: since },
+    },
+    orderBy: { lastAttemptAt: "asc" },
+    select: {
+      id: true,
+      loanId: true,
+      borrowerId: true,
+      correlationId: true,
+      repayTransactionId: true,
+      repayDebitAmount: true,
+      resultMessage: true,
+    },
+  });
+
+  let reposted = 0;
+  for (const n of candidates.filter(isUnpostedDebit)) {
+    const debited = Number(n.repayDebitAmount);
+    try {
+      const breakdown = await recordCbsRepayment({
+        loanId: n.loanId!,
+        amount: debited,
+        correlationId: n.correlationId,
+        cbsTransactionId: n.repayTransactionId,
+      });
+      const overCollected = Number((debited - breakdown.paymentAmount).toFixed(2));
+      await prisma.nplCreditNotification.update({
+        where: { id: n.id },
+        data: {
+          processStatus: breakdown.isFullyPaid ? "REPAID" : "PARTIAL_REPAID",
+          paymentId: breakdown.paymentId,
+          resultMessage:
+            "Posted by the retry sweep after the first posting failed." +
+            (overCollected > 0.01
+              ? ` OVER-COLLECTED ${overCollected.toFixed(2)}: the CBS debited ${debited.toFixed(2)} but the loan ` +
+                `owed ${breakdown.paymentAmount.toFixed(2)}. Refund the difference to the customer.`
+              : ""),
+        },
+      });
+      reposted += 1;
+      if (breakdown.isFullyPaid && n.borrowerId) {
+        void syncCbsDeletionForBorrower(n.borrowerId, {
+          source: "AUTO",
+          reason: "NPL loan fully repaid via CBS auto-debit (posted by retry sweep).",
+        });
+      }
+    } catch (e: any) {
+      const message = e?.message ?? String(e);
+      if (message.includes(NOTHING_LEFT_TO_COLLECT)) {
+        await prisma.nplCreditNotification.update({
+          where: { id: n.id },
+          data: {
+            resultMessage:
+              `${DEBITED_UNPOSTED_MESSAGE_PREFIX}: ${NOTHING_LEFT_TO_COLLECT} OVER-COLLECTED ${debited.toFixed(2)}: ` +
+              "the loan was settled before this debit could be posted. Refund it to the customer.",
+          },
+        });
+      }
+      // Otherwise leave it for the next sweep; it keeps blocking new collections
+      // on the loan (see claimLoanForCollection) until it is posted.
+      void logger.error(`[CBS-NPL] Re-post of unposted debit failed for notification=${n.id}: ${message}`);
+    }
+  }
+  if (reposted > 0) {
+    void logger.warn(`[CBS-NPL] Re-posted ${reposted} CBS debit(s) whose first posting had failed.`);
+  }
+  return reposted;
+}
+
 /**
  * Clear collection claims left behind by a process that stopped mid-flight, so
  * the loan is collectable again. They are released to FAILED with a message
@@ -1062,6 +1211,7 @@ export interface RetrySweepResult {
   collected: number;
   stillFailing: number;
   releasedClaims: number;
+  repostedDebits: number;
 }
 
 /**
@@ -1081,6 +1231,8 @@ export async function retryFailedCreditNotificationsOnce(): Promise<RetrySweepRe
 
   // Free up loans held by claims whose process never came back, before scanning.
   const releasedClaims = await releaseAbandonedClaims();
+  // Post debits the CBS already made before anything collects against those loans again.
+  const repostedDebits = await repostUnpostedDebits();
 
   // Scan wider than the batch because the message filter runs in JS: matching
   // in SQL would depend on the column's collation for case handling.
@@ -1107,6 +1259,7 @@ export async function retryFailedCreditNotificationsOnce(): Promise<RetrySweepRe
     collected: 0,
     stillFailing: 0,
     releasedClaims,
+    repostedDebits,
   };
   if (candidates.length === 0) return result;
 
@@ -1282,6 +1435,118 @@ interface CbsRepaymentBreakdown {
   isFullyPaid: boolean;
 }
 
+const NOTHING_LEFT_TO_COLLECT = "Nothing left to collect for this loan.";
+
+/**
+ * Post a CBS debit that has already succeeded, retrying transient failures. The
+ * money has left the customer's account by now; an unposted debit keeps the
+ * balance open, so the next credit — or the customer, in the app — pays it again.
+ * The August double debits all began with "Unable to start a transaction in the
+ * given time".
+ */
+async function postCbsRepaymentWithRetry(
+  args: Parameters<typeof recordCbsRepayment>[0],
+): Promise<CbsRepaymentBreakdown> {
+  const retryDelaysMs = [1_000, 3_000, 7_000];
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await recordCbsRepayment(args);
+    } catch (e: any) {
+      const message = e?.message ?? String(e);
+      if (attempt >= retryDelaysMs.length || message.includes(NOTHING_LEFT_TO_COLLECT)) throw e;
+      console.warn("[CBS-NPL][AutoDebit] Internal posting failed, retrying", {
+        loanId: args.loanId,
+        attempt: attempt + 1,
+        error: message,
+      });
+      await new Promise((resolve) => setTimeout(resolve, retryDelaysMs[attempt]));
+    }
+  }
+}
+
+const isClosedInstallment = (status: string | null | undefined) =>
+  ["PAID", "MERGED"].includes(String(status ?? "").toUpperCase());
+
+const parseJsonArray = (raw: unknown): any[] => {
+  if (Array.isArray(raw)) return raw;
+  try {
+    const parsed = JSON.parse(String(raw ?? "[]"));
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+};
+
+/**
+ * Book a CBS collection against the loan's installment schedule, as the SuperApp
+ * and manual repayment paths do, and return the installment it was booked to.
+ *
+ * Auto-collections used to move only loan.repaidAmount. The installment still
+ * looked unpaid, so the borrower app asked customers to pay the auto-debited
+ * principal a second time, and loans repaid in full stayed open.
+ */
+async function applyCollectionToInstallments(
+  tx: Prisma.TransactionClient,
+  args: {
+    installments: LoanInstallment[];
+    loanDueDate: Date;
+    penaltyRules: unknown;
+    penaltyPerInstallment: boolean;
+    penaltyPaid: number;
+    principalPaid: number;
+    isFullyPaid: boolean;
+    asOf: Date;
+  },
+): Promise<string | null> {
+  const open = args.installments.filter((i) => !isClosedInstallment(i.status));
+  const active = open.find((i) => i.isActive) ?? open[0];
+  if (!active) return null;
+
+  const paidAmount = (active.paidAmount || 0) + args.penaltyPaid + args.principalPaid;
+
+  if (args.isFullyPaid) {
+    await tx.loanInstallment.update({
+      where: { id: active.id },
+      data: { paidAmount, paidAt: args.asOf, status: "Paid", isActive: false },
+    });
+    const others = open.filter((i) => i.id !== active.id).map((i) => i.id);
+    if (others.length > 0) {
+      await tx.loanInstallment.updateMany({
+        where: { id: { in: others } },
+        data: { status: "Paid", isActive: false, paidAt: args.asOf },
+      });
+    }
+    return active.id;
+  }
+
+  const split = splitInstallmentPaidAmount({
+    installmentAmount: active.amount || 0,
+    installmentPaidAmount: paidAmount,
+    penaltyRules: parseJsonArray(args.penaltyRules),
+    penaltyDueDate: new Date(args.penaltyPerInstallment ? active.dueDate : args.loanDueDate),
+    asOfDate: args.asOf,
+  });
+  const settled = split.principalRemaining <= 0.005 && split.penaltyRemaining <= 0.005;
+  await tx.loanInstallment.update({
+    where: { id: active.id },
+    data: {
+      paidAmount,
+      paidAt: args.asOf,
+      penaltyAmount: split.penaltyAccrued,
+      ...(settled ? { status: "Paid", isActive: false } : {}),
+    },
+  });
+  if (settled) {
+    const next = open.find(
+      (i) => i.installmentNumber > active.installmentNumber && (i.amount || 0) > 0,
+    );
+    if (next) {
+      await tx.loanInstallment.update({ where: { id: next.id }, data: { isActive: true } });
+    }
+  }
+  return active.id;
+}
+
 async function recordCbsRepayment(args: {
   loanId: string;
   amount: number;
@@ -1302,6 +1567,9 @@ async function recordCbsRepayment(args: {
       include: {
         product: { include: { provider: { include: { ledgerAccounts: true } } } },
         payments: { orderBy: { date: "asc" } },
+        // computeLoanOutstanding sized the CBS debit with installments loaded;
+        // post against the same figures so the posting is never capped below it.
+        installments: { orderBy: { installmentNumber: "asc" } },
       },
     }),
     prisma.tax.findMany({ where: { status: "ACTIVE" } }),
@@ -1347,7 +1615,7 @@ async function recordCbsRepayment(args: {
 
   const paymentAmount = Math.min(amount, totalDue);
   if (paymentAmount <= 0) {
-    throw new Error("Nothing left to collect for this loan.");
+    throw new Error(NOTHING_LEFT_TO_COLLECT);
   }
 
   const principalReceivable = provider.ledgerAccounts.find(
@@ -1485,18 +1753,30 @@ async function recordCbsRepayment(args: {
       });
     }
 
+    const newRepaid = alreadyRepaid + paymentAmount;
+    const isFullyPaid = newRepaid >= totals.total - 0.01;
+
+    const installmentId = await applyCollectionToInstallments(tx, {
+      installments: loan.installments,
+      loanDueDate: loan.dueDate,
+      penaltyRules: loan.product.penaltyRules,
+      penaltyPerInstallment: Boolean(loan.product.penaltyPerInstallment),
+      penaltyPaid: penaltyToPay,
+      principalPaid: principalToPay,
+      isFullyPaid,
+      asOf: today,
+    });
+
     const payment = await tx.payment.create({
       data: {
         loanId: loan.id,
+        installmentId,
         amount: paymentAmount,
         date: today,
         outstandingBalanceBeforePayment: totalDue,
         journalEntryId: journalEntry.id,
       },
     });
-
-    const newRepaid = alreadyRepaid + paymentAmount;
-    const isFullyPaid = newRepaid >= totals.total - 0.01;
     const repaymentBehavior = isFullyPaid
       ? differenceInDays(today, startOfDay(loan.dueDate)) > 0
         ? "LATE"
@@ -1538,6 +1818,12 @@ async function recordCbsRepayment(args: {
       remainingBalance: Math.max(0, totals.total - newRepaid),
       isFullyPaid,
     };
+  }, {
+    // Every posting updates the same provider ledger-account rows, so postings
+    // queue behind each other when the CBS sends a burst of credits. The 2s
+    // default wait failed postings whose debit the CBS had already made.
+    maxWait: 15_000,
+    timeout: 30_000,
   });
   console.log("[CBS-NPL][AutoDebit] Ledger posting committed", {
     loanId,

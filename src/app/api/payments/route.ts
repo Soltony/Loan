@@ -41,7 +41,7 @@ export async function POST(req: NextRequest) {
         const [loan, taxConfigs] = await Promise.all([
             prisma.loan.findUnique({
                 where: { id: loanId },
-                include: { 
+                include: {
                     product: {
                         include: {
                             provider: {
@@ -50,7 +50,10 @@ export async function POST(req: NextRequest) {
                                 }
                             }
                         }
-                    }
+                    },
+                    // Interest depends on when principal was repaid; without these the
+                    // total due is overstated for loans with earlier partial payments.
+                    payments: { orderBy: { date: 'asc' } },
                 }
             }),
             prisma.tax.findMany({ where: { status: 'ACTIVE' } })

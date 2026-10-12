@@ -1,7 +1,8 @@
 
 
 import { DashboardClient } from '@/components/admin/dashboard-client';
-import { getPortfolioLedgerMetrics, getIncomeForLoanIds } from '@/lib/dashboard-metrics';
+import { getPortfolioLedgerMetrics, getIncomeForLoanIds, getOpenLoanOutstanding, sumReconciledCollections } from '@/lib/dashboard-metrics';
+import type { ReconciledAmounts } from '@/lib/repayment-reconciliation';
 import prisma from '@/lib/prisma';
 import type { LoanProvider, DashboardData } from '@/lib/types';
 import { getUserFromSession } from '@/lib/user';
@@ -53,7 +54,7 @@ function bucketDisbursements(
 // `range` narrows every flow metric to loans disbursed inside the window; the
 // capital cards (Initial Fund / Provider Fund) stay point-in-time by nature.
 // `day` only retargets the two daily cards, which default to today.
-async function getProviderData(providerId?: string, borrowerIds?: string[] | null, range?: DashboardRange | null, day?: DashboardRange | null): Promise<DashboardData> {
+async function getProviderData(providerId?: string, borrowerIds?: string[] | null, range?: DashboardRange | null, day?: DashboardRange | null, reconciledCache: Map<string, ReconciledAmounts> = new Map()): Promise<DashboardData> {
     const today = new Date();
     const startOfTodayDate = startOfToday();
     const endOfTodayDate = endOfToday();
@@ -113,7 +114,25 @@ async function getProviderData(providerId?: string, borrowerIds?: string[] | nul
     const totalStartingCapital = providersData.reduce((acc, p) => acc + p.startingCapital, 0);
 
     const portfolioLedger = await getPortfolioLedgerMetrics(prisma, providerId, borrowerIds, range);
-    const { totalDisbursed, receivables, collections } = portfolioLedger;
+    const { totalDisbursed } = portfolioLedger;
+    // What open loans still owe, computed the way the loans report computes it.
+    // Tax payable stays on the ledger: it is inclusive tax withheld at
+    // disbursement and owed onward, not a balance borrowers owe.
+    const openLoans = await getOpenLoanOutstanding(prisma, { providerId, borrowerIds, disbursedRange: range });
+    const receivables = { ...openLoans.receivables, tax: portfolioLedger.receivables.tax };
+    // The Repayments and Collections tabs report the same restated figures, and
+    // Principal Receivable + Principal Received = Total Disbursed.
+    const collected = await sumReconciledCollections(prisma, loans.map((l) => l.id), reconciledCache);
+    const collections = {
+        principal: collected.principal,
+        interest: collected.interest,
+        serviceFee: collected.serviceFee,
+        penalty: collected.penalty,
+        // Tax Paid card: tax collected plus tax transferred out, from the ledger.
+        tax: portfolioLedger.collections.tax,
+    };
+    const openLoanIds = new Set(openLoans.loans.map((l) => l.id));
+    const now = new Date();
     // Capital remaining for disbursement is the live available balance, which is
     // decremented on every disbursement and incremented by revolving-fund
     // replenishments. Deriving it from startingCapital - totalDisbursed would
@@ -140,10 +159,11 @@ async function getProviderData(providerId?: string, borrowerIds?: string[] | nul
             penalty: aggregateLedgerBalance('Income', 'Penalty'),
         };
     }
+    // A loan is open while it still owes something, whatever its status flag says.
     const totalLoans = loans.length;
-    const paidLoans = loans.filter(l => l.repaymentStatus === 'Paid').length;
+    const paidLoans = loans.filter(l => !openLoanIds.has(l.id)).length;
     const repaymentRate = totalLoans > 0 ? (paidLoans / totalLoans) * 100 : 0;
-    const atRiskLoans = loans.filter(l => l.repaymentStatus === 'Unpaid' && new Date(l.dueDate) < new Date()).length;
+    const atRiskLoans = loans.filter(l => openLoanIds.has(l.id) && new Date(l.dueDate) < now).length;
 
     // The two "daily" cards follow the day picker first, then the selected
     // period, and fall back to today. The client relabels them to match.
@@ -195,8 +215,8 @@ async function getProviderData(providerId?: string, borrowerIds?: string[] | nul
             })
         );
 
-    const paidCount = loans.filter(l => l.repaymentStatus === 'Paid').length;
-    const unpaidCount = loans.filter(l => l.repaymentStatus === 'Unpaid' && new Date(l.dueDate) >= new Date()).length;
+    const paidCount = paidLoans;
+    const unpaidCount = loans.filter(l => openLoanIds.has(l.id) && new Date(l.dueDate) >= now).length;
     const overdueCount = atRiskLoans;
     const loanStatusData = [
         { name: 'Paid', value: paidCount },
@@ -249,8 +269,10 @@ async function getProviderData(providerId?: string, borrowerIds?: string[] | nul
     });
 
     const productOverview = await Promise.all(allProducts.map(async p => {
-        const active = await prisma.loan.count({ where: { productId: p.id, repaymentStatus: 'Unpaid', ...borrowerFilter, ...rangeFilter } });
-        const defaulted = await prisma.loan.count({ where: { productId: p.id, repaymentStatus: 'Unpaid', dueDate: { lt: new Date() }, ...borrowerFilter, ...rangeFilter } });
+        const openForProduct = openLoans.loans.filter(l => l.productId === p.id);
+        const active = openForProduct.length;
+        // Past due and still owing, as a share of every loan the product issued.
+        const defaulted = openForProduct.filter(l => new Date(l.dueDate) < now).length;
         const total = await prisma.loan.count({ where: { productId: p.id, repaymentStatus: { not: 'REVERSED' }, ...borrowerFilter, ...rangeFilter } });
         return {
             name: p.name,
@@ -375,12 +397,14 @@ export async function getDashboardData(userId: string, requestedBranchCode?: num
         })
         : (user?.loanProvider ? [user.loanProvider] : []);
 
-    const overallData = await getProviderData(isSuperAdminOrAdmin ? undefined : user?.loanProvider?.id, null, range, day);
-    
+    // The overall view reconciles every loan; the per-provider views reuse it.
+    const reconciledCache = new Map<string, ReconciledAmounts>();
+    const overallData = await getProviderData(isSuperAdminOrAdmin ? undefined : user?.loanProvider?.id, null, range, day, reconciledCache);
+
     let providerSpecificData: Record<string, DashboardData> = {};
 
     if (isSuperAdminOrAdmin) {
-         const specificDataPromises = providers.map(p => getProviderData(p.id, null, range, day));
+         const specificDataPromises = providers.map(p => getProviderData(p.id, null, range, day, reconciledCache));
          const results = await Promise.all(specificDataPromises);
          results.forEach((data, index) => {
              providerSpecificData[providers[index].id] = data;

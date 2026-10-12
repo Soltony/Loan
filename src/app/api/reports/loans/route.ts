@@ -2,7 +2,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import prisma from '@/lib/prisma';
 import { startOfDay, endOfDay, startOfWeek, endOfWeek, startOfMonth, endOfMonth, startOfYear, endOfYear, differenceInDays, isValid } from 'date-fns';
-import { calculateTotalRepayable } from '@/lib/loan-calculator';
+import { calculateOutstandingBreakdown } from '@/lib/loan-calculator';
 import type { Loan, LoanProduct, Payment, ProvisionedData } from '@prisma/client';
 import { getUserFromSession } from '@/lib/user';
 import { applyUserBranchFilterToLoanWhere, parseBranchCodeQueryParam } from '@/lib/branch-filter';
@@ -177,7 +177,9 @@ export async function GET(req: NextRequest) {
                             provider: true,
                         },
                     },
-                    payments: true,
+                    payments: { orderBy: { date: 'desc' } },
+                    // Per-installment penalty products owe what the repayment flows charge.
+                    installments: { orderBy: { installmentNumber: 'asc' } },
                     borrower: {
                        include: {
                             // Include all provisioned data and sort by latest, we'll find the name in code.
@@ -209,22 +211,13 @@ export async function GET(req: NextRequest) {
                 asOfDate = new Date(loan.payments[0].date);
             }
 
-            const { total, principal, interest, penalty, serviceFee } = calculateTotalRepayable(loan as any, loan.product, taxConfigs, asOfDate, true);
-            
-            const totalRepaid = (loan.repaidAmount || 0);
+            const outstanding = calculateOutstandingBreakdown(loan as any, loan.product as any, taxConfigs, asOfDate);
 
-            // Correct calculation for outstanding amounts
-            const penaltyPaid = Math.min(totalRepaid, penalty);
-            const serviceFeePaid = Math.min(Math.max(0, totalRepaid - penalty), serviceFee);
-            const interestPaid = Math.min(Math.max(0, totalRepaid - penalty - serviceFee), interest);
-            const principalPaid = Math.max(0, totalRepaid - penalty - serviceFee - interest);
-
-            const totalOutstanding = Math.max(0, total - totalRepaid);
-
-            let principalOutstanding = principal - principalPaid;
-            let interestOutstanding = interest - interestPaid;
-            let serviceFeeOutstanding = serviceFee - serviceFeePaid;
-            let penaltyOutstanding = penalty - penaltyPaid;
+            let totalOutstanding = outstanding.total;
+            let principalOutstanding = outstanding.principal;
+            let interestOutstanding = outstanding.interest;
+            let serviceFeeOutstanding = outstanding.serviceFee;
+            let penaltyOutstanding = outstanding.penalty;
 
             let status = 'Current';
             const daysInArrears = differenceInDays(today, loan.dueDate);
@@ -232,7 +225,9 @@ export async function GET(req: NextRequest) {
 
             if (loan.repaymentStatus === 'Paid' || isOutstandingZero) {
                 status = 'Paid';
-                // Force components to zero if fully paid to avoid negative values due to calculation differences
+                // A paid loan owes nothing; zero every column, the total included,
+                // so the export never sums phantom balances from settled loans.
+                totalOutstanding = 0;
                 principalOutstanding = 0;
                 interestOutstanding = 0;
                 serviceFeeOutstanding = 0;

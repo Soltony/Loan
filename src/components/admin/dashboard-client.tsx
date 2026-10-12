@@ -341,7 +341,7 @@ const DashboardView = ({ data, color, hideFunds = false, periodLabel, dayLabel }
                             <TableCell>{product.name}</TableCell>
                             <TableCell>{product.provider}</TableCell>
                             <TableCell>{product.active}</TableCell>
-                            <TableCell className="text-right">{product.defaultRate.toFixed(1)}%</TableCell>
+                            <TableCell className="text-right">{product.defaultRate.toFixed(2)}%</TableCell>
                         </TableRow>
                     ))}
                   </TableBody>

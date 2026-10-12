@@ -5,6 +5,23 @@ import prisma from '@/lib/prisma';
 import { startOfDay, endOfDay, startOfWeek, endOfWeek, startOfMonth, endOfMonth, startOfYear, endOfYear, format, isValid } from 'date-fns';
 import { getUserFromSession } from '@/lib/user';
 import { resolveBranchBorrowerIdsForUser, parseBranchCodeQueryParam } from '@/lib/branch-filter';
+import { reconcileRepaymentsForLoans } from '@/lib/repayment-reconciliation-data';
+
+// SQL Server caps a statement at ~2100 parameters.
+const LOAN_ID_BATCH = 1000;
+
+/** Provider name of each loan. */
+async function loanProviderNames(loanIds: string[]): Promise<Map<string, string>> {
+    const names = new Map<string, string>();
+    for (let i = 0; i < loanIds.length; i += LOAN_ID_BATCH) {
+        const loans = await prisma.loan.findMany({
+            where: { id: { in: loanIds.slice(i, i + LOAN_ID_BATCH) } },
+            select: { id: true, product: { select: { provider: { select: { name: true } } } } },
+        });
+        for (const l of loans) names.set(l.id, l.product.provider.name);
+    }
+    return names;
+}
 
 const getDates = (timeframe: string, from?: string, to?: string) => {
     if (from && to) {
@@ -74,27 +91,20 @@ export async function GET(req: NextRequest) {
         Math.max(1, parseInt(searchParams.get("pageSize") || String(DEFAULT_PAGE_SIZE), 10))
     );
 
+    // Collections are the repayments (Payment rows) on live loans, split the way
+    // the dashboard and the Repayments tab split them (reconcileLoanRepayments).
+    // Reversed loans are out: a reversal deletes their Payment rows anyway.
+    // Payment.date is the repayment's journal date.
     const whereClause: any = {
-        type: 'Debit',
-        ledgerAccount: {
-            type: 'Received'
-        },
-        journalEntry: {
-            ...(dateRange.gte && { date: { gte: dateRange.gte } }),
-            ...(dateRange.lte && { date: { lte: dateRange.lte } }),
-            // Count only collections from live loan repayments. Scope to loan-linked,
-            // non-reversed journal entries so "Total Collected" reconciles with actual
-            // payments (and the dashboard's Daily Repayments). Without this the
-            // "Received" Debit-only sum is overstated by:
-            //   - Reversed loans: a reversal posts an *offsetting Credit* (on the
-            //     reversal date) and deletes the Payment records, but the original
-            //     "Received" Debits remain. Summing Debits only never nets the credit,
-            //     so reversed repayments are counted forever.
-            //   - Provider-level postings with no loan (e.g. tax-transfer destination
-            //     entries) are cash outflows, not collections.
-            // Mirrors getPortfolioLedgerMetrics, the dashboard's collections source.
-            loan: { is: { repaymentStatus: { not: 'REVERSED' } } },
-        }
+        loan: { repaymentStatus: { not: 'REVERSED' } },
+        ...(dateRange.gte || dateRange.lte
+            ? {
+                date: {
+                    ...(dateRange.gte && { gte: dateRange.gte }),
+                    ...(dateRange.lte && { lte: dateRange.lte }),
+                },
+            }
+            : {}),
     };
     
     const isSuperAdminOrRecon = user.role === 'Super Admin' || user.role === 'Reconciliation';
@@ -106,7 +116,7 @@ export async function GET(req: NextRequest) {
     }
 
     if (providerId && providerId !== 'all' && providerId !== 'none') {
-        whereClause.journalEntry.providerId = providerId;
+        whereClause.loan.product = { providerId };
     }
     
     if (providerId === 'none') {
@@ -120,27 +130,19 @@ export async function GET(req: NextRequest) {
         return NextResponse.json({ data: [], total: 0, page: 1, pageSize, totalPages: 0 });
     }
     if (branchBorrowerIds) {
-        whereClause.journalEntry.loan.is.borrowerId = { in: branchBorrowerIds };
+        whereClause.loan.borrowerId = { in: branchBorrowerIds };
     }
 
     try {
-        const ledgerEntries = await prisma.ledgerEntry.findMany({
+        const payments = await prisma.payment.findMany({
             where: whereClause,
-            select: {
-                amount: true,
-                journalEntry: {
-                    select: {
-                        date: true,
-                        provider: {
-                            select: { name: true }
-                        }
-                    }
-                },
-                ledgerAccount: {
-                    select: { category: true }
-                }
-            }
+            select: { journalEntryId: true, loanId: true, date: true },
         });
+        const loanIds = Array.from(new Set(payments.map((p) => p.loanId)));
+        const [reconciled, loanProviders] = await Promise.all([
+            reconcileRepaymentsForLoans(prisma, loanIds),
+            loanProviderNames(loanIds),
+        ]);
 
         const aggregatedData: Record<string, {
             provider: string;
@@ -149,11 +151,14 @@ export async function GET(req: NextRequest) {
             serviceFee: number;
             penalty: number;
             tax: number;
+            unapplied: number;
         }> = {};
-        
-        for (const entry of ledgerEntries) {
-            const dateStr = format(new Date(entry.journalEntry.date), 'yyyy-MM-dd');
-            const providerName = entry.journalEntry.provider.name;
+
+        for (const payment of payments) {
+            const split = payment.journalEntryId ? reconciled.byEntry.get(payment.journalEntryId) : undefined;
+            if (!split) continue;
+            const dateStr = format(new Date(payment.date), 'yyyy-MM-dd');
+            const providerName = loanProviders.get(payment.loanId) ?? '';
             const key = `${providerName}-${dateStr}`;
 
             if (!aggregatedData[key]) {
@@ -164,24 +169,25 @@ export async function GET(req: NextRequest) {
                     serviceFee: 0,
                     penalty: 0,
                     tax: 0,
+                    unapplied: 0,
                 };
             }
-
-            const category = entry.ledgerAccount.category.toLowerCase();
-            if (category === 'principal') aggregatedData[key].principal += entry.amount;
-            else if (category === 'interest') aggregatedData[key].interest += entry.amount;
-            else if (category === 'servicefee') aggregatedData[key].serviceFee += entry.amount;
-            else if (category === 'penalty') aggregatedData[key].penalty += entry.amount;
-            else if (category === 'tax') aggregatedData[key].tax += entry.amount;
+            const row = aggregatedData[key];
+            row.principal += split.principal;
+            row.interest += split.interest;
+            row.serviceFee += split.serviceFee;
+            row.penalty += split.penalty;
+            row.tax += split.tax;
+            row.unapplied += split.unapplied;
         }
-        
+
         let reportData = Object.entries(aggregatedData).map(([key, value]) => {
              const [provider, date] = key.split(/-(?=\d{4})/); // Split on hyphen only if followed by 4 digits (a year)
              return {
                 provider,
                 date,
                 ...value,
-                total: value.principal + value.interest + value.serviceFee + value.penalty + value.tax,
+                total: value.principal + value.interest + value.serviceFee + value.penalty + value.tax + value.unapplied,
             }
         });
 

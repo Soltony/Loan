@@ -1,4 +1,7 @@
 import type { PrismaClient } from '@prisma/client';
+import { calculateOutstandingBreakdown } from './loan-calculator';
+import { addAmounts, zeroAmounts, type ReconciledAmounts } from './repayment-reconciliation';
+import { reconcileRepaymentsForLoans } from './repayment-reconciliation-data';
 
 const CATEGORIES = ['Principal', 'Interest', 'ServiceFee', 'Penalty', 'Tax'] as const;
 type Category = (typeof CATEGORIES)[number];
@@ -177,6 +180,106 @@ export async function getPortfolioLedgerMetrics(
       tax: receivedNet.tax + transferredTax,
     },
   };
+}
+
+export interface OpenLoanOutstanding {
+  /** Loans that still owe something (outstanding > 0.01), in scope. */
+  loans: { id: string; productId: string; dueDate: Date; outstanding: number }[];
+  receivables: {
+    principal: number;
+    interest: number;
+    serviceFee: number;
+    penalty: number;
+  };
+  total: number;
+}
+
+/**
+ * What open loans still owe, computed per loan exactly as the loans report does
+ * (calculateOutstandingBreakdown), so the dashboard and the report agree.
+ *
+ * Ledger balances cannot give this figure. Interest and penalty accruals are not
+ * debited to their Receivable accounts, so those nets run negative (and were
+ * clamped to 0), and principal over-credited on settled loans nets against the
+ * balance of open ones. A loan flagged Unpaid that has in fact been repaid in
+ * full is not counted as open.
+ */
+export async function getOpenLoanOutstanding(
+  prisma: PrismaClient,
+  scope: {
+    providerId?: string;
+    borrowerIds?: string[] | null;
+    disbursedRange?: { gte: Date; lte: Date } | null;
+  },
+  asOf: Date = new Date(),
+): Promise<OpenLoanOutstanding> {
+  const [loans, taxConfigs] = await Promise.all([
+    prisma.loan.findMany({
+      where: {
+        repaymentStatus: 'Unpaid',
+        ...(scope.providerId ? { product: { providerId: scope.providerId } } : {}),
+        ...(scope.borrowerIds ? { borrowerId: { in: scope.borrowerIds } } : {}),
+        ...(scope.disbursedRange ? { disbursedDate: scope.disbursedRange } : {}),
+      },
+      include: {
+        payments: { select: { amount: true, date: true } },
+        installments: true,
+        product: {
+          select: {
+            duration: true,
+            serviceFee: true,
+            serviceFeeEnabled: true,
+            dailyFee: true,
+            dailyFeeEnabled: true,
+            penaltyRules: true,
+            penaltyRulesEnabled: true,
+            penaltyPerInstallment: true,
+          },
+        },
+      },
+    }),
+    // Same tax set the loans report uses.
+    prisma.tax.findMany(),
+  ]);
+
+  const result: OpenLoanOutstanding = {
+    loans: [],
+    receivables: { principal: 0, interest: 0, serviceFee: 0, penalty: 0 },
+    total: 0,
+  };
+  for (const loan of loans) {
+    const owed = calculateOutstandingBreakdown(loan as any, loan.product as any, taxConfigs as any, asOf);
+    if (owed.total <= 0.01) continue;
+    result.loans.push({ id: loan.id, productId: loan.productId, dueDate: loan.dueDate, outstanding: owed.total });
+    result.receivables.principal += owed.principal;
+    result.receivables.interest += owed.interest;
+    result.receivables.serviceFee += owed.serviceFee;
+    result.receivables.penalty += owed.penalty;
+    result.total += owed.total;
+  }
+  return result;
+}
+
+/**
+ * Repayments on these loans split into principal, charges and unapplied cash,
+ * restated per loan (see reconcileLoanRepayments) — the figures the Repayments
+ * and Collections tabs report. Principal received plus the principal open loans
+ * still owe equals what was disbursed.
+ *
+ * `cache` holds each loan's split for the rest of the request, so a dashboard
+ * showing several views of the same loans reconciles each loan once.
+ */
+export async function sumReconciledCollections(
+  prisma: PrismaClient,
+  loanIds: string[],
+  cache: Map<string, ReconciledAmounts>,
+): Promise<ReconciledAmounts> {
+  const missing = loanIds.filter((id) => !cache.has(id));
+  if (missing.length > 0) {
+    const { byLoan } = await reconcileRepaymentsForLoans(prisma, missing);
+    for (const id of missing) cache.set(id, byLoan.get(id) ?? zeroAmounts());
+  }
+  return loanIds.reduce((sum, id) => addAmounts(sum, cache.get(id)!), zeroAmounts());
 }
 
 /**

@@ -3,6 +3,8 @@ import prisma from "@/lib/prisma";
 import { calculateTotalRepayable } from "@/lib/loan-calculator";
 import { addDays, endOfDay, isValid, startOfDay, subDays } from "date-fns";
 import { getUserFromSession } from "@/lib/user";
+import { manualResolutionIds, parseRepaymentReference, referenceFor } from "@/lib/repayment-reference";
+import { reconcileRepaymentsForLoans } from "@/lib/repayment-reconciliation-data";
 import {
   applyBranchFilterToNestedLoan,
   parseBranchCodeQueryParam,
@@ -565,6 +567,48 @@ export async function GET(request: NextRequest) {
       }
     }
 
+    // SuperApp repayments carry the gateway TxRef; the FT the gateway reported for
+    // it lives on PaymentTransaction. Manual resolutions name the pending payment
+    // they resolved, which holds the FT as ops keep it. One lookup each per page.
+    const pageReferences = journalEntries
+      .filter((j) => j.payment)
+      .map((j) => parseRepaymentReference(j.description));
+    const superAppTxnRefs = Array.from(
+      new Set(pageReferences.flatMap((r) => (r.kind === "superapp" ? [r.txnRef] : []))),
+    );
+    const resolvedPendingIds = manualResolutionIds(pageReferences);
+    const [paymentTxs, resolvedPayments] = await Promise.all([
+      superAppTxnRefs.length
+        ? prisma.paymentTransaction.findMany({
+            where: { txnRef: { in: superAppTxnRefs } },
+            select: { txnRef: true, transactionId: true },
+          })
+        : [],
+      resolvedPendingIds.length
+        ? prisma.pendingPayment.findMany({
+            where: { id: { in: resolvedPendingIds } },
+            select: { id: true, transactionId: true },
+          })
+        : [],
+    ]);
+    const ftByTxnRef = new Map<string, string>();
+    for (const pt of paymentTxs) {
+      if (pt.txnRef && pt.transactionId && /^FT/i.test(pt.transactionId)) {
+        ftByTxnRef.set(pt.txnRef, pt.transactionId);
+      }
+    }
+    const ftByPendingPayment = new Map<string, string>();
+    for (const pp of resolvedPayments) {
+      if (/^FT/i.test(pp.transactionId)) ftByPendingPayment.set(pp.id, pp.transactionId);
+    }
+
+    // Restate each repayment's split across ALL of its loan's repayments (not just
+    // this page's), so page rows and the dashboard come from the same figures.
+    const reconciled = await reconcileRepaymentsForLoans(
+      prisma,
+      journalEntries.filter((j) => j.payment && j.loanId).map((j) => j.loanId as string),
+    );
+
     const rows = await Promise.all(
       journalEntries.map(async (je) => {
         const loan = je.loan as any;
@@ -638,14 +682,22 @@ export async function GET(request: NextRequest) {
           serviceFeeOutstanding +
           penaltyOutstanding;
 
-        // For repayments: calculate transaction-specific paid amounts from THIS journal entry's ledger entries
-        // (not cumulative totals from all payments)
+        // For repayments: what THIS repayment paid (not cumulative totals),
+        // restated per loan so the columns sum to the dashboard's collections.
         let principalPaid = 0;
         let interestPaid = 0;
         let serviceFeePaid = 0;
         let penaltyPaid = 0;
+        let unappliedPaid = 0;
 
-        if (je.payment) {
+        const restated = je.payment ? reconciled.byEntry.get(je.id) : undefined;
+        if (restated) {
+          principalPaid = restated.principal;
+          interestPaid = restated.interest;
+          serviceFeePaid = restated.serviceFee;
+          penaltyPaid = restated.penalty;
+          unappliedPaid = restated.unapplied;
+        } else if (je.payment) {
           // This is a repayment - get amounts from THIS specific transaction's ledger entries
           for (const entry of je.entries) {
             if (entry.ledgerAccount?.type === "Received") {
@@ -666,7 +718,7 @@ export async function GET(request: NextRequest) {
         }
 
         const totalPaid =
-          principalPaid + interestPaid + serviceFeePaid + penaltyPaid;
+          principalPaid + interestPaid + serviceFeePaid + penaltyPaid + unappliedPaid;
 
         const providerAccountNo = provider?.accountNumber || null;
         let debitAccounts = providerAccountNo
@@ -718,80 +770,12 @@ export async function GET(request: NextRequest) {
         let transactionStatus = je.payment ? "COMPLETED" : "POSTED";
         let reference = je.id;
 
-        // For repayments: resolve the CBS transaction reference (FT number) from PaymentTransaction
-        // Similar to how disbursements get cbsReference from DisbursementTransaction.transactionId
-        // Each partial repayment has its own TxRef in the journal entry description
-        if (je.payment && loan?.id) {
-          try {
-            const desc = String((je as any).description || "");
-
-            // 0) CBS NPL auto-collection: the FT reference is embedded in the
-            // journal entry description as "cbsTxn={transactionId}".
-            const cbsM = desc.match(/cbsTxn=([A-Za-z0-9-]+)/i);
-            if (cbsM && cbsM[1]) {
-              reference = cbsM[1];
-            }
-
-            // 1) Extract TxRef from journal entry description (unique per payment)
-            // The description contains "via TxRef {txnRef}" which is specific to this payment
-            const m = reference === je.id ? desc.match(/TxRef\s*[:#]?\s*([A-Za-z0-9-]+)/i) : null;
-            if (m && m[1]) {
-              const foundTxnRef = m[1];
-              // Look up PaymentTransaction by txnRef to get the FT number
-              const pt = await prisma.paymentTransaction.findFirst({
-                where: { txnRef: foundTxnRef } as any,
-              });
-              if (pt && pt.transactionId && /^FT/i.test(pt.transactionId)) {
-                reference = pt.transactionId;
-              }
-            }
-
-            // 2) If still default, try to match by payment date and amount via PendingPayment
-            if (reference === je.id && je.payment) {
-              const paymentDate = new Date(je.payment.date);
-              const paymentAmount = je.payment.amount;
-
-              // Find PendingPayment that matches this specific payment's date/amount
-              const matchingPending = await prisma.pendingPayment.findFirst({
-                where: {
-                  loanId: loan.id,
-                  status: "COMPLETED",
-                  amount: paymentAmount,
-                  updatedAt: {
-                    gte: new Date(paymentDate.getTime() - 60000), // within 1 minute
-                    lte: new Date(paymentDate.getTime() + 60000),
-                  },
-                },
-                orderBy: { updatedAt: "desc" },
-              });
-
-              // Broader fallback: match by loanId + amount only (for manually resolved payments
-              // where the approval time may differ significantly from the payment record time)
-              const resolvedPending = matchingPending ?? await prisma.pendingPayment.findFirst({
-                where: {
-                  loanId: loan.id,
-                  status: "COMPLETED",
-                  amount: paymentAmount,
-                },
-                orderBy: { updatedAt: "desc" },
-              });
-
-              if (resolvedPending && resolvedPending.transactionId) {
-                const pt = await prisma.paymentTransaction.findFirst({
-                  where: { txnRef: resolvedPending.transactionId } as any,
-                });
-                if (pt && pt.transactionId && /^FT/i.test(pt.transactionId)) {
-                  reference = pt.transactionId;
-                } else {
-                  // For manually resolved pending payments, the transactionId
-                  // stores the FT reference directly (no PaymentTransaction record)
-                  reference = resolvedPending.transactionId;
-                }
-              }
-            }
-          } catch (e) {
-            // ignore lookup errors and keep default reference
-          }
+        // For repayments: the CBS reference (FT number) each repayment was posted
+        // under, read from its own journal entry (see parseRepaymentReference).
+        if (je.payment) {
+          reference =
+            referenceFor(parseRepaymentReference(je.description), { ftByTxnRef, ftByPendingPayment }) ??
+            reference;
         }
 
         // --- Disbursement Matching: First by loanId, then by Account + Amount + Date ±3 minutes ---
@@ -946,6 +930,8 @@ export async function GET(request: NextRequest) {
           interestPaid,
           serviceFeePaid,
           penaltyPaid,
+          // Cash beyond what the loan owed in principal and charges (overpaid).
+          unappliedPaid,
           totalPaid,
           status: loan?.repaymentStatus || null,
           cbsReference,

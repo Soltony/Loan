@@ -13,7 +13,9 @@ import { startOfDay, isBefore, isEqual, differenceInDays } from "date-fns";
 import sendSms from "@/lib/sms";
 import { calculateTotalRepayable } from "@/lib/loan-calculator";
 import { reverseAllLoanJournalEntries } from "@/lib/loan-ledger-reversal";
+import { syncCbsDeletionForBorrower } from "@/actions/cbs-npl";
 import { isSafeOnlyProductUpdate } from "@/lib/loan-product-changes";
+import { normalizeFtReference } from "@/lib/repayment-reference";
 
 const approvalSchema = z.object({
   changeId: z.string(),
@@ -1525,13 +1527,18 @@ async function applyChange(
         const ipAddress = context?.ipAddress || "N/A";
         const userAgent = context?.userAgent || "N/A";
         const pendingPaymentId = data?.created?.pendingPaymentId || entityId;
-        const ftReference = data?.created?.ftReference;
+        const ftReference = normalizeFtReference(data?.created?.ftReference);
         const loanId = data?.created?.loanId;
         const paymentAmount = Number(data?.created?.amount);
         const manualPaymentDate = data?.created?.paymentDate ? new Date(data.created.paymentDate) : new Date();
 
         if (!pendingPaymentId) throw new Error("Missing pendingPaymentId");
-        if (!ftReference) throw new Error("Missing FT reference number");
+        if (!data?.created?.ftReference) throw new Error("Missing FT reference number");
+        if (!ftReference) {
+          throw new Error(
+            `"${data.created.ftReference}" is not a CBS FT reference. Reject this request and resubmit it with the FT from the CBS transaction.`,
+          );
+        }
         if (!loanId) throw new Error("Missing loanId");
 
         const pendingPayment = await prisma.pendingPayment.findUnique({
@@ -1558,6 +1565,10 @@ async function applyChange(
               installments: {
                 orderBy: { installmentNumber: "asc" },
               },
+              // Interest depends on when principal was repaid. Without the payments
+              // the total came out a birr or two high, the resolution that settled a
+              // loan left it open, and penalty accrued on a loan already paid.
+              payments: { orderBy: { date: "asc" } },
             },
           }),
           prisma.tax.findMany({ where: { status: "ACTIVE" } }),
@@ -1805,6 +1816,10 @@ async function applyChange(
           ipAddress,
           userAgent,
         });
+
+        // If this repayment cleared the borrower's last unpaid loan, take them
+        // out of NPL and CBS monitoring (best-effort, non-blocking).
+        void syncCbsDeletionForBorrower(loan.borrowerId, { source: "MANUAL", actorId });
       }
       break;
 

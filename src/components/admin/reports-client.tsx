@@ -1108,6 +1108,7 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
           "Service Fee Received": d.serviceFee,
           "Penalty Received": d.penalty,
           "Tax Received": d.tax,
+          "Unapplied / Overpaid": d.unapplied ?? 0,
           "Total Collected": d.total,
         }));
         const ws = wb.addWorksheet("Collections");
@@ -1201,6 +1202,7 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
           "Interest Paid": r.interestPaid,
           "Service Fee Paid": r.serviceFeePaid,
           "Penalty Paid": r.penaltyPaid,
+          "Unapplied / Overpaid": r.unappliedPaid ?? 0,
           "Total Paid": r.totalPaid,
           Status: r.status,
         }));
@@ -1226,6 +1228,7 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
           "Interest Paid": r.interestPaid,
           "Service Fee Paid": r.serviceFeePaid,
           "Penalty Paid": r.penaltyPaid,
+          "Unapplied / Overpaid": r.unappliedPaid ?? 0,
           "Total Paid": r.totalPaid,
           "Loan Status": r.status,
         }));
@@ -1251,6 +1254,7 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
           "Interest Paid": r.interestPaid,
           "Service Fee Paid": r.serviceFeePaid,
           "Penalty Paid": r.penaltyPaid,
+          "Unapplied / Overpaid": r.unappliedPaid ?? 0,
           "Total Paid": r.totalPaid,
           "Loan Status": r.status,
         }));
@@ -2273,6 +2277,7 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
                   <TableHead className="text-right">Interest Paid</TableHead>
                   <TableHead className="text-right">Service Fee Paid</TableHead>
                   <TableHead className="text-right">Penalty Paid</TableHead>
+                  <TableHead className="text-right">Unapplied / Overpaid</TableHead>
                   <TableHead className="text-right">Total Paid</TableHead>
                   <TableHead>Status</TableHead>
                 </TableRow>
@@ -2280,7 +2285,7 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
               <TableBody>
                 {isLoading ? (
                   <TableRow>
-                    <TableCell colSpan={18} className="h-24 text-center">
+                    <TableCell colSpan={19} className="h-24 text-center">
                       <Loader2 className="h-6 w-6 animate-spin mx-auto" />
                     </TableCell>
                   </TableRow>
@@ -2329,6 +2334,9 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
                       <TableCell className="text-right font-mono">
                         {formatCurrency(row.penaltyPaid)}
                       </TableCell>
+                      <TableCell className="text-right font-mono">
+                        {formatCurrency(row.unappliedPaid ?? 0)}
+                      </TableCell>
                       <TableCell className="text-right font-mono font-bold">
                         {formatCurrency(row.totalPaid)}
                       </TableCell>
@@ -2350,7 +2358,7 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
                   ))
                 ) : (
                   <TableRow>
-                    <TableCell colSpan={18} className="h-24 text-center">
+                    <TableCell colSpan={19} className="h-24 text-center">
                       No results found for the selected filters.
                     </TableCell>
                   </TableRow>
@@ -2404,6 +2412,7 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
                   <TableHead className="text-right">Interest Paid</TableHead>
                   <TableHead className="text-right">Service Fee Paid</TableHead>
                   <TableHead className="text-right">Penalty Paid</TableHead>
+                  <TableHead className="text-right">Unapplied / Overpaid</TableHead>
                   <TableHead className="text-right">Total Paid</TableHead>
                   <TableHead>Loan Status</TableHead>
                 </TableRow>
@@ -2411,7 +2420,7 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
               <TableBody>
                 {isLoading ? (
                   <TableRow>
-                    <TableCell colSpan={11} className="h-24 text-center">
+                    <TableCell colSpan={12} className="h-24 text-center">
                       <Loader2 className="h-6 w-6 animate-spin mx-auto" />
                     </TableCell>
                   </TableRow>
@@ -2451,6 +2460,9 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
                       <TableCell className="text-right font-mono">
                         {formatCurrency(row.penaltyPaid)}
                       </TableCell>
+                      <TableCell className="text-right font-mono">
+                        {formatCurrency(row.unappliedPaid ?? 0)}
+                      </TableCell>
                       <TableCell className="text-right font-mono font-bold">
                         {formatCurrency(row.totalPaid)}
                       </TableCell>
@@ -2472,7 +2484,7 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
                   ))
                 ) : (
                   <TableRow>
-                    <TableCell colSpan={11} className="h-24 text-center">
+                    <TableCell colSpan={12} className="h-24 text-center">
                       No borrowers found with failed disbursements that made repayments.
                     </TableCell>
                   </TableRow>
@@ -2526,6 +2538,7 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
                   <TableHead className="text-right">Interest Paid</TableHead>
                   <TableHead className="text-right">Service Fee Paid</TableHead>
                   <TableHead className="text-right">Penalty Paid</TableHead>
+                  <TableHead className="text-right">Unapplied / Overpaid</TableHead>
                   <TableHead className="text-right">Total Paid</TableHead>
                   <TableHead>Loan Status</TableHead>
                 </TableRow>
@@ -2533,7 +2546,7 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
               <TableBody>
                 {isLoading ? (
                   <TableRow>
-                    <TableCell colSpan={11} className="h-24 text-center">
+                    <TableCell colSpan={12} className="h-24 text-center">
                       <Loader2 className="h-6 w-6 animate-spin mx-auto" />
                     </TableCell>
                   </TableRow>
@@ -2573,6 +2586,9 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
                       <TableCell className="text-right font-mono">
                         {formatCurrency(row.penaltyPaid)}
                       </TableCell>
+                      <TableCell className="text-right font-mono">
+                        {formatCurrency(row.unappliedPaid ?? 0)}
+                      </TableCell>
                       <TableCell className="text-right font-mono font-bold">
                         {formatCurrency(row.totalPaid)}
                       </TableCell>
@@ -2594,7 +2610,7 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
                   ))
                 ) : (
                   <TableRow>
-                    <TableCell colSpan={11} className="h-24 text-center">
+                    <TableCell colSpan={12} className="h-24 text-center">
                       No borrowers found with posted disbursements that made repayments.
                     </TableCell>
                   </TableRow>
@@ -2637,6 +2653,7 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
                   </TableHead>
                   <TableHead className="text-right">Penalty Received</TableHead>
                   <TableHead className="text-right">Tax Received</TableHead>
+                  <TableHead className="text-right">Unapplied / Overpaid</TableHead>
                   <TableHead className="text-right font-bold">
                     Total Collected
                   </TableHead>
@@ -2645,7 +2662,7 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
               <TableBody>
                 {isLoading ? (
                   <TableRow>
-                    <TableCell colSpan={8} className="h-24 text-center">
+                    <TableCell colSpan={9} className="h-24 text-center">
                       <Loader2 className="h-6 w-6 animate-spin mx-auto" />
                     </TableCell>
                   </TableRow>
@@ -2671,6 +2688,9 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
                       <TableCell className="text-right font-mono">
                         {formatCurrency(row.tax)}
                       </TableCell>
+                      <TableCell className="text-right font-mono">
+                        {formatCurrency(row.unapplied ?? 0)}
+                      </TableCell>
                       <TableCell className="text-right font-mono font-bold">
                         {formatCurrency(row.total)}
                       </TableCell>
@@ -2678,7 +2698,7 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
                   ))
                 ) : (
                   <TableRow>
-                    <TableCell colSpan={8} className="h-24 text-center">
+                    <TableCell colSpan={9} className="h-24 text-center">
                       No results found.
                     </TableCell>
                   </TableRow>

@@ -557,6 +557,61 @@ export const calculateTotalRepayableDetailed = (
   };
 };
 
+export interface OutstandingBreakdown {
+  principal: number;
+  interest: number;
+  serviceFee: number;
+  penalty: number;
+  tax: number;
+  total: number;
+  /** What each bucket has been paid under the same waterfall. */
+  paid: { principal: number; interest: number; serviceFee: number; penalty: number; tax: number };
+}
+
+/**
+ * What a loan still owes, split by bucket in the order repayments settle them
+ * (penalty -> service fee -> interest -> tax -> principal) over loan.repaidAmount.
+ * The loans report and the admin dashboard both use this, so the outstanding they
+ * show is the same figure.
+ */
+export const calculateOutstandingBreakdown = (
+  loanDetails: LoanDetails,
+  loanProduct: LoanProduct,
+  taxConfigs: Tax[],
+  asOfDate: Date = new Date(),
+): OutstandingBreakdown => {
+  const totals = calculateTotalRepayable(loanDetails, loanProduct, taxConfigs, asOfDate, true);
+  const repaid = Math.max(0, Number(loanDetails.repaidAmount ?? 0));
+
+  let unapplied = repaid;
+  const owed = (amount: number) => {
+    const settled = Math.min(amount, unapplied);
+    unapplied -= settled;
+    return roundCurrency(Math.max(0, amount - settled));
+  };
+  const penalty = owed(totals.penalty);
+  const serviceFee = owed(totals.serviceFee);
+  const interest = owed(totals.interest);
+  const tax = owed(totals.tax);
+  const principal = owed(totals.principal);
+
+  return {
+    principal,
+    interest,
+    serviceFee,
+    penalty,
+    tax,
+    total: roundCurrency(Math.max(0, totals.total - repaid)),
+    paid: {
+      principal: roundCurrency(totals.principal - principal),
+      interest: roundCurrency(totals.interest - interest),
+      serviceFee: roundCurrency(totals.serviceFee - serviceFee),
+      penalty: roundCurrency(totals.penalty - penalty),
+      tax: roundCurrency(totals.tax - tax),
+    },
+  };
+};
+
 export interface InstallmentDueBreakdown {
   principalRemaining: number;
   penaltyRemaining: number;
@@ -569,6 +624,8 @@ export interface InstallmentDueBreakdown {
 /**
  * Computes the amount due for the *current installment payment* plus any
  * loan-level buckets (service fee / interest / tax) that are still unpaid.
+ * Never more than the loan's outstanding balance; exactly that balance for the
+ * last open installment.
  *
  * This is the same breakdown used for repayment validation in the payment callback.
  */
@@ -628,8 +685,30 @@ export const calculateInstallmentDueBreakdown = (params: {
     penaltyDueDate,
     asOfDate,
   });
-  const penaltyRemaining = split.penaltyRemaining;
-  const principalRemaining = split.principalRemaining;
+
+  // installment.paidAmount only moves when a payment is booked against the
+  // installment, while the service fee / interest / tax above are settled against
+  // loan.repaidAmount, which every repayment channel moves. Reading principal
+  // from one and charges from the other drifted both ways: it re-billed principal
+  // a CBS auto-debit had already collected (the counter was not updated), and it
+  // under-stated the balance once interest had been paid in pieces, so the
+  // callback refused payments the gateway had already taken from the customer.
+  //
+  // The loan's outstanding balance bounds every installment, and the last open
+  // installment carries all of it.
+  const loanOutstanding = Math.max(0, totals.total - alreadyRepaid);
+  const chargesDue = serviceFeeDue + interestDue + taxDue;
+  const room = Math.max(0, loanOutstanding - chargesDue);
+  const isClosed = (status: unknown) => ["PAID", "MERGED"].includes(String(status ?? "").toUpperCase());
+  const openInstallments = (loanDetails.installments ?? []).filter(
+    (i: any) => !isClosed(i?.status) && Number(i?.amount ?? 0) > 0,
+  );
+  const isLastOpenInstallment = openInstallments.length <= 1;
+
+  const penaltyRemaining = Math.min(split.penaltyRemaining, room);
+  const principalRemaining = isLastOpenInstallment
+    ? room - penaltyRemaining
+    : Math.min(split.principalRemaining, room - penaltyRemaining);
 
   const totalDue = roundCurrency(
     principalRemaining + penaltyRemaining + serviceFeeDue + interestDue + taxDue,
