@@ -16,6 +16,8 @@ const permissions = {
     approvals: { create: true, read: true, update: true, delete: true },
     npl: { create: true, read: true, update: true, delete: true },
     "audit-logs": { create: true, read: true, update: true, delete: true },
+    "manual-repayment": { create: true, read: true, update: true, delete: true, approve: true },
+    "repayment-approvals": { create: true, read: true, update: true, delete: true, approve: true },
   },
   loanProvider: {
     dashboard: { create: false, read: true, update: false, delete: false },
@@ -38,6 +40,8 @@ const permissions = {
     approvals: { create: false, read: false, update: false, delete: false },
     npl: { create: false, read: false, update: false, delete: false },
     "audit-logs": { create: false, read: false, update: false, delete: false },
+    "manual-repayment": { create: false, read: false, update: false, delete: false },
+    "repayment-approvals": { create: false, read: false, update: false, delete: false },
   },
   reconciliation: {
     dashboard: { create: false, read: true, update: false, delete: false },
@@ -60,6 +64,8 @@ const permissions = {
     approvals: { create: false, read: false, update: false, delete: false },
     npl: { create: false, read: false, update: false, delete: false },
     "audit-logs": { create: false, read: false, update: false, delete: false },
+    "manual-repayment": { create: false, read: true, update: false, delete: false },
+    "repayment-approvals": { create: false, read: true, update: false, delete: false },
   },
 };
 
@@ -133,6 +139,23 @@ async function main() {
   });
 
   console.log("Super Admin user seeded.");
+
+  // Manual repayment policy (BRD 3.5 / 3.6 / 3.7). Created once; an existing row
+  // is left alone so a bank-tuned policy survives a re-seed.
+  await prisma.manualRepaymentConfig.upsert({
+    where: { id: "global" },
+    update: {},
+    create: {
+      id: "global",
+      allocationOrder: JSON.stringify(["PENALTY", "SERVICE_FEE", "INTEREST", "TAX", "PRINCIPAL"]),
+      makerApprovalLimit: null,
+      overpaymentPolicy: "REJECT",
+      requireAttachment: false,
+      notifyCustomer: true,
+    },
+  });
+
+  console.log("Manual repayment policy seeded.");
   console.log("Seeding finished.");
 }
 

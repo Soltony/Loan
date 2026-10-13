@@ -17,6 +17,8 @@ import {
   Banknote,
   PiggyBank,
   HeartHandshake,
+  HandCoins,
+  ClipboardCheck,
 } from 'lucide-react';
 
 export const allMenuItems = [
@@ -60,6 +62,18 @@ export const allMenuItems = [
     path: '/admin/pending-payment-approvals',
     label: 'Payment Approvals',
     icon: CheckSquare,
+    roles: ['Super Admin', 'Loan Manager'],
+  },
+  {
+    path: '/admin/manual-repayment',
+    label: 'Manual Repayment',
+    icon: HandCoins,
+    roles: ['Super Admin', 'Loan Manager', 'Auditor', 'Branch', 'District'],
+  },
+  {
+    path: '/admin/manual-repayment-approvals',
+    label: 'Repayment Approvals',
+    icon: ClipboardCheck,
     roles: ['Super Admin', 'Loan Manager'],
   },
   {

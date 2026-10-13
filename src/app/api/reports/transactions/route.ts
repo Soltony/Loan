@@ -767,7 +767,9 @@ export async function GET(request: NextRequest) {
           }
         } catch (e) {}
 
-        let transactionStatus = je.payment ? "COMPLETED" : "POSTED";
+        // A booked repayment succeeded — the money is on the loan. "POSTED" is the
+        // disbursement default, replaced below by whatever CBS reported for it.
+        let transactionStatus = je.payment ? "SUCCESS" : "POSTED";
         let reference = je.id;
 
         // For repayments: the CBS reference (FT number) each repayment was posted
@@ -878,25 +880,33 @@ export async function GET(request: NextRequest) {
               borrowerAccount = match.creditAccount;
             }
 
-            // Determine status: prefer disbursementStatus field (SUCCESS/FAILED), fallback to statusCode
-            if (matchDisbursementStatus === "SUCCESS" || 
+            // Determine status: prefer disbursementStatus field (SUCCESS/FAILED), fallback to statusCode.
+            //
+            // The matched DisbursementTransaction describes how the money went OUT, so
+            // its outcome only speaks for a disbursement row. A repayment is matched
+            // here purely to borrow the customer's credit account, and letting the
+            // disbursement's status land on it is what made two identical repayments
+            // report differently — one SUCCESS, one COMPLETED — depending on whether
+            // their loan's disbursement record happened to be matchable.
+            const ownsStatus = !je.payment;
+            if (matchDisbursementStatus === "SUCCESS" ||
                 (disbursementStatusCode !== null && disbursementStatusCode >= 200 && disbursementStatusCode < 300)) {
               disbursementStatusText = "Success";
               disbursementOutcome = "Success";
               cbsCreditAmount = match.amount ?? null;
-              transactionStatus = "SUCCESS";
-            } else if (matchDisbursementStatus === "FAILED" || 
+              if (ownsStatus) transactionStatus = "SUCCESS";
+            } else if (matchDisbursementStatus === "FAILED" ||
                        (disbursementStatusCode !== null && (disbursementStatusCode < 200 || disbursementStatusCode >= 300))) {
-              disbursementStatusText = disbursementStatusCode !== null 
-                ? `Status ${disbursementStatusCode}` 
+              disbursementStatusText = disbursementStatusCode !== null
+                ? `Status ${disbursementStatusCode}`
                 : "Failed";
               disbursementOutcome = "Failure";
               cbsCreditAmount = 0;
-              transactionStatus = "FAILED";
+              if (ownsStatus) transactionStatus = "FAILED";
             } else if (matchDisbursementStatus === "PENDING" || matchDisbursementStatus === "SENT") {
               disbursementStatusText = matchDisbursementStatus;
               disbursementOutcome = "Pending";
-              transactionStatus = "PENDING";
+              if (ownsStatus) transactionStatus = "PENDING";
             }
           }
         }

@@ -75,6 +75,60 @@ describe('parseRepaymentReference', () => {
   });
 });
 
+/**
+ * The manual repayment module writes the reference the Maker keyed in straight into
+ * the journal description. Before this was parsed, the repayments report fell back
+ * to the journal entry's own cuid and showed that in the Reference column.
+ */
+describe('parseRepaymentReference for manual repayments', () => {
+  const DESCRIPTION =
+    'Manual repayment cmv6fm0250001azzid5x8dtfb — Bank Transfer (Ref: FT123456789)';
+
+  test('reads the reference the Maker entered', () => {
+    expect(parseRepaymentReference(DESCRIPTION)).toEqual({
+      kind: 'manualRepayment',
+      reference: 'FT123456789',
+      manualRepaymentId: 'cmv6fm0250001azzid5x8dtfb',
+    });
+  });
+
+  test('a cash receipt or cheque number is a reference too, not only an FT', () => {
+    expect(
+      parseRepaymentReference('Manual repayment cmv6fm0250001azzid5x8dtfb — Cash (Ref: RCPT-00912)'),
+    ).toMatchObject({ kind: 'manualRepayment', reference: 'RCPT-00912' });
+    expect(
+      parseRepaymentReference('Manual repayment cmv6fm0250001azzid5x8dtfb — Cheque (Ref: CHQ/2026/8841)'),
+    ).toMatchObject({ kind: 'manualRepayment', reference: 'CHQ/2026/8841' });
+  });
+
+  test('a reference containing a bracket is captured whole', () => {
+    expect(
+      parseRepaymentReference('Manual repayment cmv6fm0250001azzid5x8dtfb — Other Channel (Ref: A(1)B)'),
+    ).toMatchObject({ kind: 'manualRepayment', reference: 'A(1)B' });
+  });
+
+  test('does not swallow the legacy manual *resolution* description', () => {
+    expect(
+      parseRepaymentReference(
+        'Manual repayment resolution for pending payment cmo01ajuu0wr1z7egpmssj6cb (FT: FT261059WJCV)',
+      ),
+    ).toEqual({ kind: 'manual', ft: 'FT261059WJCV', pendingPaymentId: 'cmo01ajuu0wr1z7egpmssj6cb' });
+  });
+
+  test('a reversal journal carries no reference of its own', () => {
+    expect(
+      parseRepaymentReference(
+        'Reversal: manual repayment cmv6fpi34000sazzi8e4cfpu8 — keyed against the wrong loan',
+      ),
+    ).toEqual({ kind: 'unknown' });
+  });
+
+  test('referenceFor returns the entered reference without any lookup', () => {
+    const lookups = { ftByTxnRef: new Map<string, string>(), ftByPendingPayment: new Map<string, string>() };
+    expect(referenceFor(parseRepaymentReference(DESCRIPTION), lookups)).toBe('FT123456789');
+  });
+});
+
 describe('normalizeFtReference', () => {
   test('accepts a CBS FT, trimmed and upper-cased', () => {
     expect(normalizeFtReference(' ft26123ab4cd ')).toBe('FT26123AB4CD');
