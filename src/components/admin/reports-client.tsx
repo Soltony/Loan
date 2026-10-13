@@ -99,8 +99,6 @@ type ExportSource =
   | "collections"
   | "disbursements"
   | "repayments"
-  | "failedRepayments"
-  | "postedRepayments"
   | "nationalBank"
   | "providerSummary";
 
@@ -121,16 +119,6 @@ const EXPORT_SHEETS: {
   },
   { id: "disbursements", label: "Disbursements", source: "disbursements" },
   { id: "repayments", label: "Repayments", source: "repayments" },
-  {
-    id: "failedDisbursements",
-    label: "Failed Disbursements with Repayments",
-    source: "failedRepayments",
-  },
-  {
-    id: "postedDisbursements",
-    label: "Posted Disbursements with Repayments",
-    source: "postedRepayments",
-  },
   { id: "aging", label: "Aging Report", source: "providerSummary" },
   { id: "borrowerAging", label: "Borrower Aging", source: "providerSummary" },
   {
@@ -146,8 +134,6 @@ const TAB_EXPORT_SHEETS: Record<string, string[]> = {
   providerReport: ["providerLoans"],
   disbursementsReport: ["disbursements"],
   repaymentsReport: ["repayments"],
-  failedDisbursementRepaymentReport: ["failedDisbursements"],
-  postedDisbursementRepaymentReport: ["postedDisbursements"],
   collectionsReport: ["collections"],
   utilizationReport: ["utilization"],
   // The Aging tab shows both the per-provider buckets and the borrower breakdown.
@@ -192,12 +178,6 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
   const [repaymentsData, setRepaymentsData] = useState<any[]>([]);
   const [repaymentsPagination, setRepaymentsPagination] = useState({ total: 0, page: 1, pageSize: 50, totalPages: 0 });
   
-  const [failedDisbursementRepaymentData, setFailedDisbursementRepaymentData] = useState<any[]>([]);
-  const [failedDisbursementRepaymentPagination, setFailedDisbursementRepaymentPagination] = useState({ total: 0, page: 1, pageSize: 50, totalPages: 0 });
-  
-  const [postedDisbursementRepaymentData, setPostedDisbursementRepaymentData] = useState<any[]>([]);
-  const [postedDisbursementRepaymentPagination, setPostedDisbursementRepaymentPagination] = useState({ total: 0, page: 1, pageSize: 50, totalPages: 0 });
-
   const [nationalBankData, setNationalBankData] = useState<any[]>([]);
   const [nationalBankPagination, setNationalBankPagination] = useState({ total: 0, page: 1, pageSize: 50, totalPages: 0 });
   
@@ -395,18 +375,6 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
       page: 1,
       pageSize: DEFAULT_PAGE_SIZE,
     },
-    failedDisbursementRepaymentReport: {
-      sortBy: "transactionDate",
-      sortDir: "desc",
-      page: 1,
-      pageSize: DEFAULT_PAGE_SIZE,
-    },
-    postedDisbursementRepaymentReport: {
-      sortBy: "transactionDate",
-      sortDir: "desc",
-      page: 1,
-      pageSize: DEFAULT_PAGE_SIZE,
-    },
     nationalBankReport: {
       sortBy: "loanAccountRefNo",
       sortDir: "desc",
@@ -550,52 +518,6 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
     }
   }, [providerId, timeframe, appliedRange, debouncedSearch, buildPaginatedUrl, toast]);
 
-  const fetchFailedDisbursementRepaymentData = useCallback(async (page: number = 1, pageSize: number = DEFAULT_PAGE_SIZE) => {
-    if (!providerId || providerId === "none") return;
-    try {
-      const url =
-        buildPaginatedUrl(
-          "/api/reports/transactions",
-          providerId,
-          timeframe,
-          appliedRange,
-          page,
-          pageSize,
-          debouncedSearch
-        ) + "&type=failed-disbursement-with-repayment";
-      const response = await fetch(url);
-      if (!response.ok) throw new Error("Failed to fetch data");
-      const result = await response.json();
-      setFailedDisbursementRepaymentData(result.data || []);
-      setFailedDisbursementRepaymentPagination({ total: result.total || 0, page: result.page || 1, pageSize: result.pageSize || pageSize, totalPages: result.totalPages || 0 });
-    } catch (error: any) {
-      toast({ title: "Error", description: error.message, variant: "destructive" });
-    }
-  }, [providerId, timeframe, appliedRange, debouncedSearch, buildPaginatedUrl, toast]);
-
-  const fetchPostedDisbursementRepaymentData = useCallback(async (page: number = 1, pageSize: number = DEFAULT_PAGE_SIZE) => {
-    if (!providerId || providerId === "none") return;
-    try {
-      const url =
-        buildPaginatedUrl(
-          "/api/reports/transactions",
-          providerId,
-          timeframe,
-          appliedRange,
-          page,
-          pageSize,
-          debouncedSearch
-        ) + "&type=posted-disbursement-with-repayment";
-      const response = await fetch(url);
-      if (!response.ok) throw new Error("Failed to fetch data");
-      const result = await response.json();
-      setPostedDisbursementRepaymentData(result.data || []);
-      setPostedDisbursementRepaymentPagination({ total: result.total || 0, page: result.page || 1, pageSize: result.pageSize || pageSize, totalPages: result.totalPages || 0 });
-    } catch (error: any) {
-      toast({ title: "Error", description: error.message, variant: "destructive" });
-    }
-  }, [providerId, timeframe, appliedRange, debouncedSearch, buildPaginatedUrl, toast]);
-
   const fetchNationalBankData = useCallback(async (page: number = 1, pageSize: number = DEFAULT_PAGE_SIZE) => {
     if (!providerId || providerId === "none") return;
     try {
@@ -711,28 +633,6 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
               page: borrowerResult.page || 1, 
               pageSize: borrowerResult.pageSize || DEFAULT_PAGE_SIZE, 
               totalPages: borrowerResult.totalPages || 0 
-            });
-            break;
-
-          case "failedDisbursementRepaymentReport":
-            const failedResult = await fetchData(buildUrl("/api/reports/transactions") + "&type=failed-disbursement-with-repayment");
-            setFailedDisbursementRepaymentData(failedResult.data || []);
-            setFailedDisbursementRepaymentPagination({ 
-              total: failedResult.total || 0, 
-              page: failedResult.page || 1, 
-              pageSize: failedResult.pageSize || DEFAULT_PAGE_SIZE, 
-              totalPages: failedResult.totalPages || 0 
-            });
-            break;
-
-          case "postedDisbursementRepaymentReport":
-            const postedResult = await fetchData(buildUrl("/api/reports/transactions") + "&type=posted-disbursement-with-repayment");
-            setPostedDisbursementRepaymentData(postedResult.data || []);
-            setPostedDisbursementRepaymentPagination({ 
-              total: postedResult.total || 0, 
-              page: postedResult.page || 1, 
-              pageSize: postedResult.pageSize || DEFAULT_PAGE_SIZE, 
-              totalPages: postedResult.totalPages || 0 
             });
             break;
 
@@ -1043,8 +943,6 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
         allCollections,
         allDisbursements,
         allRepayments,
-        allFailedRepayments,
-        allPostedRepayments,
         allNationalBank,
         summaries,
       ] = await Promise.all([
@@ -1061,18 +959,6 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
           (page, pageSize) =>
             buildBaseUrl("/api/reports/transactions")(page, pageSize) +
             "&type=repayment"
-        ),
-        fetchIfNeeded(
-          "failedRepayments",
-          (page, pageSize) =>
-            buildBaseUrl("/api/reports/transactions")(page, pageSize) +
-            "&type=failed-disbursement-with-repayment"
-        ),
-        fetchIfNeeded(
-          "postedRepayments",
-          (page, pageSize) =>
-            buildBaseUrl("/api/reports/transactions")(page, pageSize) +
-            "&type=posted-disbursement-with-repayment"
         ),
         fetchIfNeeded("nationalBank", buildBaseUrl("/api/reports/national-bank")),
         fetchProviderSummaries(),
@@ -1110,6 +996,8 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
           "Tax Received": d.tax,
           "Unapplied / Overpaid": d.unapplied ?? 0,
           "Total Collected": d.total,
+          "Outstanding Principal": d.outstandingPrincipal ?? 0,
+          "Outstanding Loans": d.outstandingLoans ?? 0,
         }));
         const ws = wb.addWorksheet("Collections");
         addSanitizedRows(ws, collectionsExportData);
@@ -1208,58 +1096,6 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
         }));
         const ws = wb.addWorksheet("Repayments");
         addSanitizedRows(ws, repExport);
-      }
-
-      // 7. Failed Disbursements with Repayments
-      if (allFailedRepayments.length > 0) {
-        const failedRepExport = allFailedRepayments.map((r: any) => ({
-          Provider: r.provider,
-          "Repayment Date": formatDateForExport(r.transactionDate),
-          "Loan ID": r.loanId,
-          Customer:
-            r.customerName ||
-            r.borrowerName ||
-            r.borrowerAccount ||
-            r.borrowerId ||
-            "",
-          "Account Number": r.borrowerAccount || r.creditAccount,
-          Product: r.productType,
-          "Principal Paid": r.principalPaid,
-          "Interest Paid": r.interestPaid,
-          "Service Fee Paid": r.serviceFeePaid,
-          "Penalty Paid": r.penaltyPaid,
-          "Unapplied / Overpaid": r.unappliedPaid ?? 0,
-          "Total Paid": r.totalPaid,
-          "Loan Status": r.status,
-        }));
-        const ws = wb.addWorksheet("Failed Disb with Repayments");
-        addSanitizedRows(ws, failedRepExport);
-      }
-
-      // 8. Posted Disbursements with Repayments
-      if (allPostedRepayments.length > 0) {
-        const postedRepExport = allPostedRepayments.map((r: any) => ({
-          Provider: r.provider,
-          "Repayment Date": formatDateForExport(r.transactionDate),
-          "Loan ID": r.loanId,
-          Customer:
-            r.customerName ||
-            r.borrowerName ||
-            r.borrowerAccount ||
-            r.borrowerId ||
-            "",
-          "Account Number": r.borrowerAccount || r.creditAccount,
-          Product: r.productType,
-          "Principal Paid": r.principalPaid,
-          "Interest Paid": r.interestPaid,
-          "Service Fee Paid": r.serviceFeePaid,
-          "Penalty Paid": r.penaltyPaid,
-          "Unapplied / Overpaid": r.unappliedPaid ?? 0,
-          "Total Paid": r.totalPaid,
-          "Loan Status": r.status,
-        }));
-        const ws = wb.addWorksheet("Posted Disb with Repayments");
-        addSanitizedRows(ws, postedRepExport);
       }
 
       // 5. Aging Report
@@ -1537,20 +1373,6 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
       ...collectionsPagination,
     }),
     [collectionsData, collectionsPagination]
-  );
-  const failedDisbursementRepaymentTable = useMemo(
-    () => ({
-      items: failedDisbursementRepaymentData,
-      ...failedDisbursementRepaymentPagination,
-    }),
-    [failedDisbursementRepaymentData, failedDisbursementRepaymentPagination]
-  );
-  const postedDisbursementRepaymentTable = useMemo(
-    () => ({
-      items: postedDisbursementRepaymentData,
-      ...postedDisbursementRepaymentPagination,
-    }),
-    [postedDisbursementRepaymentData, postedDisbursementRepaymentPagination]
   );
   const nationalBankTable = useMemo(
     () => ({
@@ -1866,8 +1688,6 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
             <TabsTrigger value="providerReport">Provider Loans</TabsTrigger>
             <TabsTrigger value="disbursementsReport">Disbursements</TabsTrigger>
             <TabsTrigger value="repaymentsReport">Repayments</TabsTrigger>
-            <TabsTrigger value="failedDisbursementRepaymentReport">Failed Disbursements with Repayments</TabsTrigger>
-            <TabsTrigger value="postedDisbursementRepaymentReport">Posted Disbursements with Repayments</TabsTrigger>
             <TabsTrigger value="collectionsReport">Collections</TabsTrigger>
 
             {showUtilizationTab && (
@@ -2377,258 +2197,6 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
               onPageSizeChange={(pageSize) => fetchRepaymentsData(1, pageSize)}
             />
           </TabsContent>
-          <TabsContent value="failedDisbursementRepaymentReport">
-            <Table>
-              <TableHeader className="sticky top-0 bg-card z-10">
-                <TableRow>
-                  <TableHead>Provider</TableHead>
-                  <TableHead>
-                    <button
-                      onClick={() => toggleSort("failedDisbursementRepaymentReport", "transactionDate")}
-                      className="flex items-center"
-                    >
-                      Repayment Date{renderSortIcon("failedDisbursementRepaymentReport", "transactionDate")}
-                    </button>
-                  </TableHead>
-                  <TableHead>
-                    <button
-                      onClick={() => toggleSort("failedDisbursementRepaymentReport", "loanId")}
-                      className="flex items-center"
-                    >
-                      Loan ID{renderSortIcon("failedDisbursementRepaymentReport", "loanId")}
-                    </button>
-                  </TableHead>
-                  <TableHead>Customer</TableHead>
-                  <TableHead>Account Number</TableHead>
-                  <TableHead>Product</TableHead>
-                  <TableHead className="text-right">
-                    <button
-                      onClick={() => toggleSort("failedDisbursementRepaymentReport", "principalDisbursed")}
-                      className="flex items-center ml-auto"
-                    >
-                      Principal Paid{renderSortIcon("failedDisbursementRepaymentReport", "principalDisbursed")}
-                    </button>
-                  </TableHead>
-                  <TableHead className="text-right">Interest Paid</TableHead>
-                  <TableHead className="text-right">Service Fee Paid</TableHead>
-                  <TableHead className="text-right">Penalty Paid</TableHead>
-                  <TableHead className="text-right">Unapplied / Overpaid</TableHead>
-                  <TableHead className="text-right">Total Paid</TableHead>
-                  <TableHead>Loan Status</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {isLoading ? (
-                  <TableRow>
-                    <TableCell colSpan={12} className="h-24 text-center">
-                      <Loader2 className="h-6 w-6 animate-spin mx-auto" />
-                    </TableCell>
-                  </TableRow>
-                ) : failedDisbursementRepaymentTable.items.length > 0 ? (
-                  failedDisbursementRepaymentTable.items.map((row: any) => (
-                    <TableRow key={row.reference || row.loanId}>
-                      <TableCell>{row.provider}</TableCell>
-                      <TableCell>
-                        {row.transactionDate
-                          ? format(
-                              new Date(row.transactionDate),
-                              "yyyy-MM-dd"
-                            )
-                          : ""}
-                      </TableCell>
-                      <TableCell>{row.loanId?.slice(-8)}</TableCell>
-                      <TableCell>
-                        {row.customerName ||
-                          row.borrowerName ||
-                          row.borrowerAccount ||
-                          row.borrowerId ||
-                          ""}
-                      </TableCell>
-                      <TableCell className="font-mono">
-                        {row.borrowerAccount || row.creditAccount}
-                      </TableCell>
-                      <TableCell>{row.productType}</TableCell>
-                      <TableCell className="text-right font-mono">
-                        {formatCurrency(row.principalPaid)}
-                      </TableCell>
-                      <TableCell className="text-right font-mono">
-                        {formatCurrency(row.interestPaid)}
-                      </TableCell>
-                      <TableCell className="text-right font-mono">
-                        {formatCurrency(row.serviceFeePaid)}
-                      </TableCell>
-                      <TableCell className="text-right font-mono">
-                        {formatCurrency(row.penaltyPaid)}
-                      </TableCell>
-                      <TableCell className="text-right font-mono">
-                        {formatCurrency(row.unappliedPaid ?? 0)}
-                      </TableCell>
-                      <TableCell className="text-right font-mono font-bold">
-                        {formatCurrency(row.totalPaid)}
-                      </TableCell>
-                      <TableCell>
-                        <Badge
-                          variant={
-                            row.status === "Overdue" ||
-                            row.status === "Defaulted"
-                              ? "destructive"
-                              : row.status === "Paid"
-                              ? "default"
-                              : "secondary"
-                          }
-                        >
-                          {row.status}
-                        </Badge>
-                      </TableCell>
-                    </TableRow>
-                  ))
-                ) : (
-                  <TableRow>
-                    <TableCell colSpan={12} className="h-24 text-center">
-                      No borrowers found with failed disbursements that made repayments.
-                    </TableCell>
-                  </TableRow>
-                )}
-              </TableBody>
-            </Table>
-            <PaginationControls
-              tab="failedDisbursementRepaymentReport"
-              meta={{
-                total: failedDisbursementRepaymentTable.total,
-                totalPages: failedDisbursementRepaymentTable.totalPages,
-                page: failedDisbursementRepaymentTable.page,
-                pageSize: failedDisbursementRepaymentTable.pageSize,
-              }}
-              onPageChange={(page) => fetchFailedDisbursementRepaymentData(page, failedDisbursementRepaymentTable.pageSize)}
-              onPageSizeChange={(pageSize) => fetchFailedDisbursementRepaymentData(1, pageSize)}
-            />
-          </TabsContent>
-          <TabsContent value="postedDisbursementRepaymentReport">
-            <Table>
-              <TableHeader className="sticky top-0 bg-card z-10">
-                <TableRow>
-                  <TableHead>Provider</TableHead>
-                  <TableHead>
-                    <button
-                      onClick={() => toggleSort("postedDisbursementRepaymentReport", "transactionDate")}
-                      className="flex items-center"
-                    >
-                      Repayment Date{renderSortIcon("postedDisbursementRepaymentReport", "transactionDate")}
-                    </button>
-                  </TableHead>
-                  <TableHead>
-                    <button
-                      onClick={() => toggleSort("postedDisbursementRepaymentReport", "loanId")}
-                      className="flex items-center"
-                    >
-                      Loan ID{renderSortIcon("postedDisbursementRepaymentReport", "loanId")}
-                    </button>
-                  </TableHead>
-                  <TableHead>Customer</TableHead>
-                  <TableHead>Account Number</TableHead>
-                  <TableHead>Product</TableHead>
-                  <TableHead className="text-right">
-                    <button
-                      onClick={() => toggleSort("postedDisbursementRepaymentReport", "principalDisbursed")}
-                      className="flex items-center ml-auto"
-                    >
-                      Principal Paid{renderSortIcon("postedDisbursementRepaymentReport", "principalDisbursed")}
-                    </button>
-                  </TableHead>
-                  <TableHead className="text-right">Interest Paid</TableHead>
-                  <TableHead className="text-right">Service Fee Paid</TableHead>
-                  <TableHead className="text-right">Penalty Paid</TableHead>
-                  <TableHead className="text-right">Unapplied / Overpaid</TableHead>
-                  <TableHead className="text-right">Total Paid</TableHead>
-                  <TableHead>Loan Status</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {isLoading ? (
-                  <TableRow>
-                    <TableCell colSpan={12} className="h-24 text-center">
-                      <Loader2 className="h-6 w-6 animate-spin mx-auto" />
-                    </TableCell>
-                  </TableRow>
-                ) : postedDisbursementRepaymentTable.items.length > 0 ? (
-                  postedDisbursementRepaymentTable.items.map((row: any) => (
-                    <TableRow key={row.reference || row.loanId}>
-                      <TableCell>{row.provider}</TableCell>
-                      <TableCell>
-                        {row.transactionDate
-                          ? format(
-                              new Date(row.transactionDate),
-                              "yyyy-MM-dd"
-                            )
-                          : ""}
-                      </TableCell>
-                      <TableCell>{row.loanId?.slice(-8)}</TableCell>
-                      <TableCell>
-                        {row.customerName ||
-                          row.borrowerName ||
-                          row.borrowerAccount ||
-                          row.borrowerId ||
-                          ""}
-                      </TableCell>
-                      <TableCell className="font-mono">
-                        {row.borrowerAccount || row.creditAccount}
-                      </TableCell>
-                      <TableCell>{row.productType}</TableCell>
-                      <TableCell className="text-right font-mono">
-                        {formatCurrency(row.principalPaid)}
-                      </TableCell>
-                      <TableCell className="text-right font-mono">
-                        {formatCurrency(row.interestPaid)}
-                      </TableCell>
-                      <TableCell className="text-right font-mono">
-                        {formatCurrency(row.serviceFeePaid)}
-                      </TableCell>
-                      <TableCell className="text-right font-mono">
-                        {formatCurrency(row.penaltyPaid)}
-                      </TableCell>
-                      <TableCell className="text-right font-mono">
-                        {formatCurrency(row.unappliedPaid ?? 0)}
-                      </TableCell>
-                      <TableCell className="text-right font-mono font-bold">
-                        {formatCurrency(row.totalPaid)}
-                      </TableCell>
-                      <TableCell>
-                        <Badge
-                          variant={
-                            row.status === "Overdue" ||
-                            row.status === "Defaulted"
-                              ? "destructive"
-                              : row.status === "Paid"
-                              ? "default"
-                              : "secondary"
-                          }
-                        >
-                          {row.status}
-                        </Badge>
-                      </TableCell>
-                    </TableRow>
-                  ))
-                ) : (
-                  <TableRow>
-                    <TableCell colSpan={12} className="h-24 text-center">
-                      No borrowers found with posted disbursements that made repayments.
-                    </TableCell>
-                  </TableRow>
-                )}
-              </TableBody>
-            </Table>
-            <PaginationControls
-              tab="postedDisbursementRepaymentReport"
-              meta={{
-                total: postedDisbursementRepaymentTable.total,
-                totalPages: postedDisbursementRepaymentTable.totalPages,
-                page: postedDisbursementRepaymentTable.page,
-                pageSize: postedDisbursementRepaymentTable.pageSize,
-              }}
-              onPageChange={(page) => fetchPostedDisbursementRepaymentData(page, postedDisbursementRepaymentTable.pageSize)}
-              onPageSizeChange={(pageSize) => fetchPostedDisbursementRepaymentData(1, pageSize)}
-            />
-          </TabsContent>
           <TabsContent value="collectionsReport">
             <Table>
               <TableHeader className="sticky top-0 bg-card z-10">
@@ -2657,12 +2225,24 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
                   <TableHead className="text-right font-bold">
                     Total Collected
                   </TableHead>
+                  <TableHead
+                    className="text-right"
+                    title="Principal still owed at the end of this date: disbursed less principal received"
+                  >
+                    Outstanding Principal
+                  </TableHead>
+                  <TableHead
+                    className="text-right"
+                    title="Loans still carrying a principal balance at the end of this date"
+                  >
+                    Outstanding Loans
+                  </TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
                 {isLoading ? (
                   <TableRow>
-                    <TableCell colSpan={9} className="h-24 text-center">
+                    <TableCell colSpan={11} className="h-24 text-center">
                       <Loader2 className="h-6 w-6 animate-spin mx-auto" />
                     </TableCell>
                   </TableRow>
@@ -2694,11 +2274,17 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
                       <TableCell className="text-right font-mono font-bold">
                         {formatCurrency(row.total)}
                       </TableCell>
+                      <TableCell className="text-right font-mono">
+                        {formatCurrency(row.outstandingPrincipal ?? 0)}
+                      </TableCell>
+                      <TableCell className="text-right font-mono">
+                        {(row.outstandingLoans ?? 0).toLocaleString()}
+                      </TableCell>
                     </TableRow>
                   ))
                 ) : (
                   <TableRow>
-                    <TableCell colSpan={9} className="h-24 text-center">
+                    <TableCell colSpan={11} className="h-24 text-center">
                       No results found.
                     </TableCell>
                   </TableRow>

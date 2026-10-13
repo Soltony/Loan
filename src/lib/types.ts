@@ -482,7 +482,12 @@ export type CollectionsReportData = {
   serviceFee: number;
   penalty: number;
   tax: number;
+  unapplied: number;
   total: number;
+  /** Principal borrowers still owed at the end of this date (disbursed - principal received). */
+  outstandingPrincipal: number;
+  /** Loans still carrying a principal balance at the end of this date. */
+  outstandingLoans: number;
 };
 
 export type IncomeReportData = {

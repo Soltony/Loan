@@ -182,7 +182,10 @@ async function loadLoanBases(
             batches(loanIds).map((batch) => prisma.loan.findMany({ where: { id: { in: batch } }, select: loanSelect })),
           )
         ).flat();
-  for (const l of loans) if (l.repaymentStatus === 'Unpaid') unpaidIds.push(l.id);
+  // Only a loan with repayments to restate ever reads its basis, and loading one
+  // pulls in that loan's installments — so a loan that has never been repaid is
+  // left out here. Most of an open book is in that state.
+  for (const l of loans) if (l.repaymentStatus === 'Unpaid' && rowsByLoan.has(l.id)) unpaidIds.push(l.id);
 
   // Same inputs and tax set as the loans report, so "open" means the same thing.
   const [taxConfigs, products] = await Promise.all([

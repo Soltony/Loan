@@ -6,21 +6,62 @@ import { startOfDay, endOfDay, startOfWeek, endOfWeek, startOfMonth, endOfMonth,
 import { getUserFromSession } from '@/lib/user';
 import { resolveBranchBorrowerIdsForUser, parseBranchCodeQueryParam } from '@/lib/branch-filter';
 import { reconcileRepaymentsForLoans } from '@/lib/repayment-reconciliation-data';
+import { buildOutstandingSeries, outstandingAt } from '@/lib/collections-outstanding';
 
 // SQL Server caps a statement at ~2100 parameters.
-const LOAN_ID_BATCH = 1000;
+const BORROWER_ID_BATCH = 1000;
 
-/** Provider name of each loan. */
-async function loanProviderNames(loanIds: string[]): Promise<Map<string, string>> {
-    const names = new Map<string, string>();
-    for (let i = 0; i < loanIds.length; i += LOAN_ID_BATCH) {
-        const loans = await prisma.loan.findMany({
-            where: { id: { in: loanIds.slice(i, i + LOAN_ID_BATCH) } },
-            select: { id: true, product: { select: { provider: { select: { name: true } } } } },
-        });
-        for (const l of loans) names.set(l.id, l.product.provider.name);
+interface ScopedLoan {
+    id: string;
+    provider: string;
+    loanAmount: number;
+    disbursedDate: Date;
+}
+
+/**
+ * Every live loan the report covers, with its provider's name: the loans whose
+ * repayments make up the collections, and the loans whose principal makes up the
+ * outstanding balance behind them.
+ *
+ * Borrower id lists are chunked — a branch's borrower set can run past the ~2100
+ * parameters SQL Server allows in one statement.
+ */
+async function loadScopedLoans(
+    loanWhere: Record<string, any>,
+    borrowerIds: string[] | null,
+): Promise<ScopedLoan[]> {
+    const select = {
+        id: true,
+        loanAmount: true,
+        disbursedDate: true,
+        product: { select: { provider: { select: { name: true } } } },
+    } as const;
+
+    const chunks: (string[] | null)[] = [];
+    if (borrowerIds) {
+        for (let i = 0; i < borrowerIds.length; i += BORROWER_ID_BATCH) {
+            chunks.push(borrowerIds.slice(i, i + BORROWER_ID_BATCH));
+        }
+    } else {
+        chunks.push(null);
     }
-    return names;
+
+    const scoped: ScopedLoan[] = [];
+    for (const chunk of chunks) {
+        const loans = await prisma.loan.findMany({
+            where: { ...loanWhere, ...(chunk ? { borrowerId: { in: chunk } } : {}) },
+            select,
+        });
+        for (const loan of loans) {
+            scoped.push({
+                id: loan.id,
+                provider: loan.product.provider.name,
+                loanAmount: loan.loanAmount,
+                disbursedDate: loan.disbursedDate,
+            });
+        }
+    }
+    return scoped;
 }
 
 const getDates = (timeframe: string, from?: string, to?: string) => {
@@ -92,21 +133,17 @@ export async function GET(req: NextRequest) {
     );
 
     // Collections are the repayments (Payment rows) on live loans, split the way
-    // the dashboard and the Repayments tab split them (reconcileLoanRepayments).
+    // the dashboard and the Repayments tab split them (reconcileLoanRepayments),
+    // against the principal those same loans still owe at the end of the day.
     // Reversed loans are out: a reversal deletes their Payment rows anyway.
     // Payment.date is the repayment's journal date.
-    const whereClause: any = {
-        loan: { repaymentStatus: { not: 'REVERSED' } },
-        ...(dateRange.gte || dateRange.lte
-            ? {
-                date: {
-                    ...(dateRange.gte && { gte: dateRange.gte }),
-                    ...(dateRange.lte && { lte: dateRange.lte }),
-                },
-            }
-            : {}),
+    const loanWhere: Record<string, any> = {
+        repaymentStatus: { not: 'REVERSED' },
+        // A loan disbursed after the window collects nothing inside it and sits in
+        // none of its end-of-day balances, so it is no part of this report.
+        ...(dateRange.lte ? { disbursedDate: { lte: dateRange.lte } } : {}),
     };
-    
+
     const isSuperAdminOrRecon = user.role === 'Super Admin' || user.role === 'Reconciliation';
 
     // Users with loanProviderId are restricted to their own provider
@@ -116,9 +153,9 @@ export async function GET(req: NextRequest) {
     }
 
     if (providerId && providerId !== 'all' && providerId !== 'none') {
-        whereClause.loan.product = { providerId };
+        loanWhere.product = { providerId };
     }
-    
+
     if (providerId === 'none') {
         return NextResponse.json({ data: [], total: 0, page: 1, pageSize, totalPages: 0 });
     }
@@ -129,23 +166,18 @@ export async function GET(req: NextRequest) {
     if (branchBorrowerIds !== null && branchBorrowerIds.length === 0) {
         return NextResponse.json({ data: [], total: 0, page: 1, pageSize, totalPages: 0 });
     }
-    if (branchBorrowerIds) {
-        whereClause.loan.borrowerId = { in: branchBorrowerIds };
-    }
 
     try {
-        const payments = await prisma.payment.findMany({
-            where: whereClause,
-            select: { journalEntryId: true, loanId: true, date: true },
-        });
-        const loanIds = Array.from(new Set(payments.map((p) => p.loanId)));
-        const [reconciled, loanProviders] = await Promise.all([
-            reconcileRepaymentsForLoans(prisma, loanIds),
-            loanProviderNames(loanIds),
-        ]);
+        const loans = await loadScopedLoans(loanWhere, branchBorrowerIds);
+        const reconciled = await reconcileRepaymentsForLoans(prisma, loans.map((l) => l.id));
+        const outstandingSeries = buildOutstandingSeries(loans, reconciled);
+
+        const inRange = (date: Date) =>
+            (!dateRange.gte || date >= dateRange.gte) && (!dateRange.lte || date <= dateRange.lte);
 
         const aggregatedData: Record<string, {
             provider: string;
+            date: string;
             principal: number;
             interest: number;
             serviceFee: number;
@@ -154,41 +186,47 @@ export async function GET(req: NextRequest) {
             unapplied: number;
         }> = {};
 
-        for (const payment of payments) {
-            const split = payment.journalEntryId ? reconciled.byEntry.get(payment.journalEntryId) : undefined;
-            if (!split) continue;
-            const dateStr = format(new Date(payment.date), 'yyyy-MM-dd');
-            const providerName = loanProviders.get(payment.loanId) ?? '';
-            const key = `${providerName}-${dateStr}`;
+        for (const loan of loans) {
+            for (const entry of reconciled.entriesByLoan.get(loan.id) ?? []) {
+                const split = reconciled.byEntry.get(entry.id);
+                const date = new Date(entry.date);
+                if (!split || !inRange(date)) continue;
+                const dateStr = format(date, 'yyyy-MM-dd');
+                // NUL separates the parts so a provider name holding a hyphen (or a
+                // digit) cannot be split back apart in the wrong place.
+                const key = `${loan.provider}\u0000${dateStr}`;
 
-            if (!aggregatedData[key]) {
-                aggregatedData[key] = {
-                    provider: providerName,
-                    principal: 0,
-                    interest: 0,
-                    serviceFee: 0,
-                    penalty: 0,
-                    tax: 0,
-                    unapplied: 0,
-                };
+                if (!aggregatedData[key]) {
+                    aggregatedData[key] = {
+                        provider: loan.provider,
+                        date: dateStr,
+                        principal: 0,
+                        interest: 0,
+                        serviceFee: 0,
+                        penalty: 0,
+                        tax: 0,
+                        unapplied: 0,
+                    };
+                }
+                const row = aggregatedData[key];
+                row.principal += split.principal;
+                row.interest += split.interest;
+                row.serviceFee += split.serviceFee;
+                row.penalty += split.penalty;
+                row.tax += split.tax;
+                row.unapplied += split.unapplied;
             }
-            const row = aggregatedData[key];
-            row.principal += split.principal;
-            row.interest += split.interest;
-            row.serviceFee += split.serviceFee;
-            row.penalty += split.penalty;
-            row.tax += split.tax;
-            row.unapplied += split.unapplied;
         }
 
-        let reportData = Object.entries(aggregatedData).map(([key, value]) => {
-             const [provider, date] = key.split(/-(?=\d{4})/); // Split on hyphen only if followed by 4 digits (a year)
-             return {
-                provider,
-                date,
+        let reportData = Object.values(aggregatedData).map((value) => {
+            // The balance still outstanding once that day's collections are in.
+            const point = outstandingAt(outstandingSeries, value.provider, value.date);
+            return {
                 ...value,
                 total: value.principal + value.interest + value.serviceFee + value.penalty + value.tax + value.unapplied,
-            }
+                outstandingPrincipal: point.outstanding,
+                outstandingLoans: point.loans,
+            };
         });
 
         if (q) {
@@ -199,7 +237,7 @@ export async function GET(req: NextRequest) {
                 );
             });
         }
-        
+
         reportData.sort((a,b) => {
             const diff = new Date(b.date).getTime() - new Date(a.date).getTime();
             if (diff !== 0) return diff;
