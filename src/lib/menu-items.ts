@@ -19,9 +19,22 @@ import {
   HeartHandshake,
   HandCoins,
   ClipboardCheck,
+  type LucideIcon,
 } from 'lucide-react';
 
-export const allMenuItems = [
+export type MenuItem = {
+  path: string;
+  label: string;
+  icon: LucideIcon;
+  roles: string[];
+  /**
+   * Role permission key for this page. Defaults to the kebab-cased label; set it
+   * when a page is renamed so roles saved under the old key keep their access.
+   */
+  permissionKey?: string;
+};
+
+export const allMenuItems: MenuItem[] = [
   {
     path: '/admin',
     label: 'Dashboard',
@@ -113,9 +126,17 @@ export const allMenuItems = [
     roles: ['Super Admin', 'Loan Manager'],
   },
   {
-    path: '/admin/tax-transfers',
-    label: 'Tax Transfers',
+    path: '/admin/collection-transfers',
+    label: 'Collection Transfers',
+    // Formerly "Tax Transfers"; roles store their access under the old key.
+    permissionKey: 'tax-transfers',
     icon: Send,
+    roles: ['Super Admin', 'Loan Manager'],
+  },
+  {
+    path: '/admin/collection-transfer-approvals',
+    label: 'Transfer Approvals',
+    icon: ClipboardCheck,
     roles: ['Super Admin', 'Loan Manager'],
   },
   {
@@ -155,3 +176,14 @@ export const allMenuItems = [
     roles: ['Super Admin', 'Loan Manager'],
   },
 ];
+
+/** Permission key that roles store this menu item's access under. */
+export function menuPermissionKey(item: Pick<MenuItem, 'label' | 'permissionKey'>) {
+  return item.permissionKey ?? item.label.toLowerCase().replace(/\s+/g, '-');
+}
+
+/** Display name for a permission module key: the menu label when one maps to it. */
+export function permissionModuleLabel(moduleKey: string) {
+  const item = allMenuItems.find((i) => menuPermissionKey(i) === moduleKey);
+  return item?.label ?? moduleKey.replace(/-/g, ' ');
+}

@@ -16,11 +16,11 @@ import {
 } from "@/components/ui/table";
 import type { Role, Permissions } from "@/lib/types";
 import { produce } from "immer";
-import { allMenuItems } from "@/lib/menu-items";
+import { allMenuItems, menuPermissionKey, permissionModuleLabel } from "@/lib/menu-items";
 
 const PERMISSION_MODULES: (keyof Permissions)[] = allMenuItems
   .map(
-    (item) => item.label.toLowerCase().replace(/\s+/g, "-") as keyof Permissions
+    (item) => menuPermissionKey(item) as keyof Permissions
   )
   .concat(["providers", "products"]);
 const PERMISSION_ACTIONS: (keyof Permissions[keyof Permissions])[] = [
@@ -147,7 +147,7 @@ export function RoleForm({
               {PERMISSION_MODULES.map((module) => (
                 <TableRow key={module}>
                   <TableCell className="font-medium capitalize">
-                    {String(module).replace("-", " ")}
+                    {permissionModuleLabel(String(module))}
                   </TableCell>
                   {PERMISSION_ACTIONS.map((action) => (
                     <TableCell key={action} className="text-center">

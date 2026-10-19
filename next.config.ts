@@ -13,6 +13,13 @@ const nextConfig: NextConfig = {
     ],
   },
 
+  async redirects() {
+    return [
+      // Tax Transfers was generalised to all repayment components.
+      { source: '/admin/tax-transfers', destination: '/admin/collection-transfers', permanent: false },
+    ];
+  },
+
   async headers() {
     return [
       {

@@ -3,7 +3,7 @@ import { DashboardClient } from '@/components/admin/dashboard-client';
 import { getUserFromSession } from '@/lib/user';
 import { getDashboardData, parseDashboardPeriod, parseDashboardDay } from './dashboard/page';
 import { redirect } from 'next/navigation';
-import { allMenuItems } from '@/lib/menu-items';
+import { allMenuItems, menuPermissionKey } from '@/lib/menu-items';
 import { parseBranchCodeQueryParam } from '@/lib/branch-filter';
 
 export const dynamic = 'force-dynamic';
@@ -24,7 +24,7 @@ export default async function AdminRootPage({
     // If user does not have dashboard access, redirect to the first page they DO have access to.
     if (!hasDashboardAccess) {
         const firstAllowedPage = allMenuItems.find(item => {
-            const moduleName = item.label.toLowerCase().replace(/\s+/g, '-');
+            const moduleName = menuPermissionKey(item);
             // Ensure permissions object and module entry exist before checking .read
             return user.permissions && user.permissions[moduleName]?.read;
         });

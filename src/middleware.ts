@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { decryptJwt } from '@/lib/session';
-import { allMenuItems } from './lib/menu-items';
+import { allMenuItems, menuPermissionKey } from './lib/menu-items';
 import type { Permissions } from '@/lib/types';
 
 function findLongestMatchingMenuItem(path: string) {
@@ -268,7 +268,7 @@ export default async function middleware(req: NextRequest) {
     const PERMISSION_MAP: Record<string, string> = {};
     const ORDERED_ADMIN_PAGES: string[] = [];
     for (const item of allMenuItems) {
-      const moduleKey = item.label.toLowerCase().replace(/\s+/g, '-');
+      const moduleKey = menuPermissionKey(item);
       PERMISSION_MAP[item.path] = moduleKey;
       ORDERED_ADMIN_PAGES.push(item.path);
     }
@@ -353,7 +353,7 @@ export default async function middleware(req: NextRequest) {
 
     // menu permission read check
     if (currentRouteConfig) {
-      const moduleName = currentRouteConfig.label.toLowerCase().replace(/\s+/g, '-');
+      const moduleName = menuPermissionKey(currentRouteConfig);
       const hasPermission = !!permissions[moduleName]?.read;
 
       if (!hasPermission) {

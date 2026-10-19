@@ -17,7 +17,7 @@ import { useToast } from '@/hooks/use-toast';
 import { useAuth } from '@/hooks/use-auth';
 import { Loader2 } from 'lucide-react';
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, AlertDialogTrigger } from '@/components/ui/alert-dialog';
-import { allMenuItems } from '@/lib/menu-items';
+import { allMenuItems, menuPermissionKey, permissionModuleLabel } from '@/lib/menu-items';
 import {
   Pagination,
   PaginationContent,
@@ -29,7 +29,7 @@ import {
 } from '@/components/ui/pagination';
 
 
-const PERMISSION_MODULES = allMenuItems.map(item => item.label.toLowerCase().replace(/\s+/g, '-')).concat(['products']);
+const PERMISSION_MODULES = allMenuItems.map(item => menuPermissionKey(item)).concat(['products']);
 const ITEMS_PER_PAGE = 10;
 
 
@@ -525,7 +525,7 @@ function RolesTab() {
                             <TableRow>
                                 <TableHead className="w-[150px]">Role Name</TableHead>
                                 {PERMISSION_MODULES.map(module => (
-                                    <TableHead key={module} className="text-center capitalize">{module.replace(/-/g, ' ')}</TableHead>
+                                    <TableHead key={module} className="text-center capitalize">{permissionModuleLabel(module)}</TableHead>
                                 ))}
                                 <TableHead className="text-right">Actions</TableHead>
                             </TableRow>

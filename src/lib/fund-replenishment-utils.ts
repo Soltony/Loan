@@ -1,4 +1,4 @@
-export { formatCurrency } from "@/lib/tax-transfer-utils";
+export { formatCurrency } from "@/lib/collection-transfer-utils";
 
 export type FundReplenishmentRecord = {
   id: string;

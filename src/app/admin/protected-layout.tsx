@@ -40,7 +40,7 @@ import { Logo } from '@/components/icons';
 import { useAuth } from '@/hooks/use-auth';
 import type { LoanProvider } from '@/lib/types';
 import { cn } from '@/lib/utils';
-import { allMenuItems } from '@/lib/menu-items';
+import { allMenuItems, menuPermissionKey } from '@/lib/menu-items';
 
 
 // Function to convert hex to HSL
@@ -119,7 +119,7 @@ export function ProtectedLayout({ children, providers }: ProtectedLayoutProps) {
     if (!currentUser || !currentUser.permissions) return [];
     
     return allMenuItems.filter((item) => {
-        const moduleName = item.label.toLowerCase().replace(/\s+/g, '-');
+        const moduleName = menuPermissionKey(item);
         // Fallback for roles that might not have all permission keys yet
         return currentUser.permissions[moduleName]?.read;
     });
@@ -134,7 +134,7 @@ export function ProtectedLayout({ children, providers }: ProtectedLayoutProps) {
     if (!currentUser || !currentUser.permissions) return false;
     const current = currentMenuItem;
     if (!current) return true; // allow non-admin menu routes (handled elsewhere)
-    const moduleName = current.label.toLowerCase().replace(/\s+/g, '-');
+    const moduleName = menuPermissionKey(current);
     return !!currentUser.permissions[moduleName]?.read;
   }, [currentUser, currentMenuItem]);
 

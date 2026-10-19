@@ -1,4 +1,4 @@
-import { allMenuItems } from './menu-items';
+import { allMenuItems, menuPermissionKey } from './menu-items';
 import type { Permissions } from './types';
 
 export const PermissionSets = ['read', 'create', 'update', 'delete', 'approve'] as const;
@@ -9,7 +9,7 @@ function pascalOrCamelToKebab(name: string) {
   return name.replace(/([a-z0-9])([A-Z])/g, '$1-$2').toLowerCase();
 }
 
-const MODULE_KEYS = allMenuItems.map((i) => i.label.toLowerCase().replace(/\s+/g, '-'));
+const MODULE_KEYS = allMenuItems.map((i) => menuPermissionKey(i));
 
 // Explicit map from entity types to the module permission keys exposed in the UI.
 const ENTITY_TO_MODULE: Record<string, string[]> = {
@@ -34,6 +34,8 @@ const ENTITY_TO_MODULE: Record<string, string[]> = {
   smscampaign: ['sms-management'],
   smslog: ['sms-management'],
   fundreplenishment: ['revolving-fund'],
+  // Collection Transfers (formerly Tax Transfers, which keeps the old key) and its checker page.
+  taxtransfersimulation: ['tax-transfers', 'transfer-approvals'],
 };
 
 export function entityTypeToPermissionKeys(entityType: string) {

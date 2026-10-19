@@ -34,6 +34,8 @@ model User {
   updatedDisbursementControls DisbursementControl[] @relation("DisbursementControlUpdatedBy")
   recordedTaxTransfers        TaxTransferSimulation[] @relation("TaxTransferRecordedBy")
   reversedTaxTransfers        TaxTransferSimulation[] @relation("TaxTransferReversedBy")
+  checkedTaxTransfers         TaxTransferSimulation[] @relation("TaxTransferCheckedBy")
+  reversalRequestedTaxTransfers TaxTransferSimulation[] @relation("TaxTransferReversalRequestedBy")
   recordedFundReplenishments  FundReplenishment[]     @relation("FundReplenishmentRecordedBy")
   manualRepaymentsEntered     ManualRepayment[]       @relation("ManualRepaymentMaker")
   manualRepaymentsChecked     ManualRepayment[]       @relation("ManualRepaymentChecker")
@@ -494,21 +496,40 @@ model Tax {
   status      String  @default("ACTIVE") // ACTIVE, PENDING_APPROVAL
 }
 
-// Tax transfer simulation tracking
+// Collection transfer register (admin "Collection Transfers" page): records CBS
+// transfers of a collected repayment component out of the collection GL. The
+// model keeps its original Tax-only name so the existing table and rows carry over.
+// Maker-checker: a maker submits (PENDING_APPROVAL), a different user approves
+// (APPROVED) or rejects (REJECTED); reversals go PENDING_REVERSAL -> REVERSED.
+// Only approved Tax transfers post a journal entry (Tax Receivable -> "Tax
+// Destination:"); the other components are register-only, because their
+// collections are already recognised in <Component> Received/Income at repayment.
 model TaxTransferSimulation {
   id                           String        @id @default(cuid())
   providerId                   String
   provider                     LoanProvider  @relation("TaxTransfers", fields: [providerId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  component                    String        @default("Tax") // Interest, ServiceFee, Penalty, Tax
   transferAmount               Float
+  sourceAccountName            String? // GL/account the amount left (null on rows recorded before this field existed)
   destinationAccountName       String // Real account name/reference
-  transferReference            String        @unique // Prevent duplicate posting with same reference
+  transferReference            String // As entered (FT number)
+  // Normalized reference while the row is live (pending/approved/reversal pending);
+  // re-keyed with "|<id>" once rejected or reversed so the reference can be re-submitted.
+  referenceKey                 String        @unique
   transferDate                 DateTime
-  journalEntryId               String?       @unique
+  journalEntryId               String?       @unique // filtered (non-NULL) unique index in the DB
   journalEntry                 JournalEntry? @relation(fields: [journalEntryId], references: [id], onDelete: SetNull, onUpdate: NoAction)
-  recordedByUserId             String
+  recordedByUserId             String // maker
   recordedByUser               User          @relation("TaxTransferRecordedBy", fields: [recordedByUserId], references: [id], onDelete: NoAction, onUpdate: NoAction)
-  status                       String        @default("SIMULATED") // SIMULATED, REVERSED
-  reversedByUserId             String?
+  status                       String        @default("PENDING_APPROVAL") // PENDING_APPROVAL, APPROVED, REJECTED, PENDING_REVERSAL, REVERSED; SIMULATED = legacy, treated as APPROVED
+  checkedByUserId              String? // checker who approved or rejected
+  checkedByUser                User?         @relation("TaxTransferCheckedBy", fields: [checkedByUserId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  checkedAt                    DateTime?
+  rejectionReason              String?       @db.Text
+  reversalRequestedByUserId    String?
+  reversalRequestedByUser      User?         @relation("TaxTransferReversalRequestedBy", fields: [reversalRequestedByUserId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  reversalRequestedAt          DateTime?
+  reversedByUserId             String? // checker who approved the reversal
   reversedByUser               User?         @relation("TaxTransferReversedBy", fields: [reversedByUserId], references: [id], onDelete: NoAction, onUpdate: NoAction)
   reversalReason               String?       @db.Text
   reversedAt                   DateTime?
@@ -519,6 +540,7 @@ model TaxTransferSimulation {
   @@index([providerId])
   @@index([transferDate])
   @@index([status])
+  @@index([component])
 }
 
 // Manual replenishment of provider disbursement fund from collected repayments
