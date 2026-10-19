@@ -134,11 +134,11 @@ async function hasSuperAppToken(req: NextRequest) {
   return false;
 }
 
-export default async function middleware(req: NextRequest) {
+export default async function proxy(req: NextRequest) {
   const path = req.nextUrl.pathname;
 
-  // Generate nonce
-  const nonce = btoa(self.crypto.randomUUID());
+  // Generate nonce (global crypto: proxy runs on Node.js, where `self` is undefined)
+  const nonce = btoa(crypto.randomUUID());
 
   // Build CSP
   const cspHeader = `
@@ -203,7 +203,7 @@ export default async function middleware(req: NextRequest) {
         }
       });
     } catch (e) {
-      console.error('Failed to fetch session in middleware:', e);
+      console.error('Failed to fetch session in proxy:', e);
 
       if (path.startsWith('/api/')) {
         return withSecurityHeaders(
