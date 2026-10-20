@@ -140,10 +140,11 @@ export default async function proxy(req: NextRequest) {
   // Generate nonce (global crypto: proxy runs on Node.js, where `self` is undefined)
   const nonce = btoa(crypto.randomUUID());
 
-  // Build CSP
+  // Build CSP. React's dev build needs eval() for its debugging features; production never does.
+  const devEval = process.env.NODE_ENV === 'development' ? " 'unsafe-eval'" : '';
   const cspHeader = `
     default-src 'self';
-    script-src 'self' 'nonce-${nonce}';
+    script-src 'self' 'nonce-${nonce}'${devEval};
     style-src 'self' 'unsafe-inline' https://fonts.googleapis.com;
     font-src 'self' https://fonts.gstatic.com;
     img-src 'self' data: blob: https://placehold.co https://play-lh.googleusercontent.com;
