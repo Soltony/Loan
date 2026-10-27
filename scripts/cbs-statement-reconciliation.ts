@@ -242,7 +242,7 @@ async function run() {
   const args = process.argv.slice(2);
   const confirmedAt = args.indexOf('--confirmed');
   const confirmedFile = confirmedAt >= 0 ? args[confirmedAt + 1] : undefined;
-  const file = args.find((a, i) => !a.startsWith('--') && i !== confirmedAt + 1);
+  const file = args.find((a, i) => !a.startsWith('--') && !(confirmedAt >= 0 && i === confirmedAt + 1));
   if (!file || !fs.existsSync(file) || (confirmedAt >= 0 && (!confirmedFile || !fs.existsSync(confirmedFile)))) {
     console.error('Usage: npx tsx -r tsconfig-paths/register scripts/cbs-statement-reconciliation.ts "<statement.xlsx>" [--confirmed <file.json>]');
     process.exit(1);

@@ -437,10 +437,16 @@ export async function GET(request: NextRequest) {
         : [];
     // Build map preferring the first (best) account per borrower
     const phoneAccountMap = new Map<string, (typeof phoneAccounts)[0]>();
+    // Every account a borrower has held: a loan may have been paid out to an
+    // account that is no longer their active one.
+    const accountsByBorrower = new Map<string, string[]>();
     for (const p of phoneAccounts) {
       if (!phoneAccountMap.has(p.phoneNumber)) {
         phoneAccountMap.set(p.phoneNumber, p);
       }
+      const accounts = accountsByBorrower.get(p.phoneNumber) ?? [];
+      accounts.push(p.accountNumber);
+      accountsByBorrower.set(p.phoneNumber, accounts);
     }
 
     const providerIds = Array.from(
@@ -815,15 +821,27 @@ export async function GET(request: NextRequest) {
             foundMatch = disbByLoanId.get(loan.id);
           }
 
-          // 2️⃣ FALLBACK: Match by Account + Amount + Timestamp if no direct loanId match
+          // 2️⃣ FALLBACK: Match by Account + Amount + Timestamp if no direct loanId match.
+          // Look on every account the borrower has held, not only today's active one:
+          // once a borrower switches accounts, a loan paid to the old one would lose
+          // its match and show as POSTED against the new account.
           if (!foundMatch) {
-            const normalizedBorrowerAcc = String(borrowerAccount || "")
-              .replace(/\D/g, "")
-              .replace(/^0+/, "");
-            const candidates =
-              disbMap.get(String(normalizedBorrowerAcc)) ||
-              disbMap.get(String(borrowerAccount)) ||
-              [];
+            const accountKeys = new Set<string>();
+            for (const acc of [borrowerAccount, ...(accountsByBorrower.get(loan.borrowerId) ?? [])]) {
+              const raw = String(acc || "").trim();
+              if (!raw) continue;
+              accountKeys.add(raw);
+              accountKeys.add(raw.replace(/\D/g, "").replace(/^0+/, ""));
+            }
+            const candidateById = new Map<string, any>();
+            for (const key of accountKeys) {
+              for (const c of disbMap.get(key) ?? []) {
+                // A transaction linked to another loan paid that loan, not this one.
+                if (c.loanId && c.loanId !== loan.id) continue;
+                candidateById.set(c.id, c);
+              }
+            }
+            const candidates = Array.from(candidateById.values());
 
             if (candidates.length > 0) {
               // Filter by exact amount

@@ -8,6 +8,14 @@
  *   TIGIST ERKO LATA     7000107677424  FT26198YH98D 800.76
  *   DEBORA MEKONNEN      7000103189182  FT26111VKG2J 6,000.00 (resolved onto a loan already repaid)
  *   MIKIYAS ASFAW ABEBE  7000027829843  FT26171Z5HDB 132.00  (paid after the loan was settled)
+ *   ALEMU AYELE LIBE     7000033349877  FT261732S3X3 10,007.90 (refunded 10 Jul, FT26191M9HRZ)
+ *   HAWA GEBEYEHU ABDIE  7000037218656  FT26141J7RCR 10,031.00 (refunded 3 Jun, FT26154NQLDB)
+ *
+ * ALEMU and HAWA each paid their loan twice, and ops resolved the pending payment
+ * after the SuperApp repayment had cleared the loan, so the resolution posted nothing
+ * to the ledger. ALEMU's 10,008.00 of 23 Jun is what the loan owed that day. HAWA's
+ * loan owed 10,031.00 on 21 May (9.00 interest, 22.00 penalty); the 10,022.00 that
+ * stays is reported with 9.00 of penalty waived.
  *
  * Each refunded transaction is removed whole: its payment, its journal entry and the
  * ledger balances it moved, as if the CBS had reversed it. The CBS notification that
@@ -91,6 +99,22 @@ const CASES: Case[] = [
     refunded: ['FT26171Z5HDB'],
     refundTotal: 132,
   },
+  {
+    customer: 'ALEMU AYELE LIBE',
+    account: '7000033349877',
+    loanId: 'cmnk0tksx0fhaz7egmynizbqu',
+    refunded: ['FT261732S3X3'],
+    refundTotal: 10007.9,
+    pendingPaymentId: 'cmqpfyj2k00gm85tg308e310s',
+  },
+  {
+    customer: 'HAWA GEBEYEHU ABDIE',
+    account: '7000037218656',
+    loanId: 'cmkzes8si0ingnp50w788di0l',
+    refunded: ['FT26141J7RCR'],
+    refundTotal: 10031,
+    pendingPaymentId: 'cmpfpwkir0gvpnvx6to2zakc9',
+  },
 ];
 
 /** Left by the earlier version of this script, which reduced or deleted the overpaid repayment. */
@@ -131,8 +155,8 @@ async function run() {
       select: { txnRef: true, transactionId: true },
     }),
     prisma.pendingPayment.findMany({ where: { loanId: { in: CASES.map((c) => c.loanId) } }, select: { id: true, transactionId: true, status: true } }),
-    // A handful of rows: the earlier version wrote one per refunded repayment.
-    prisma.auditLog.findMany({ where: { action: EARLIER }, select: { action: true, entityId: true, details: true } }),
+    // A handful of rows: the earlier version wrote one per refunded repayment, this one one per loan.
+    prisma.auditLog.findMany({ where: { action: { in: [EARLIER, ACTION] } }, select: { action: true, entityId: true, details: true } }),
     prisma.loan.findMany({ where: { id: { in: CASES.map((c) => c.loanId) } }, select: { id: true, repaymentStatus: true } }),
   ]);
   const ftByTxnRef = new Map(gateway.filter((g) => g.txnRef).map((g) => [g.txnRef!, g.transactionId]));
@@ -146,7 +170,13 @@ async function run() {
     if (loan?.repaymentStatus !== 'Paid') problems.push(`${c.customer}: loan is ${loan?.repaymentStatus ?? 'missing'}, expected Paid`);
     const remove = payments.filter((p) => p.loanId === c.loanId && c.refunded.includes(ftOf(p)));
     const earlierOnLoan = audits.some((a) => a.action === EARLIER && JSON.parse(a.details ?? '{}').loanId === c.loanId);
-    const missing = c.refunded.filter((ft) => !remove.some((p) => ftOf(p) === ft));
+    // A case added later can run after the others were applied: what an earlier run removed is done.
+    const removedBefore = new Set<string>(
+      audits
+        .filter((a) => a.action === ACTION && a.entityId === c.loanId)
+        .flatMap((a) => (JSON.parse(a.details ?? '{}').removed ?? []).map((r: { reference: string }) => r.reference)),
+    );
+    const missing = c.refunded.filter((ft) => !remove.some((p) => ftOf(p) === ft) && !removedBefore.has(ft));
     // The earlier version deleted DEBORA's and MIKIYAS's refunded repayment outright.
     if (missing.length && !(earlierOnLoan && !c.keep)) problems.push(`${c.customer}: ${missing.join(', ')} not found on the loan`);
     const removedTotal = r2(remove.reduce((s, p) => s + p.amount, 0));
