@@ -8,17 +8,22 @@ import {
   auditExternalApiResponse,
   newAuditCorrelationId,
 } from "@/lib/audit-log";
+import {
+  MiniAppAuthError,
+  requireMiniAppAuthContext,
+  assertBorrowerMatches,
+} from "@/lib/miniapp-auth";
 
+// The mini-app also sends creditAccount, providerId and amount. They are not
+// read: the account and amount are the ones recorded when the loan was booked
+// (POST /api/loans), so a request cannot redirect or resize a disbursement.
 type Body = {
-  creditAccount: string;
-  providerId: string;
-  amount: string | number;
   loanId?: string;
 };
 
-// Helper to find existing DisbursementTransaction by loanId or create new one
-async function findOrCreateDisbursementTransaction(
-  loanId: string | undefined,
+// Saves the outcome on the loan's disbursement record (claimed as SENT before sending).
+async function recordDisbursementResult(
+  disbursementTransactionId: string,
   data: {
     providerId: string;
     originalProviderId?: string;
@@ -32,38 +37,9 @@ async function findOrCreateDisbursementTransaction(
     disbursementStatus: string;
   },
 ) {
-  // If loanId is provided, try to find existing PENDING record and update it
-  if (loanId) {
-    const existing = await prisma.disbursementTransaction.findFirst({
-      where: {
-        loanId,
-        disbursementStatus: "PENDING",
-      } as any, // Type assertion until Prisma client is regenerated
-    });
-
-    if (existing) {
-      return await prisma.disbursementTransaction.update({
-        where: { id: existing.id },
-        data: {
-          transactionId: data.transactionId ?? undefined,
-          providerId: data.providerId,
-          originalProviderId: data.originalProviderId,
-          creditAccount: data.creditAccount,
-          amount: data.amount,
-          disbursementStatus: data.disbursementStatus,
-          requestPayload: data.requestPayload,
-          responsePayload: data.responsePayload,
-          rawResponse: data.rawResponse,
-          statusCode: data.statusCode,
-        } as any, // Type assertion until Prisma client is regenerated
-      });
-    }
-  }
-
-  // No existing record found, create new one
-  return await prisma.disbursementTransaction.create({
+  return await prisma.disbursementTransaction.update({
+    where: { id: disbursementTransactionId },
     data: {
-      loanId: loanId ?? undefined,
       transactionId: data.transactionId ?? undefined,
       providerId: data.providerId,
       originalProviderId: data.originalProviderId,
@@ -84,6 +60,8 @@ export async function POST(req: Request) {
     const userAgent = req.headers.get("user-agent") || "N/A";
     const actorId = "system";
 
+    const ctx = await requireMiniAppAuthContext();
+
     const enabled = await areDisbursementsEnabled();
     if (!enabled) {
       return NextResponse.json(
@@ -93,45 +71,54 @@ export async function POST(req: Request) {
     }
 
     const body: Body = await req.json();
-    const { creditAccount, providerId, amount: clientAmount, loanId } = body;
+    const loanId = typeof body?.loanId === "string" ? body.loanId : "";
     // For testing: force the provider id to PRO0001 unless overridden by env
     const forcedProviderId = process.env.FORCE_PROVIDER_ID ?? "PRO0001";
     const sendProviderId = forcedProviderId;
-    if (!creditAccount || !providerId || !clientAmount)
-      return NextResponse.json(
-        { error: "creditAccount, providerId and amount are required" },
-        { status: 400 },
-      );
+    if (!loanId)
+      return NextResponse.json({ error: "loanId is required" }, { status: 400 });
 
-    // Server-side safeguard: if a loanId is provided, use the loan's
-    // netDisbursedAmount (inclusive-tax-adjusted) from the database instead
-    // of trusting the client-supplied amount.
-    let amount: string | number = clientAmount;
-    if (loanId) {
-      try {
-        const loan = await prisma.loan.findUnique({
-          where: { id: loanId },
-          select: {
-            loanAmount: true,
-            taxDeducted: true,
-            netDisbursedAmount: true,
-          },
-        } as any);
-        if (loan) {
-          const loanData = loan as any;
-          if (loanData.netDisbursedAmount != null && loanData.taxDeducted > 0) {
-            amount = loanData.netDisbursedAmount;
-          } else {
-            amount = loanData.loanAmount;
-          }
-        }
-      } catch (e) {
-        console.error(
-          "[external][disbursement] failed to lookup loan for net amount, using client amount",
-          e,
-        );
-      }
+    const loan = await prisma.loan.findUnique({
+      where: { id: loanId },
+      select: {
+        borrowerId: true,
+        loanAmount: true,
+        taxDeducted: true,
+        netDisbursedAmount: true,
+        product: { select: { providerId: true } },
+      },
+    });
+    if (!loan)
+      return NextResponse.json({ error: "Loan not found" }, { status: 404 });
+    assertBorrowerMatches(loan.borrowerId, ctx);
+
+    const providerId = loan.product.providerId;
+    // The net amount (after inclusive tax) when tax was deducted, else the principal.
+    const amount =
+      loan.netDisbursedAmount != null && loan.taxDeducted > 0
+        ? loan.netDisbursedAmount
+        : loan.loanAmount;
+
+    // Claim the loan's PENDING record before sending, so the same loan cannot be
+    // sent twice (a repeated or concurrent call finds nothing PENDING). A record
+    // left SENT means the request went out and its outcome was not recorded.
+    const disbursement = await prisma.disbursementTransaction.findFirst({
+      where: { loanId, disbursementStatus: "PENDING" },
+      select: { id: true, creditAccount: true },
+    });
+    const claimed = disbursement
+      ? await prisma.disbursementTransaction.updateMany({
+          where: { id: disbursement.id, disbursementStatus: "PENDING" },
+          data: { disbursementStatus: "SENT" },
+        })
+      : null;
+    if (!disbursement || claimed?.count !== 1) {
+      return NextResponse.json(
+        { error: "This loan has already been sent for disbursement." },
+        { status: 409 },
+      );
     }
+    const creditAccount = disbursement.creditAccount;
 
     const apiUrl = process.env.EXTERNAL_DISBURSEMENT_URL;
     const user = process.env.EXTERNAL_API_USERNAME;
@@ -172,7 +159,7 @@ export async function POST(req: Request) {
       ).catch(() => null);
 
       try {
-        await findOrCreateDisbursementTransaction(loanId, {
+        await recordDisbursementResult(disbursement.id, {
           providerId: sendProviderId,
           originalProviderId: providerId ?? undefined,
           creditAccount: String(creditAccount),
@@ -272,7 +259,7 @@ export async function POST(req: Request) {
       ).catch(() => null);
 
       try {
-        await findOrCreateDisbursementTransaction(loanId, {
+        await recordDisbursementResult(disbursement.id, {
           providerId: sendProviderId,
           originalProviderId: providerId ?? undefined,
           creditAccount: String(creditAccount),
@@ -393,7 +380,7 @@ export async function POST(req: Request) {
           : false);
       const disbursementStatus = isSuccess ? "SUCCESS" : "FAILED";
 
-      await findOrCreateDisbursementTransaction(loanId, {
+      await recordDisbursementResult(disbursement.id, {
         transactionId: upstreamTransactionId ?? undefined,
         providerId: sendProviderId,
         originalProviderId: providerId ?? undefined,
@@ -476,6 +463,9 @@ export async function POST(req: Request) {
       { status: res.status },
     );
   } catch (err: any) {
+    if (err instanceof MiniAppAuthError) {
+      return NextResponse.json({ error: err.message }, { status: err.status });
+    }
     console.error("[external][disbursement] error", err);
     return NextResponse.json(
       { error: String(err?.message ?? err) },
