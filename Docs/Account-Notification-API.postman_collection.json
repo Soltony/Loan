@@ -1,0 +1,598 @@
+{
+  "info": {
+    "_postman_id": "b7c1f4e2-5a3d-4e77-9f10-0c2a8d61e4a1",
+    "name": "Account Notification API (Core ↔ Lending)",
+    "description": "# Account Notification API\n\nHow the **core banking system (CBS)** tells the **lending platform** that money moved on an account it was asked to watch, and how the lending platform tells the core which accounts to watch.\n\nEverything here is generic: hosts, tokens, account numbers and amounts are collection variables, so the same collection can be pointed at any environment (local, UAT, production) without editing a request.\n\n---\n\n## The flow\n\n```\n  Lending platform                          Core banking system\n        |                                           |\n        |  1. POST /bulk  (accounts to watch)       |\n        | ----------------------------------------> |\n        |                                           |\n        |                                     ( account moves:\n        |                                       credit or debit )\n        |                                           |\n        |  2. POST /api/cbs/notifications/credit    |\n        | <---------------------------------------- |\n        |                                           |\n        |  3. 200 { notificationId, status }        |\n        | ----------------------------------------> |\n        |                                           |\n        |  4. DELETE /delete/{accountNumber}        |\n        | ----------------------------------------> |\n```\n\n1. **Register** — the lending platform posts the account numbers it wants monitored.\n2. **Notify** — every time one of those accounts moves, the core posts a notification to the lending platform's listener. This is the payload this collection is really about: folder *1. Core → Lending*.\n3. **Acknowledge** — the listener always answers `200` with a `notificationId` and a `status`, unless the token is wrong (`401`) or the body is not JSON (`400`). The core does not need to interpret the `status`; a `200` means the notification was captured.\n4. **Deregister** — when an account no longer needs watching.\n\n---\n\n## Authentication\n\n| Direction | Header | Variable |\n| --- | --- | --- |\n| Core → Lending | `Authorization: Bearer <token>` **or** `x-cbs-token: <token>` | `{{inboundToken}}` |\n| Lending → Core | `Authorization: Bearer <token>` (Basic also supported) | `{{coreAuthToken}}` |\n\nThe inbound token is a single shared secret. If the listener is configured without one, the token check is skipped entirely — useful for a sandbox, never for production.\n\n---\n\n## Identifiers and idempotency\n\n| Field | Who sets it | Purpose |\n| --- | --- | --- |\n| `externalReference` | core | The core's own transaction reference. **This is the deduplication key** — re-delivering the same reference returns the original notification instead of creating a second one. It is unique across the whole listener, so it must be globally unique per transaction, not per account. |\n| `correlationId` | core (optional) | Free-form trace id carried through the logs. When absent the listener generates one. |\n| `notificationId` | lending platform | Returned in the acknowledgement. Quote this when chasing a notification. |\n\nA core that cannot guarantee a unique `externalReference` should omit it — every delivery is then stored as a distinct notification, including genuine retries.\n\n---\n\n## Retry expectations\n\nThe listener answers `200` even when it could not act on a notification (unknown account, bad amount) — the `status` field carries that outcome, and the record is kept for inspection and manual retry on the lending side. The core should therefore retry only on a transport failure, a `5xx`, or a timeout, and it should reuse the same `externalReference` when it does.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      { "key": "token", "value": "{{inboundToken}}", "type": "string" }
+    ]
+  },
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// Give every run a fresh transaction reference and timestamp, so repeated",
+          "// runs read as new transactions rather than replays of an earlier one.",
+          "// The replay request deliberately ignores these and reuses the last one.",
+          "const stamp = Date.now();",
+          "const noise = Math.floor(Math.random() * 100000).toString().padStart(5, '0');",
+          "pm.collectionVariables.set('externalReference', 'TXN' + stamp + noise);",
+          "pm.collectionVariables.set('notifiedAt', new Date().toISOString());"
+        ]
+      }
+    }
+  ],
+  "variable": [
+    { "key": "lendingBaseUrl", "value": "http://localhost:9002", "type": "string", "description": "Host of the lending platform that receives notifications." },
+    { "key": "coreBaseUrl", "value": "http://localhost:8080/api/v1/notification", "type": "string", "description": "Base path of the core banking notification API." },
+    { "key": "inboundToken", "value": "replace-with-shared-inbound-token", "type": "string", "description": "Shared secret the core presents when posting a notification." },
+    { "key": "coreAuthToken", "value": "replace-with-core-api-token", "type": "string", "description": "Token the lending platform presents to the core." },
+    { "key": "accountNumber", "value": "1000123456789", "type": "string", "description": "The monitored account." },
+    { "key": "secondAccountNumber", "value": "1000987654321", "type": "string" },
+    { "key": "providerId", "value": "PRO0001", "type": "string", "description": "Provider / channel code issued by the core." },
+    { "key": "accountCategory", "value": "SAVING", "type": "string" },
+    { "key": "currency", "value": "ETB", "type": "string" },
+    { "key": "accountMinimumBalance", "value": "25", "type": "string", "description": "Balance the account must retain." },
+    { "key": "creditAmount", "value": "1500.00", "type": "string" },
+    { "key": "balanceAfterCredit", "value": "1725.50", "type": "string" },
+    { "key": "debitAmount", "value": "400.00", "type": "string" },
+    { "key": "balanceAfterDebit", "value": "1325.50", "type": "string" },
+    { "key": "externalReference", "value": "", "type": "string", "description": "Set per run by the collection pre-request script." },
+    { "key": "notifiedAt", "value": "", "type": "string", "description": "Set per run by the collection pre-request script." },
+    { "key": "lastExternalReference", "value": "", "type": "string", "description": "Captured from the last accepted notification, so the replay request can reuse it." },
+    { "key": "lastNotificationId", "value": "", "type": "string" },
+    { "key": "adminSessionCookie", "value": "", "type": "string", "description": "Session cookie for the operator endpoint in folder 3." }
+  ],
+  "item": [
+    {
+      "name": "1. Core → Lending · Account activity notifications",
+      "description": "The core posts one request per movement on a monitored account. Same endpoint, same envelope, whether the money went in or out — the payload says which.\n\n**Endpoint:** `POST {{lendingBaseUrl}}/api/cbs/notifications/credit`\n\n### Payload\n\n| Field | Type | Required | Notes |\n| --- | --- | --- | --- |\n| `accountNumber` | string | **yes** | The monitored account the movement happened on. |\n| `amount` | number \\| numeric string | **yes** | Magnitude of the movement, always positive. The direction is carried by `transactionType`, not by the sign. |\n| `transactionType` | string | no | `CREDIT` or `DEBIT`. |\n| `currentBalance` | number | no | Account balance **after** the movement. |\n| `accountMinimumBalance` | number | no | Balance the account must retain. |\n| `accountCategory` | string | no | Account classification from the core. |\n| `externalReference` | string | no | Core's transaction reference; the deduplication key. |\n| `correlationId` | string | no | Trace id. |\n| `providerId` | string | no | Provider / channel code. |\n| `notifiedAt` | ISO-8601 string | no | When the core raised the notification. |\n\nAny additional field the core wants to send is accepted and stored with the notification verbatim, so the payload can be extended without a change on the lending side.\n\n### Acknowledgement\n\n```json\n{ \"notificationId\": \"<id>\", \"status\": \"<outcome>\", \"message\": \"<human readable>\" }\n```\n\n`status` is the listener's own processing outcome — `PENDING`, `DUPLICATE`, `UNMATCHED_ACCOUNT`, `FAILED` or a terminal status. It is diagnostic information for the lending side; for the core, a `200` means the notification was captured either way.",
+      "item": [
+        {
+          "name": "Credit — money into the account",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{lendingBaseUrl}}/api/cbs/notifications/credit",
+              "host": ["{{lendingBaseUrl}}"],
+              "path": ["api", "cbs", "notifications", "credit"]
+            },
+            "description": "A deposit, transfer in, or any other inbound movement on a monitored account.\n\n`currentBalance` is the balance **after** the credit has landed. Send it post-settlement: a pre-credit snapshot understates what is on the account and makes the notification look smaller than the movement really was.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"correlationId\": \"{{$guid}}\",\n  \"externalReference\": \"{{externalReference}}\",\n  \"accountNumber\": \"{{accountNumber}}\",\n  \"transactionType\": \"CREDIT\",\n  \"amount\": {{creditAmount}},\n  \"currency\": \"{{currency}}\",\n  \"currentBalance\": {{balanceAfterCredit}},\n  \"accountMinimumBalance\": {{accountMinimumBalance}},\n  \"accountCategory\": \"{{accountCategory}}\",\n  \"providerId\": \"{{providerId}}\",\n  \"notifiedAt\": \"{{notifiedAt}}\"\n}",
+              "options": { "raw": { "language": "json" } }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Acknowledged with 200', () => pm.response.to.have.status(200));",
+                  "pm.test('Acknowledgement carries a notificationId', () => {",
+                  "    pm.expect(pm.response.json()).to.have.property('notificationId');",
+                  "});",
+                  "",
+                  "// Remember this delivery so the replay request can resend it verbatim.",
+                  "const body = pm.response.json();",
+                  "pm.collectionVariables.set('lastExternalReference', pm.collectionVariables.get('externalReference'));",
+                  "if (body.notificationId) pm.collectionVariables.set('lastNotificationId', body.notificationId);"
+                ]
+              }
+            }
+          ],
+          "response": [
+            {
+              "name": "200 · Captured",
+              "originalRequest": {
+                "method": "POST",
+                "header": [{ "key": "Content-Type", "value": "application/json" }],
+                "url": {
+                  "raw": "{{lendingBaseUrl}}/api/cbs/notifications/credit",
+                  "host": ["{{lendingBaseUrl}}"],
+                  "path": ["api", "cbs", "notifications", "credit"]
+                },
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"correlationId\": \"5f1c6b2a-9d4e-4c31-b0a7-8e2f4d6c1b90\",\n  \"externalReference\": \"TXN175823940012345\",\n  \"accountNumber\": \"1000123456789\",\n  \"transactionType\": \"CREDIT\",\n  \"amount\": 1500.00,\n  \"currency\": \"ETB\",\n  \"currentBalance\": 1725.50,\n  \"accountMinimumBalance\": 25,\n  \"accountCategory\": \"SAVING\",\n  \"providerId\": \"PRO0001\",\n  \"notifiedAt\": \"2026-09-16T08:41:22.318Z\"\n}",
+                  "options": { "raw": { "language": "json" } }
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "cookie": [],
+              "body": "{\n  \"notificationId\": \"clx9k2p0a0001qz8v7m3n5t2y\",\n  \"status\": \"PENDING\",\n  \"message\": \"Notification received.\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "Debit — money out of the account",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{lendingBaseUrl}}/api/cbs/notifications/credit",
+              "host": ["{{lendingBaseUrl}}"],
+              "path": ["api", "cbs", "notifications", "credit"]
+            },
+            "description": "A withdrawal, transfer out, or any other outbound movement on a monitored account.\n\nSame endpoint and same envelope as a credit. Two things differ:\n\n- `transactionType` is `DEBIT`;\n- `currentBalance` is **lower** than before the movement.\n\n`amount` stays positive — it is the size of the movement, not a signed ledger entry. The pair `transactionType` + `currentBalance` is what tells the lending side which way the money went and where the account landed.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"correlationId\": \"{{$guid}}\",\n  \"externalReference\": \"{{externalReference}}\",\n  \"accountNumber\": \"{{accountNumber}}\",\n  \"transactionType\": \"DEBIT\",\n  \"amount\": {{debitAmount}},\n  \"currency\": \"{{currency}}\",\n  \"currentBalance\": {{balanceAfterDebit}},\n  \"accountMinimumBalance\": {{accountMinimumBalance}},\n  \"accountCategory\": \"{{accountCategory}}\",\n  \"providerId\": \"{{providerId}}\",\n  \"notifiedAt\": \"{{notifiedAt}}\"\n}",
+              "options": { "raw": { "language": "json" } }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Acknowledged with 200', () => pm.response.to.have.status(200));",
+                  "pm.test('Acknowledgement carries a notificationId', () => {",
+                  "    pm.expect(pm.response.json()).to.have.property('notificationId');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "response": [
+            {
+              "name": "200 · Captured",
+              "originalRequest": {
+                "method": "POST",
+                "header": [{ "key": "Content-Type", "value": "application/json" }],
+                "url": {
+                  "raw": "{{lendingBaseUrl}}/api/cbs/notifications/credit",
+                  "host": ["{{lendingBaseUrl}}"],
+                  "path": ["api", "cbs", "notifications", "credit"]
+                },
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"correlationId\": \"a4d70e18-2b55-4f0c-9a31-6c5b8e7d2a44\",\n  \"externalReference\": \"TXN175823940198765\",\n  \"accountNumber\": \"1000123456789\",\n  \"transactionType\": \"DEBIT\",\n  \"amount\": 400.00,\n  \"currency\": \"ETB\",\n  \"currentBalance\": 1325.50,\n  \"accountMinimumBalance\": 25,\n  \"accountCategory\": \"SAVING\",\n  \"providerId\": \"PRO0001\",\n  \"notifiedAt\": \"2026-09-16T09:02:10.774Z\"\n}",
+                  "options": { "raw": { "language": "json" } }
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "cookie": [],
+              "body": "{\n  \"notificationId\": \"clx9k3r7b0004qz8v2h8k9p1c\",\n  \"status\": \"PENDING\",\n  \"message\": \"Notification received.\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "Credit — minimum payload",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{lendingBaseUrl}}/api/cbs/notifications/credit",
+              "host": ["{{lendingBaseUrl}}"],
+              "path": ["api", "cbs", "notifications", "credit"]
+            },
+            "description": "The smallest body the listener accepts: which account, and how much moved.\n\nUse it to confirm connectivity and the shared token before wiring up the full payload. Note what is lost by sending only this — with no `externalReference` there is no deduplication, and with no `currentBalance` the listener knows the movement but not the resulting position of the account.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"accountNumber\": \"{{accountNumber}}\",\n  \"amount\": {{creditAmount}}\n}",
+              "options": { "raw": { "language": "json" } }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Acknowledged with 200', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ],
+          "response": [
+            {
+              "name": "200 · Captured",
+              "originalRequest": {
+                "method": "POST",
+                "header": [{ "key": "Content-Type", "value": "application/json" }],
+                "url": {
+                  "raw": "{{lendingBaseUrl}}/api/cbs/notifications/credit",
+                  "host": ["{{lendingBaseUrl}}"],
+                  "path": ["api", "cbs", "notifications", "credit"]
+                },
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"accountNumber\": \"1000123456789\",\n  \"amount\": 1500.00\n}",
+                  "options": { "raw": { "language": "json" } }
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "cookie": [],
+              "body": "{\n  \"notificationId\": \"clx9k4s9c0007qz8v5d2m7r3e\",\n  \"status\": \"PENDING\",\n  \"message\": \"Notification received.\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "Replay — same transaction delivered twice",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{lendingBaseUrl}}/api/cbs/notifications/credit",
+              "host": ["{{lendingBaseUrl}}"],
+              "path": ["api", "cbs", "notifications", "credit"]
+            },
+            "description": "Resends the `externalReference` from the last accepted notification — what happens when the core retries after a timeout, or when the same transaction is published twice.\n\nRun **Credit — money into the account** first; this request reuses the reference that request captured.\n\nThe listener recognises the reference and returns the **original** `notificationId` rather than creating a second record. This is why `externalReference` must be unique per transaction across all accounts: it is the only thing standing between a network retry and a double-counted movement.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"correlationId\": \"{{$guid}}\",\n  \"externalReference\": \"{{lastExternalReference}}\",\n  \"accountNumber\": \"{{accountNumber}}\",\n  \"transactionType\": \"CREDIT\",\n  \"amount\": {{creditAmount}},\n  \"currency\": \"{{currency}}\",\n  \"currentBalance\": {{balanceAfterCredit}},\n  \"accountMinimumBalance\": {{accountMinimumBalance}},\n  \"accountCategory\": \"{{accountCategory}}\",\n  \"providerId\": \"{{providerId}}\",\n  \"notifiedAt\": \"{{notifiedAt}}\"\n}",
+              "options": { "raw": { "language": "json" } }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Acknowledged with 200', () => pm.response.to.have.status(200));",
+                  "pm.test('Resolves to the original notification, not a new one', () => {",
+                  "    const previous = pm.collectionVariables.get('lastNotificationId');",
+                  "    if (previous) pm.expect(pm.response.json().notificationId).to.eql(previous);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "response": [
+            {
+              "name": "200 · Recognised as a replay",
+              "originalRequest": {
+                "method": "POST",
+                "header": [{ "key": "Content-Type", "value": "application/json" }],
+                "url": {
+                  "raw": "{{lendingBaseUrl}}/api/cbs/notifications/credit",
+                  "host": ["{{lendingBaseUrl}}"],
+                  "path": ["api", "cbs", "notifications", "credit"]
+                },
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"correlationId\": \"7c2e9a13-6f84-4b02-8d5a-1e3c7b9f0d26\",\n  \"externalReference\": \"TXN175823940012345\",\n  \"accountNumber\": \"1000123456789\",\n  \"transactionType\": \"CREDIT\",\n  \"amount\": 1500.00,\n  \"currency\": \"ETB\",\n  \"currentBalance\": 1725.50,\n  \"accountMinimumBalance\": 25,\n  \"accountCategory\": \"SAVING\",\n  \"providerId\": \"PRO0001\",\n  \"notifiedAt\": \"2026-09-16T08:41:22.318Z\"\n}",
+                  "options": { "raw": { "language": "json" } }
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "cookie": [],
+              "body": "{\n  \"notificationId\": \"clx9k2p0a0001qz8v7m3n5t2y\",\n  \"status\": \"DUPLICATE\",\n  \"message\": \"Notification already processed (status=PENDING).\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "Rejected — incomplete payload",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{lendingBaseUrl}}/api/cbs/notifications/credit",
+              "host": ["{{lendingBaseUrl}}"],
+              "path": ["api", "cbs", "notifications", "credit"]
+            },
+            "description": "A payload with no `accountNumber`.\n\nThe listener answers **`200`, not `4xx`** — the notification is stored with `status: \"FAILED\"` and the reason, so a malformed delivery is visible and inspectable on the lending side rather than lost. The core should treat this as delivered and **not** retry it; only transport errors, `5xx` and timeouts are worth retrying.\n\nSame outcome for a non-numeric or negative `amount`.\n\nThe second saved example shows the one body-level case that does return `4xx`: a request that is not JSON at all.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"correlationId\": \"{{$guid}}\",\n  \"externalReference\": \"{{externalReference}}\",\n  \"transactionType\": \"CREDIT\",\n  \"amount\": {{creditAmount}},\n  \"providerId\": \"{{providerId}}\"\n}",
+              "options": { "raw": { "language": "json" } }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Still acknowledged with 200', () => pm.response.to.have.status(200));",
+                  "pm.test('Outcome is reported in the body', () => {",
+                  "    pm.expect(pm.response.json().status).to.eql('FAILED');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "response": [
+            {
+              "name": "200 · Stored as FAILED",
+              "originalRequest": {
+                "method": "POST",
+                "header": [{ "key": "Content-Type", "value": "application/json" }],
+                "url": {
+                  "raw": "{{lendingBaseUrl}}/api/cbs/notifications/credit",
+                  "host": ["{{lendingBaseUrl}}"],
+                  "path": ["api", "cbs", "notifications", "credit"]
+                },
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"correlationId\": \"1b8d3f60-4a27-4e95-9c02-5d6a8b1e7f34\",\n  \"externalReference\": \"TXN175823940155512\",\n  \"transactionType\": \"CREDIT\",\n  \"amount\": 1500.00,\n  \"providerId\": \"PRO0001\"\n}",
+                  "options": { "raw": { "language": "json" } }
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "cookie": [],
+              "body": "{\n  \"notificationId\": \"clx9k5t2d000aqz8v8j4n6w5f\",\n  \"status\": \"FAILED\",\n  \"message\": \"Invalid payload: accountNumber and positive amount are required.\"\n}"
+            },
+            {
+              "name": "400 · Body is not JSON",
+              "originalRequest": {
+                "method": "POST",
+                "header": [{ "key": "Content-Type", "value": "application/json" }],
+                "url": {
+                  "raw": "{{lendingBaseUrl}}/api/cbs/notifications/credit",
+                  "host": ["{{lendingBaseUrl}}"],
+                  "path": ["api", "cbs", "notifications", "credit"]
+                },
+                "body": {
+                  "mode": "raw",
+                  "raw": "accountNumber=1000123456789&amount=1500",
+                  "options": { "raw": { "language": "text" } }
+                }
+              },
+              "status": "Bad Request",
+              "code": 400,
+              "_postman_previewlanguage": "json",
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "cookie": [],
+              "body": "{\n  \"error\": \"Invalid JSON body\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "Rejected — wrong or missing token",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                { "key": "token", "value": "not-the-shared-token", "type": "string" }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{lendingBaseUrl}}/api/cbs/notifications/credit",
+              "host": ["{{lendingBaseUrl}}"],
+              "path": ["api", "cbs", "notifications", "credit"]
+            },
+            "description": "The listener rejects the delivery before reading the body and stores nothing.\n\nThe token may be presented either way:\n\n- `Authorization: Bearer <token>`\n- `x-cbs-token: <token>`\n\nA `401` here means a configuration mismatch, not a bad transaction — the core should alert rather than retry in a loop.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"correlationId\": \"{{$guid}}\",\n  \"externalReference\": \"{{externalReference}}\",\n  \"accountNumber\": \"{{accountNumber}}\",\n  \"transactionType\": \"CREDIT\",\n  \"amount\": {{creditAmount}},\n  \"currentBalance\": {{balanceAfterCredit}},\n  \"accountMinimumBalance\": {{accountMinimumBalance}},\n  \"providerId\": \"{{providerId}}\"\n}",
+              "options": { "raw": { "language": "json" } }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Rejected with 401', () => pm.response.to.have.status(401));"
+                ]
+              }
+            }
+          ],
+          "response": [
+            {
+              "name": "401 · Unauthorized",
+              "originalRequest": {
+                "method": "POST",
+                "header": [{ "key": "Content-Type", "value": "application/json" }],
+                "url": {
+                  "raw": "{{lendingBaseUrl}}/api/cbs/notifications/credit",
+                  "host": ["{{lendingBaseUrl}}"],
+                  "path": ["api", "cbs", "notifications", "credit"]
+                },
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"accountNumber\": \"1000123456789\",\n  \"amount\": 1500.00\n}",
+                  "options": { "raw": { "language": "json" } }
+                }
+              },
+              "status": "Unauthorized",
+              "code": 401,
+              "_postman_previewlanguage": "json",
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "cookie": [],
+              "body": "{\n  \"error\": \"Unauthorized\"\n}"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "2. Lending → Core · Which accounts to watch",
+      "description": "The other half of the contract: nothing is notified until an account is on the core's watch list, and notifications keep coming until it is taken off.\n\nBoth calls live under `{{coreBaseUrl}}` and authenticate with `{{coreAuthToken}}` (Bearer, or HTTP Basic where the core requires it).",
+      "item": [
+        {
+          "name": "Register accounts for monitoring",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                { "key": "token", "value": "{{coreAuthToken}}", "type": "string" }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{coreBaseUrl}}/bulk",
+              "host": ["{{coreBaseUrl}}"],
+              "path": ["bulk"]
+            },
+            "description": "Adds account numbers to the core's watch list. From this point the core posts a notification on every movement on those accounts.\n\nThe call is **additive and idempotent** — an account already on the list is counted under `alreadyExistsCount` rather than duplicated, so the whole list can safely be re-sent on a schedule.\n\nThe core caps the list per request (commonly 1000 accounts); longer lists are split across several calls and the counts summed.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"accountNumbers\": [\n    \"{{accountNumber}}\",\n    \"{{secondAccountNumber}}\"\n  ]\n}",
+              "options": { "raw": { "language": "json" } }
+            }
+          },
+          "response": [
+            {
+              "name": "200 · Registered",
+              "originalRequest": {
+                "method": "POST",
+                "header": [{ "key": "Content-Type", "value": "application/json" }],
+                "url": {
+                  "raw": "{{coreBaseUrl}}/bulk",
+                  "host": ["{{coreBaseUrl}}"],
+                  "path": ["bulk"]
+                },
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"accountNumbers\": [\n    \"1000123456789\",\n    \"1000987654321\"\n  ]\n}",
+                  "options": { "raw": { "language": "json" } }
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "cookie": [],
+              "body": "{\n  \"totalReceived\": 2,\n  \"insertedCount\": 1,\n  \"alreadyExistsCount\": 1\n}"
+            }
+          ]
+        },
+        {
+          "name": "Stop monitoring an account",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                { "key": "token", "value": "{{coreAuthToken}}", "type": "string" }
+              ]
+            },
+            "method": "DELETE",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{coreBaseUrl}}/delete/{{accountNumber}}",
+              "host": ["{{coreBaseUrl}}"],
+              "path": ["delete", "{{accountNumber}}"]
+            },
+            "description": "Takes one account off the watch list; no more notifications are raised for it.\n\nThe account number goes in the path and must be URL-encoded. Removing an account that is not on the list is not an error."
+          },
+          "response": [
+            {
+              "name": "200 · Removed",
+              "originalRequest": {
+                "method": "DELETE",
+                "header": [],
+                "url": {
+                  "raw": "{{coreBaseUrl}}/delete/1000123456789",
+                  "host": ["{{coreBaseUrl}}"],
+                  "path": ["delete", "1000123456789"]
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "cookie": [],
+              "body": "{\n  \"status\": \"Success\",\n  \"message\": \"Account removed from monitoring.\",\n  \"status_code\": 200,\n  \"deletedCount\": 1\n}"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "3. Lending · What was received",
+      "description": "The audit trail on the lending side. Useful during an integration test to show the core team that their deliveries landed, and in what state.\n\nThis is an **operator** endpoint, not a machine-to-machine one: it authenticates with the admin session cookie rather than the shared token, and requires the NPL-collection permission.",
+      "item": [
+        {
+          "name": "List received notifications",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" },
+              { "key": "Cookie", "value": "{{adminSessionCookie}}", "description": "Session cookie from an authenticated admin browser session.", "disabled": true }
+            ],
+            "url": {
+              "raw": "{{lendingBaseUrl}}/api/cbs/notifications?page=1&limit=20&search={{accountNumber}}",
+              "host": ["{{lendingBaseUrl}}"],
+              "path": ["api", "cbs", "notifications"],
+              "query": [
+                { "key": "page", "value": "1" },
+                { "key": "limit", "value": "20", "description": "1–100." },
+                { "key": "search", "value": "{{accountNumber}}", "description": "Matches account number, correlation id, or external reference." },
+                { "key": "status", "value": "FAILED", "description": "Filter by processing status.", "disabled": true },
+                { "key": "from", "value": "2026-09-01", "description": "Received on or after (inclusive).", "disabled": true },
+                { "key": "to", "value": "2026-09-16", "description": "Received on or before (inclusive).", "disabled": true }
+              ]
+            },
+            "description": "Paginated list of the notifications the listener has captured, newest first, with a per-status summary.\n\nEnable the `Cookie` header and set `{{adminSessionCookie}}` from a logged-in admin browser session, or run the request from a browser that already holds one. Without it the endpoint answers `401`."
+          },
+          "response": [
+            {
+              "name": "200 · Two notifications on the account",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{lendingBaseUrl}}/api/cbs/notifications?page=1&limit=20&search=1000123456789",
+                  "host": ["{{lendingBaseUrl}}"],
+                  "path": ["api", "cbs", "notifications"],
+                  "query": [
+                    { "key": "page", "value": "1" },
+                    { "key": "limit", "value": "20" },
+                    { "key": "search", "value": "1000123456789" }
+                  ]
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "cookie": [],
+              "body": "{\n  \"page\": 1,\n  \"limit\": 20,\n  \"total\": 2,\n  \"totalPages\": 1,\n  \"summary\": {\n    \"total\": 2,\n    \"byStatus\": {\n      \"PENDING\": 2\n    },\n    \"totalCredited\": 1900,\n    \"totalDebited\": 0\n  },\n  \"rows\": [\n    {\n      \"id\": \"clx9k3r7b0004qz8v2h8k9p1c\",\n      \"correlationId\": \"a4d70e18-2b55-4f0c-9a31-6c5b8e7d2a44\",\n      \"externalReference\": \"TXN175823940198765\",\n      \"accountNumber\": \"1000123456789\",\n      \"creditedAmount\": 400,\n      \"providerId\": \"PRO0001\",\n      \"processStatus\": \"PENDING\",\n      \"resultMessage\": null,\n      \"attempts\": 0,\n      \"receivedAt\": \"2026-09-16T09:02:11.104Z\",\n      \"lastAttemptAt\": null\n    },\n    {\n      \"id\": \"clx9k2p0a0001qz8v7m3n5t2y\",\n      \"correlationId\": \"5f1c6b2a-9d4e-4c31-b0a7-8e2f4d6c1b90\",\n      \"externalReference\": \"TXN175823940012345\",\n      \"accountNumber\": \"1000123456789\",\n      \"creditedAmount\": 1500,\n      \"providerId\": \"PRO0001\",\n      \"processStatus\": \"PENDING\",\n      \"resultMessage\": null,\n      \"attempts\": 0,\n      \"receivedAt\": \"2026-09-16T08:41:22.655Z\",\n      \"lastAttemptAt\": null\n    }\n  ]\n}"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

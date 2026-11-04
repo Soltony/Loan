@@ -8,6 +8,7 @@ import { hasPermissionForEntity } from '@/lib/require-permission';
 import { z } from 'zod';
 import { createAuditLog } from '@/lib/audit-log';
 import { isSafeOnlyProductUpdate } from '@/lib/loan-product-changes';
+import { checkStatementParameterChange } from '@/lib/statement-parameters';
 
 export async function GET(req: NextRequest) {
   const user = await getUserFromSession();
@@ -181,6 +182,20 @@ export async function POST(req: NextRequest) {
       // Scoring rules don't have a status on a single entity, it's a collection.
     }
 
+
+    // Statement parameters are checked now (clear errors for the maker) and again on approval.
+    if (entityType === 'StatementParameter') {
+      let parsedPayload: any = null;
+      try {
+        parsedPayload = JSON.parse(payload);
+      } catch {
+        return NextResponse.json({ error: 'Invalid statement parameter.' }, { status: 400 });
+      }
+      const checked = await checkStatementParameterChange(changeType, entityId, parsedPayload);
+      if (!checked.ok) {
+        return NextResponse.json({ error: checked.error }, { status: 400 });
+      }
+    }
 
     // Validate embedded file payloads for uploads submitted via pending changes
     if (entityType === 'DataProvisioningUpload' || entityType === 'EligibilityList') {

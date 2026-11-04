@@ -1,6 +1,7 @@
 
 import { NextRequest, NextResponse } from 'next/server';
 import prisma from '@/lib/prisma';
+import { loadStatementParameters } from '@/lib/statement-parameters';
 
 // This route fetches all columns from all data provisioning configs for a given provider,
 // and now also includes hardcoded behavioral metrics.
@@ -54,6 +55,12 @@ export async function GET(req: NextRequest) {
         
         customParameters = customParameters.concat(behavioralParameters);
         // --- END NEW ---
+
+        // Statement parameters defined (and approved) in the Scoring Engine
+        const statementParameters = await loadStatementParameters();
+        customParameters = customParameters.concat(
+            statementParameters.map((p) => ({ value: p.field, label: `${p.name} (statement)`, type: 'number', options: [] }))
+        );
 
         // Remove duplicates in case multiple configs have the same column name
         const uniqueParameters = Array.from(new Map(customParameters.map(item => [item['value'], item])).values());

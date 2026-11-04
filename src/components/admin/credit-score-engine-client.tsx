@@ -56,6 +56,9 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '.
 import { Badge } from '../ui/badge';
 import { Textarea } from '../ui/textarea';
 import { usePermissions } from '@/hooks/use-permissions';
+import { StatementParametersCard } from './statement-parameters-card';
+import { DataFetchSettingsCard } from './data-fetch-settings-card';
+import { StatementFiguresCard } from './statement-figures-card';
 
 
 export interface ScoringHistoryItem {
@@ -206,6 +209,7 @@ export function CreditScoreEngineClient({ initialProviders, initialScoringParame
     const [allDataConfigs, setAllDataConfigs] = useState<DataProvisioningConfig[]>(initialProviders.flatMap(p => p.dataProvisioningConfigs || []));
     
     const [customParams, setCustomParams] = useState<CustomParameterType[]>([]);
+    const [statementMonths, setStatementMonths] = useState(6);
     const [isSaving, setIsSaving] = useState(false);
     const [isHistoryLoading, setIsHistoryLoading] = useState(false);
     const [scoringHistory, setScoringHistory] = useState<ScoringHistoryItem[]>([]);
@@ -496,6 +500,12 @@ export function CreditScoreEngineClient({ initialProviders, initialScoringParame
                 }}
                 allProviderProducts={currentProvider?.products || []}
             />
+
+            <DataFetchSettingsCard onSettings={(s) => setStatementMonths(s.statementMonths)} />
+
+            <StatementParametersCard months={statementMonths} />
+
+            <StatementFiguresCard />
 
             <Card>
                 <CardHeader className="flex flex-row items-center justify-between">

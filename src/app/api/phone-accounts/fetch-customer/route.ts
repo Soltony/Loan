@@ -1,12 +1,29 @@
-import { NextResponse } from "next/server";
+import { NextResponse, after } from "next/server";
 import prisma from "../../../../lib/prisma";
 import { Prisma } from "@prisma/client";
 import {
   MiniAppAuthError,
   requireMiniAppAuthContext,
 } from "@/lib/miniapp-auth";
+import {
+  storedDataStamps,
+  syncBorrowerData,
+  within,
+} from "@/lib/borrower-data-sync";
+
+// How long this route waits before answering. Customer info usually comes within 20 s, but a new
+// customer in a rush waits their turn at the data API; the fetch carries on after we answer.
+const CUSTOMER_INFO_WAIT_MS = 20_000;
+// Enough for figures that are still fresh, or a statement the data API already holds. A read from
+// ODS takes a minute or more and carries on after we answer.
+const STATEMENT_WAIT_MS = 3_000;
 
 // POST { phoneNumber, accountNumber }
+//
+// Answers { ok, saved | reused | stale, provisionedDataId, changed, pending, customerInfoFetchedAt,
+// figuresComputedAt }. changed = new data was stored while we waited (recalculate the limit now);
+// pending = more is still being fetched (202 while even the customer info is): ask
+// /api/phone-accounts/data-status when it has landed.
 export async function POST(req: Request) {
   try {
     const ctx = await requireMiniAppAuthContext();
@@ -194,139 +211,54 @@ export async function POST(req: Request) {
     // Ensure Borrower exists. Use phoneNumber as borrower id (as used in auth/connect).
     const borrowerId = String(phoneNumber);
     // Create borrower defensively. Prisma `upsert` on SQL Server can fail under
-    // concurrency (unique constraint) so we use create and accept "already exists".
-    // An existing borrower keeps its status: this runs every time the app opens,
-    // and resetting it to Active cleared the NPL flag of borrowers who still owe.
+    // concurrency (unique constraint) so we use create and ignore P2002.
     try {
       await prisma.borrower.create({
         data: { id: borrowerId, status: "Active" },
       });
     } catch (e: any) {
+      // P2002: the borrower already exists. Leave its status alone: resetting it
+      // here cleared the NPL flag every time the dashboard loaded.
       if (
-        !(e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2002")
+        !(
+          e instanceof Prisma.PrismaClientKnownRequestError &&
+          e.code === "P2002"
+        )
       ) {
         throw e;
       }
     }
 
-    // Try to reuse an existing provisioned payload for the same borrower+accountNumber
-    // Search across all ExternalCustomerInfo configs for this borrower and look for a matching accountNumber
-    const existingAcross = await prisma.provisionedData.findMany({
-      where: { borrowerId, config: { name: "ExternalCustomerInfo" } },
-    });
-    for (const ex of existingAcross) {
-      try {
-        const parsed = JSON.parse(ex.data as string);
-        const candidate = parsed?.detail ?? parsed;
-        const candidateAccount =
-          candidate?.AccountNumber ??
-          candidate?.accountNumber ??
-          candidate?.account_number ??
-          null;
-        if (candidateAccount != null) {
-          // Compare loosely since DB may store numbers or strings
-          if (String(candidateAccount) === String(accountNumber)) {
-            // Reuse this payload for the target provider config by upserting into its provisionedData
-            const payload = parsed;
-            const existingForTarget = await prisma.provisionedData.findFirst({
-              where: { borrowerId, configId: config.id },
-            });
-            if (existingForTarget) {
-              const updated = await prisma.provisionedData.update({
-                where: { id: existingForTarget.id },
-                data: { data: JSON.stringify(payload) },
-              });
-              return NextResponse.json({
-                ok: true,
-                copied: true,
-                provisionedDataId: updated.id,
-              });
-            } else {
-              const created = await prisma.provisionedData.create({
-                data: {
-                  borrowerId,
-                  configId: config.id,
-                  data: JSON.stringify(payload),
-                },
-              });
-              return NextResponse.json({
-                ok: true,
-                copied: true,
-                provisionedDataId: created.id,
-              });
-            }
-          }
-        }
-      } catch (e) {
-        // ignore parse errors for unrelated rows
-      }
-    }
+    const account = String(accountNumber).trim();
+    // Customer info, then the statement figures (unless they are fresh or statement fetching is
+    // switched off). Scoring goes ahead without what has not landed yet.
+    const sync = syncBorrowerData(borrowerId, account, config.id);
+    after(sync.done);
 
-    // No existing matched payload found: call the external customer info service
-    const apiUrl = process.env.EXTERNAL_CUSTOMER_INFO_URL ?? "";
-    const user = process.env.EXTERNAL_API_USERNAME;
-    const pass = process.env.EXTERNAL_API_PASSWORD;
-    const auth = "Basic " + Buffer.from(`${user}:${pass}`).toString("base64");
-
-    // Call upstream customer info service
-    const res = await fetch(apiUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: auth },
-      body: JSON.stringify({ accountNumber }),
-    });
-
-    if (!res.ok) {
-      const text = await res.text().catch(() => null);
-      console.warn(
-        "[phone-accounts][fetch-customer] upstream returned",
-        res.status,
-        text
-      );
-
+    const result = await within(sync.customerInfo, CUSTOMER_INFO_WAIT_MS);
+    if (result && !result.ok) {
       return NextResponse.json(
-        { error: "Upstream error", status: res.status, body: text },
+        { error: "Upstream error", status: result.status, body: result.body },
         { status: 502 }
       );
     }
-
-    const data = await res.json().catch(() => null);
-    const detail = data?.detail ?? data?.details ?? data;
-
-    // Save provisioned data as JSON string. We keep a single latest row per (borrower, config) per simplicity.
-    const payload = {
-      source: "external-customer-info",
-      accountNumber,
-      fetchedAt: new Date().toISOString(),
-      detail,
-    };
-
-    const existing = await prisma.provisionedData.findFirst({
-      where: { borrowerId, configId: config.id },
-    });
-    if (existing) {
-      const updated = await prisma.provisionedData.update({
-        where: { id: existing.id },
-        data: { data: JSON.stringify(payload) },
-      });
-      return NextResponse.json({
+    const statement = result
+      ? await within(sync.statement, STATEMENT_WAIT_MS)
+      : undefined;
+    return NextResponse.json(
+      {
         ok: true,
-        saved: true,
-        provisionedDataId: updated.id,
-      });
-    } else {
-      const created = await prisma.provisionedData.create({
-        data: {
-          borrowerId,
-          configId: config.id,
-          data: JSON.stringify(payload),
-        },
-      });
-      return NextResponse.json({
-        ok: true,
-        saved: true,
-        provisionedDataId: created.id,
-      });
-    }
+        ...(result
+          ? { [result.outcome]: true, provisionedDataId: result.provisionedDataId }
+          : {}),
+        changed:
+          result?.outcome === "saved" ||
+          (statement?.ok === true && statement.outcome === "saved"),
+        pending: result === undefined || statement === undefined,
+        ...(await storedDataStamps(borrowerId, account)),
+      },
+      { status: result ? 200 : 202 }
+    );
   } catch (err: any) {
     if (err instanceof MiniAppAuthError) {
       return NextResponse.json({ error: err.message }, { status: err.status });

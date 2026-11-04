@@ -1,0 +1,330 @@
+{
+  "info": {
+    "_postman_id": "0d2b27d7-ff4d-400e-9250-88b0082e7a7e",
+    "name": "Account Notification API (Core ↔ Lending)",
+    "description": "# Account Notification API\n\nHow the **core banking system (CBS)** tells the **lending platform** that money moved on an account it was asked to watch, and how the lending platform tells the core which accounts to watch.\n\nEverything here is generic: hosts, tokens, account numbers and amounts are collection variables, so the same collection can be pointed at any environment (local, UAT, production) without editing a request.\n\n---\n\n## The flow\n\n```\n  Lending platform                          Core banking system\n        |                                           |\n        |  1. POST /bulk  (accounts to watch)       |\n        | ----------------------------------------> |\n        |                                           |\n        |                                     ( account moves:\n        |                                       credit or debit )\n        |                                           |\n        |  2. POST /api/cbs/notifications/credit    |\n        | <---------------------------------------- |\n        |                                           |\n        |  3. 200 { notificationId, status }        |\n        | ----------------------------------------> |\n        |                                           |\n        |  4. DELETE /delete/{accountNumber}        |\n        | ----------------------------------------> |\n```\n\n1. **Register** — the lending platform posts the account numbers it wants monitored.\n2. **Notify** — every time one of those accounts moves, the core posts a notification to the lending platform's listener. This is the payload this collection is really about: folder *1. Core → Lending*.\n3. **Acknowledge** — the listener always answers `200` with a `notificationId` and a `status`, unless the token is wrong (`401`) or the body is not JSON (`400`). The core does not need to interpret the `status`; a `200` means the notification was captured.\n4. **Deregister** — when an account no longer needs watching.\n\n---\n\n## Authentication\n\n| Direction | Header | Variable |\n| --- | --- | --- |\n| Core → Lending | `Authorization: Bearer <token>` **or** `x-cbs-token: <token>` | `{{inboundToken}}` |\n| Lending → Core | `Authorization: Bearer <token>` (Basic also supported) | `{{coreAuthToken}}` |\n\nThe inbound token is a single shared secret. If the listener is configured without one, the token check is skipped entirely — useful for a sandbox, never for production.\n\n---\n\n## Identifiers and idempotency\n\n| Field | Who sets it | Purpose |\n| --- | --- | --- |\n| `externalReference` | core | The core's own transaction reference. **This is the deduplication key** — re-delivering the same reference returns the original notification instead of creating a second one. It is unique across the whole listener, so it must be globally unique per transaction, not per account. |\n| `correlationId` | core (optional) | Free-form trace id carried through the logs. When absent the listener generates one. |\n| `notificationId` | lending platform | Returned in the acknowledgement. Quote this when chasing a notification. |\n\nA core that cannot guarantee a unique `externalReference` should omit it — every delivery is then stored as a distinct notification, including genuine retries.\n\n---\n\n## Retry expectations\n\nThe listener answers `200` even when it could not act on a notification (unknown account, bad amount) — the `status` field carries that outcome, and the record is kept for inspection and manual retry on the lending side. The core should therefore retry only on a transport failure, a `5xx`, or a timeout, and it should reuse the same `externalReference` when it does.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "_exporter_id": "50415360",
+    "_collection_link": "https://go.postman.co/collection/50415360-0d2b27d7-ff4d-400e-9250-88b0082e7a7e?source=collection_link"
+  },
+  "item": [
+    {
+      "name": "1. Core → Lending · Account activity notifications",
+      "item": [
+        {
+          "name": "Credit — money into the account",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Acknowledged with 200', () => pm.response.to.have.status(200));",
+                  "pm.test('Acknowledgement carries a notificationId', () => {",
+                  "    pm.expect(pm.response.json()).to.have.property('notificationId');",
+                  "});",
+                  "",
+                  "// Remember this delivery so the replay request can resend it verbatim.",
+                  "const body = pm.response.json();",
+                  "pm.collectionVariables.set('lastExternalReference', pm.collectionVariables.get('externalReference'));",
+                  "if (body.notificationId) pm.collectionVariables.set('lastNotificationId', body.notificationId);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"correlationId\": \"{{$guid}}\",\n  \"externalReference\": \"{{externalReference}}\",\n  \"accountNumber\": \"{{accountNumber}}\",\n  \"transactionType\": \"CREDIT\",\n  \"amount\": {{creditAmount}},\n  \"currency\": \"{{currency}}\",\n  \"currentBalance\": {{balanceAfterCredit}},\n  \"accountMinimumBalance\": {{accountMinimumBalance}},\n  \"accountCategory\": \"{{accountCategory}}\",\n  \"providerId\": \"{{providerId}}\",\n  \"notifiedAt\": \"{{notifiedAt}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{lendingBaseUrl}}/api/cbs/notifications/credit",
+              "host": [
+                "{{lendingBaseUrl}}"
+              ],
+              "path": [
+                "api",
+                "cbs",
+                "notifications",
+                "credit"
+              ]
+            },
+            "description": "A deposit, transfer in, or any other inbound movement on a monitored account.\n\n`currentBalance` is the balance **after** the credit has landed. Send it post-settlement: a pre-credit snapshot understates what is on the account and makes the notification look smaller than the movement really was."
+          },
+          "response": [
+            {
+              "name": "200 · Captured",
+              "originalRequest": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"correlationId\": \"5f1c6b2a-9d4e-4c31-b0a7-8e2f4d6c1b90\",\n  \"externalReference\": \"TXN175823940012345\",\n  \"accountNumber\": \"1000123456789\",\n  \"transactionType\": \"CREDIT\",\n  \"amount\": 1500.00,\n  \"currency\": \"ETB\",\n  \"currentBalance\": 1725.50,\n  \"accountMinimumBalance\": 25,\n  \"accountCategory\": \"SAVING\",\n  \"providerId\": \"PRO0001\",\n  \"notifiedAt\": \"2026-09-16T08:41:22.318Z\"\n}",
+                  "options": {
+                    "raw": {
+                      "language": "json"
+                    }
+                  }
+                },
+                "url": {
+                  "raw": "{{lendingBaseUrl}}/api/cbs/notifications/credit",
+                  "host": [
+                    "{{lendingBaseUrl}}"
+                  ],
+                  "path": [
+                    "api",
+                    "cbs",
+                    "notifications",
+                    "credit"
+                  ]
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "cookie": [],
+              "body": "{\n  \"notificationId\": \"clx9k2p0a0001qz8v7m3n5t2y\",\n  \"status\": \"PENDING\",\n  \"message\": \"Notification received.\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "Debit — money out of the account",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Acknowledged with 200', () => pm.response.to.have.status(200));",
+                  "pm.test('Acknowledgement carries a notificationId', () => {",
+                  "    pm.expect(pm.response.json()).to.have.property('notificationId');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"correlationId\": \"{{$guid}}\",\n  \"externalReference\": \"{{externalReference}}\",\n  \"accountNumber\": \"{{accountNumber}}\",\n  \"transactionType\": \"DEBIT\",\n  \"amount\": {{debitAmount}},\n  \"currency\": \"{{currency}}\",\n  \"currentBalance\": {{balanceAfterDebit}},\n  \"accountMinimumBalance\": {{accountMinimumBalance}},\n  \"accountCategory\": \"{{accountCategory}}\",\n  \"providerId\": \"{{providerId}}\",\n  \"notifiedAt\": \"{{notifiedAt}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{lendingBaseUrl}}/api/cbs/notifications/credit",
+              "host": [
+                "{{lendingBaseUrl}}"
+              ],
+              "path": [
+                "api",
+                "cbs",
+                "notifications",
+                "credit"
+              ]
+            },
+            "description": "A withdrawal, transfer out, or any other outbound movement on a monitored account.\n\nSame endpoint and same envelope as a credit. Two things differ:\n\n- `transactionType` is `DEBIT`;\n- `currentBalance` is **lower** than before the movement.\n\n`amount` stays positive — it is the size of the movement, not a signed ledger entry. The pair `transactionType` + `currentBalance` is what tells the lending side which way the money went and where the account landed."
+          },
+          "response": [
+            {
+              "name": "200 · Captured",
+              "originalRequest": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"correlationId\": \"a4d70e18-2b55-4f0c-9a31-6c5b8e7d2a44\",\n  \"externalReference\": \"TXN175823940198765\",\n  \"accountNumber\": \"1000123456789\",\n  \"transactionType\": \"DEBIT\",\n  \"amount\": 400.00,\n  \"currency\": \"ETB\",\n  \"currentBalance\": 1325.50,\n  \"accountMinimumBalance\": 25,\n  \"accountCategory\": \"SAVING\",\n  \"providerId\": \"PRO0001\",\n  \"notifiedAt\": \"2026-09-16T09:02:10.774Z\"\n}",
+                  "options": {
+                    "raw": {
+                      "language": "json"
+                    }
+                  }
+                },
+                "url": {
+                  "raw": "{{lendingBaseUrl}}/api/cbs/notifications/credit",
+                  "host": [
+                    "{{lendingBaseUrl}}"
+                  ],
+                  "path": [
+                    "api",
+                    "cbs",
+                    "notifications",
+                    "credit"
+                  ]
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "cookie": [],
+              "body": "{\n  \"notificationId\": \"clx9k3r7b0004qz8v2h8k9p1c\",\n  \"status\": \"PENDING\",\n  \"message\": \"Notification received.\"\n}"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{inboundToken}}",
+        "type": "string"
+      }
+    ]
+  },
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// Give every run a fresh transaction reference and timestamp, so repeated",
+          "// runs read as new transactions rather than replays of an earlier one.",
+          "// The replay request deliberately ignores these and reuses the last one.",
+          "const stamp = Date.now();",
+          "const noise = Math.floor(Math.random() * 100000).toString().padStart(5, '0');",
+          "pm.collectionVariables.set('externalReference', 'TXN' + stamp + noise);",
+          "pm.collectionVariables.set('notifiedAt', new Date().toISOString());"
+        ]
+      }
+    }
+  ],
+  "variable": [
+    {
+      "key": "lendingBaseUrl",
+      "value": "http://localhost:9002",
+      "description": "Host of the lending platform that receives notifications."
+    },
+    {
+      "key": "coreBaseUrl",
+      "value": "http://localhost:8080/api/v1/notification",
+      "description": "Base path of the core banking notification API."
+    },
+    {
+      "key": "inboundToken",
+      "value": "replace-with-shared-inbound-token",
+      "description": "Shared secret the core presents when posting a notification."
+    },
+    {
+      "key": "coreAuthToken",
+      "value": "replace-with-core-api-token",
+      "description": "Token the lending platform presents to the core."
+    },
+    {
+      "key": "accountNumber",
+      "value": "1000123456789",
+      "description": "The monitored account."
+    },
+    {
+      "key": "secondAccountNumber",
+      "value": "1000987654321"
+    },
+    {
+      "key": "providerId",
+      "value": "PRO0001",
+      "description": "Provider / channel code issued by the core."
+    },
+    {
+      "key": "accountCategory",
+      "value": "SAVING"
+    },
+    {
+      "key": "currency",
+      "value": "ETB"
+    },
+    {
+      "key": "accountMinimumBalance",
+      "value": "25",
+      "description": "Balance the account must retain."
+    },
+    {
+      "key": "creditAmount",
+      "value": "1500.00"
+    },
+    {
+      "key": "balanceAfterCredit",
+      "value": "1725.50"
+    },
+    {
+      "key": "debitAmount",
+      "value": "400.00"
+    },
+    {
+      "key": "balanceAfterDebit",
+      "value": "1325.50"
+    },
+    {
+      "key": "externalReference",
+      "value": "",
+      "description": "Set per run by the collection pre-request script."
+    },
+    {
+      "key": "notifiedAt",
+      "value": "",
+      "description": "Set per run by the collection pre-request script."
+    },
+    {
+      "key": "lastExternalReference",
+      "value": "",
+      "description": "Captured from the last accepted notification, so the replay request can reuse it."
+    },
+    {
+      "key": "lastNotificationId",
+      "value": ""
+    },
+    {
+      "key": "adminSessionCookie",
+      "value": "",
+      "description": "Session cookie for the operator endpoint in folder 3."
+    },
+    {
+      "key": "auth_secret_0f3a",
+      "secret": true
+    }
+  ]
+}
