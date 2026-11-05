@@ -1,6 +1,24 @@
 import { NextResponse } from 'next/server';
 import prisma from '../../../lib/prisma';
 import { MiniAppAuthError, requireMiniAppAuthContext } from '@/lib/miniapp-auth';
+import { accountBelongsToPhone } from '@/lib/bank-accounts';
+
+/**
+ * Only accounts the bank lists under the borrower's phone number may be linked or made active:
+ * scoring reads the active account's customer info and statement, and loans are paid into it.
+ * Returns the refusal to send, or null when the account is theirs.
+ */
+async function refuseUnlessOwnAccount(phoneNumber: string, accountNumber: string) {
+  const ownership = await accountBelongsToPhone(phoneNumber, accountNumber);
+  if (ownership === 'yes') return null;
+  if (ownership === 'no') {
+    return NextResponse.json({ error: 'This account is not registered to your phone number.' }, { status: 403 });
+  }
+  return NextResponse.json(
+    { error: 'We could not check your accounts with the bank right now. Please try again shortly.' },
+    { status: 503 }
+  );
+}
 
 // GET /api/phone-accounts?phoneNumber=...
 export async function GET(req: Request) {
@@ -45,7 +63,9 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
     }
 
-    const accNum = String(accountNumber);
+    const accNum = String(accountNumber).trim();
+    const refusal = await refuseUnlessOwnAccount(String(phoneNumber), accNum);
+    if (refusal) return refusal;
 
     // If setting active, deactivate others for this phone first
     return await prisma.$transaction(async (tx) => {
@@ -87,7 +107,10 @@ export async function PATCH(req: Request) {
       return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
     }
 
-    const accNum = String(accountNumber);
+    const accNum = String(accountNumber).trim();
+    // Links made before ownership was checked are checked when they are made active.
+    const refusal = await refuseUnlessOwnAccount(String(phoneNumber), accNum);
+    if (refusal) return refusal;
 
     const result = await prisma.$transaction(async (tx) => {
       console.info(`[phone-accounts][PATCH] deactivating others for ${phoneNumber}`);

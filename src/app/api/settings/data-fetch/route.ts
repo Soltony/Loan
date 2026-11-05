@@ -8,6 +8,7 @@ import {
   saveDataFetchSettings,
   validateDataFetchSettings,
 } from '@/lib/data-fetch-settings';
+import { statementDataFreshness } from '@/lib/statement-figures';
 
 /**
  * GET/PUT /api/settings/data-fetch
@@ -22,7 +23,9 @@ export async function GET() {
   if (!hasPermission(user, 'scoring-engine', 'read')) {
     return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
   }
-  return NextResponse.json({ settings: await loadDataFetchSettings(), limits: DATA_FETCH_LIMITS });
+  // How current the statement data is, so a stale ODS shows up here before it shows up in scores.
+  const [settings, freshness] = await Promise.all([loadDataFetchSettings(), statementDataFreshness()]);
+  return NextResponse.json({ settings, limits: DATA_FETCH_LIMITS, freshness });
 }
 
 export async function PUT(req: NextRequest) {

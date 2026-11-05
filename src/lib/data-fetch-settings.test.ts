@@ -23,6 +23,6 @@ describe('validateDataFetchSettings', () => {
   });
 
   it('defaults keep 6 months, a weekly statement refresh and customer info fetched once', () => {
-    expect(DEFAULT_DATA_FETCH_SETTINGS).toMatchObject({ statementMonths: 6, statementRefreshDays: 7, customerInfoRefreshDays: 0 });
+    expect(DEFAULT_DATA_FETCH_SETTINGS).toMatchObject({ statementMonths: 6, statementRefreshDays: 7, customerInfoRefreshDays: 30 });
   });
 });

@@ -21,7 +21,8 @@ import {
   AccordionItem,
   AccordionTrigger,
 } from '@/components/ui/accordion';
-import { PlusCircle, Trash2, Save, History, Loader2 as Loader, Info, GripVertical, Upload, Edit, FileClock, ChevronRight, ChevronLeft, CheckCircle, XCircle, Clock } from 'lucide-react';
+import { PlusCircle, Trash2, Save, History, Loader2 as Loader, Info, GripVertical, Upload, Edit, FileClock, ChevronRight, ChevronLeft, CheckCircle, XCircle, Clock, Eye, RotateCcw } from 'lucide-react';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import type { Rule, ScoringParameter, DataProvisioningConfig, DataColumn, DataProvisioningUpload } from '@/lib/types';
 import {
   AlertDialog,
@@ -198,25 +199,127 @@ const RuleRow = ({ rule, onUpdate, onRemove, color, maxScore, paramFieldInfo, re
 interface CreditScoreEngineClientProps {
     initialProviders: LoanProvider[];
     initialScoringParameters: ScoringParameter[];
+    initialPendingChanges?: PendingScoringChange[];
 }
 
-export function CreditScoreEngineClient({ initialProviders, initialScoringParameters }: CreditScoreEngineClientProps) {
+/** A scoring change awaiting approval (loaded by the page). */
+export interface PendingScoringChange {
+    id: string;
+    providerId: string;
+    createdAt: string;
+    /** Null for a change just submitted from this page. */
+    submittedBy: string | null;
+}
+
+// Rules compared by what they do, ignoring ids: tells an edit from the approved rules.
+const rulesKey = (parameters: ScoringParameter[]) =>
+    JSON.stringify(parameters.map(p => ({
+        name: p.name,
+        weight: Number(p.weight),
+        rules: (p.rules || []).map(r => ({ condition: r.condition, value: String(r.value ?? ''), score: Number(r.score) })),
+    })));
+
+const byProvider = (parameters: ScoringParameter[]) =>
+    parameters.reduce<Record<string, ScoringParameter[]>>((acc, p) => {
+        (acc[p.providerId] ||= []).push(p);
+        return acc;
+    }, {});
+
+// The highest score the rules can give: each parameter's best rule, capped at its weight.
+const highestPossibleScore = (parameters: ScoringParameter[]) =>
+    parameters.reduce((sum, param) => {
+        const best = Math.max(0, ...(param.rules || []).map(r => Number(r.score) || 0));
+        return sum + Math.max(0, Math.min(best, Number(param.weight) || 0));
+    }, 0);
+
+// Attributes it is discriminatory to score on. Still selectable, but flagged in the editor.
+const PROTECTED_FIELDS = new Set(['gender', 'sex', 'nationality', 'maritalstatus', 'religion', 'ethnicity', 'tribe', 'race', 'disability']);
+const isProtectedField = (name: string) => PROTECTED_FIELDS.has(name.toLowerCase().replace(/[^a-z0-9]/g, ''));
+
+const isNumber = (value: string) => value.trim() !== '' && !isNaN(Number(value));
+
+/**
+ * What has to be fixed before the rules can be submitted, read the way evaluateCondition
+ * (lib/utils.ts) reads them: comparisons need a number, a range is "min-max" with the
+ * minimum below the maximum (no negative numbers), equality needs a value, and no rule
+ * may score above its parameter's weight.
+ */
+function draftProblems(parameters: ScoringParameter[], fields: CustomParameterType[]): string[] {
+    const problems: string[] = [];
+    if (parameters.length === 0) problems.push('Add at least one parameter.');
+    const known = new Set(fields.map(f => f.value));
+    const seen = new Set<string>();
+    parameters.forEach((param, index) => {
+        const label = param.name || `Parameter ${index + 1}`;
+        if (!param.name) problems.push(`${label}: choose a field.`);
+        else if (fields.length > 0 && !known.has(param.name)) problems.push(`${label}: this field is no longer available.`);
+        if (param.name && seen.has(param.name.toLowerCase())) problems.push(`${label}: used more than once (it would be counted twice).`);
+        seen.add(param.name.toLowerCase());
+        const weight = Number(param.weight);
+        if (!Number.isInteger(weight) || weight <= 0) problems.push(`${label}: the weight must be a whole number above 0.`);
+        if (!param.rules?.length) problems.push(`${label}: add at least one rule.`);
+        (param.rules || []).forEach((rule, ruleIndex) => {
+            const ruleLabel = `${label}, rule ${ruleIndex + 1}`;
+            const value = String(rule.value ?? '');
+            if (rule.condition === 'between') {
+                const [min = '', max = '', extra] = value.split('-');
+                if (extra !== undefined || !isNumber(min) || !isNumber(max)) problems.push(`${ruleLabel}: enter both ends of the range as numbers.`);
+                else if (Number(min) >= Number(max)) problems.push(`${ruleLabel}: the range minimum must be below its maximum.`);
+            } else if (['>', '<', '>=', '<='].includes(rule.condition) && !isNumber(value)) {
+                problems.push(`${ruleLabel}: "${rule.condition}" needs a number.`);
+            } else if (!value.trim()) {
+                problems.push(`${ruleLabel}: enter a value.`);
+            }
+            const score = Number(rule.score);
+            if (!Number.isInteger(score) || score < 0) problems.push(`${ruleLabel}: the score must be a whole number of 0 or more.`);
+            else if (Number.isInteger(weight) && score > weight) problems.push(`${ruleLabel}: the score cannot be above the weight (${weight}).`);
+        });
+    });
+    return problems;
+}
+
+/** Scored products whose loan amount tiers stop below `maxScore`: borrowers above the top tier get no amount. */
+function tierWarnings(products: LoanProduct[], maxScore: number): string[] {
+    return products.flatMap(product => {
+        const tiers = product.loanAmountTiers || [];
+        if (tiers.length === 0) return [];
+        const top = Math.max(...tiers.map(t => Number(t.toScore)));
+        return maxScore > top
+            ? [`"${product.name}": loan amount tiers end at score ${top}, so borrowers scoring ${top + 1} to ${maxScore} would be declined.`]
+            : [];
+    });
+}
+
+/** A rule as a short phrase: "> 5000", "between 1000 and 5000". */
+const describeRule = (rule: { condition: string; value: string }) => {
+    if (rule.condition === 'between') {
+        const [min = '', max = ''] = String(rule.value ?? '').split('-');
+        return `between ${min} and ${max}`;
+    }
+    return `${rule.condition} ${rule.value}`;
+};
+
+export function CreditScoreEngineClient({ initialProviders, initialScoringParameters, initialPendingChanges = [] }: CreditScoreEngineClientProps) {
     const [providers, setProviders] = useState(initialProviders);
     const [selectedProviderId, setSelectedProviderId] = useState<string>('');
-    
+    const [tab, setTab] = useState('scorecard');
+
     // Global state for all params
     const [allParameters, setAllParameters] = useState<ScoringParameter[]>(initialScoringParameters);
+    // The rules last approved, per provider: what an edit is compared with and sent as `original`.
+    const baseline = useMemo(() => byProvider(initialScoringParameters), [initialScoringParameters]);
+    const [pendingChanges, setPendingChanges] = useState<PendingScoringChange[]>(initialPendingChanges);
     const [allDataConfigs, setAllDataConfigs] = useState<DataProvisioningConfig[]>(initialProviders.flatMap(p => p.dataProvisioningConfigs || []));
-    
+
     const [customParams, setCustomParams] = useState<CustomParameterType[]>([]);
     const [statementMonths, setStatementMonths] = useState(6);
     const [isSaving, setIsSaving] = useState(false);
     const [isHistoryLoading, setIsHistoryLoading] = useState(false);
     const [scoringHistory, setScoringHistory] = useState<ScoringHistoryItem[]>([]);
     const [isApplyDialogOpen, setIsApplyDialogOpen] = useState(false);
-    const [selectedProducts, setSelectedProducts] = useState<Record<string, boolean>>({});
-    const [deletingHistoryId, setDeletingHistoryId] = useState<string | null>(null);
     const [restoringHistoryItem, setRestoringHistoryItem] = useState<ScoringHistoryItem | null>(null);
+    const [viewingHistoryItem, setViewingHistoryItem] = useState<ScoringHistoryItem | null>(null);
+    const [showProblems, setShowProblems] = useState(false);
 
     const { toast } = useToast();
     const { entityActions } = usePermissions();
@@ -248,7 +351,7 @@ export function CreditScoreEngineClient({ initialProviders, initialScoringParame
             if (!historyResponse.ok) throw new Error('Failed to fetch scoring history');
             const historyData = await historyResponse.json();
             setScoringHistory(historyData);
-            
+
             if (!configsResponse.ok) throw new Error('Failed to fetch data configs');
             const configsData = await configsResponse.json();
             setAllDataConfigs(prev => [...prev.filter(c => c.providerId !== selectedProviderId), ...configsData]);
@@ -265,7 +368,7 @@ export function CreditScoreEngineClient({ initialProviders, initialScoringParame
             setSelectedProviderId(providers[0].id);
         }
     }, [providers, selectedProviderId]);
-    
+
     useEffect(() => {
         fetchProviderData();
     }, [selectedProviderId, fetchProviderData]);
@@ -275,7 +378,43 @@ export function CreditScoreEngineClient({ initialProviders, initialScoringParame
     // Memoized filters for the currently selected provider
     const currentParameters = useMemo(() => allParameters.filter(p => p.providerId === selectedProviderId), [allParameters, selectedProviderId]);
     const currentDataConfigs = useMemo(() => allDataConfigs.filter(c => c.providerId === selectedProviderId), [allDataConfigs, selectedProviderId]);
-    
+    const currentProvider = providers.find(p => p.id === selectedProviderId);
+    // Salary advance products take their limit from the salary list, not the score.
+    const scoredProducts = useMemo(() => (currentProvider?.products || []).filter(p => !p.isSalaryAdvance), [currentProvider]);
+    const salaryAdvanceCount = (currentProvider?.products || []).length - scoredProducts.length;
+
+    const approvedParameters = useMemo(() => baseline[selectedProviderId] ?? [], [baseline, selectedProviderId]);
+    const approvedKey = rulesKey(approvedParameters);
+    const isDirty = rulesKey(currentParameters) !== approvedKey;
+    const anyDirty = useMemo(() => {
+        const edited = byProvider(allParameters);
+        const ids = new Set([...Object.keys(edited), ...Object.keys(baseline)]);
+        return [...ids].some(id => rulesKey(edited[id] ?? []) !== rulesKey(baseline[id] ?? []));
+    }, [allParameters, baseline]);
+    const pending = pendingChanges.find(c => c.providerId === selectedProviderId) ?? null;
+    const problems = useMemo(() => draftProblems(currentParameters, customParams), [currentParameters, customParams]);
+    const maxScore = highestPossibleScore(currentParameters);
+    const tierProblems = useMemo(() => tierWarnings(scoredProducts, maxScore), [scoredProducts, maxScore]);
+
+    // Versions are listed newest first; version 1 is the oldest. The newest one holding the
+    // approved rules is the one in effect (every product of the provider is scored with it).
+    const versionOf = (item: ScoringHistoryItem) => scoringHistory.length - scoringHistory.indexOf(item);
+    const currentVersionItem = useMemo(
+        () => scoringHistory.find(item => Array.isArray(item.parameters) && rulesKey(item.parameters) === approvedKey) ?? null,
+        [scoringHistory, approvedKey],
+    );
+
+    // Edits live in this page only: warn before leaving with unsaved changes.
+    useEffect(() => {
+        if (!anyDirty) return;
+        const warn = (e: BeforeUnloadEvent) => {
+            e.preventDefault();
+            e.returnValue = '';
+        };
+        window.addEventListener('beforeunload', warn);
+        return () => window.removeEventListener('beforeunload', warn);
+    }, [anyDirty]);
+
     // Memoized setter function for the current provider
     const setCurrentParameters = (updater: React.SetStateAction<ScoringParameter[]>) => {
         setAllParameters(prevAll => {
@@ -285,7 +424,7 @@ export function CreditScoreEngineClient({ initialProviders, initialScoringParame
             return [...otherProviderParams, ...updated];
         });
     };
-    
+
     const handleAddParameter = () => {
         if (!selectedProviderId) return;
         if (scoringReadOnly) {
@@ -301,17 +440,19 @@ export function CreditScoreEngineClient({ initialProviders, initialScoringParame
         };
         setCurrentParameters(prev => [...prev, newParam]);
     };
-    
+
     const handleUpdateParameter = (paramId: string, field: 'name' | 'weight', value: any) => {
         if (scoringReadOnly) return;
         setCurrentParameters(produce(draft => {
             const param = draft.find(p => p.id === paramId);
             if (param) {
                 (param as any)[field] = value;
+                // The evaluator reads each rule's own field: keep it on the parameter's field.
+                if (field === 'name') (param.rules || []).forEach(rule => { rule.field = value; });
             }
         }));
     };
-    
+
     const handleRemoveParameter = (paramId: string) => {
         if (scoringReadOnly) return;
         setCurrentParameters(prev => prev.filter(p => p.id !== paramId));
@@ -359,13 +500,14 @@ export function CreditScoreEngineClient({ initialProviders, initialScoringParame
         }));
     };
 
-    const totalMaximumScore = useMemo(() => {
-        return currentParameters.reduce((sum, param) => sum + Number(param.weight || 0), 0);
-    }, [currentParameters]);
-
     const handleOpenSaveDialog = () => {
         if (scoringReadOnly) {
             toast({ title: 'Not authorized', description: 'You are not authorized to submit scoring rules for approval.', variant: 'destructive' });
+            return;
+        }
+        if (problems.length > 0) {
+            setShowProblems(true);
+            toast({ title: 'Fix the rules first', description: problems.slice(0, 3).join(' '), variant: 'destructive' });
             return;
         }
         setIsApplyDialogOpen(true);
@@ -380,15 +522,14 @@ export function CreditScoreEngineClient({ initialProviders, initialScoringParame
 
         setIsSaving(true);
         try {
-            const appliedProductIds = Object.keys(selectedProducts).filter(id => selectedProducts[id]);
-            const provider = providers.find(p => p.id === selectedProviderId);
-            const appliedProducts = (provider?.products || []).filter(p => appliedProductIds.includes(p.id));
             const payload = {
-                original: initialScoringParameters.filter(p => p.providerId === selectedProviderId),
-                updated: currentParameters,
-                appliedProductIds: appliedProductIds,
-                provider: provider ? { id: provider.id, name: provider.name } : { id: selectedProviderId, name: '' },
-                appliedProducts: appliedProducts.map(p => ({ id: p.id, name: p.name })),
+                original: approvedParameters,
+                // Every rule reads its parameter's field.
+                updated: currentParameters.map(p => ({ ...p, rules: (p.rules || []).map(r => ({ ...r, field: p.name })) })),
+                // Every product of the provider is scored with its current rules; they are recorded with this version.
+                appliedProductIds: scoredProducts.map(p => p.id),
+                provider: currentProvider ? { id: currentProvider.id, name: currentProvider.name } : { id: selectedProviderId, name: '' },
+                appliedProducts: scoredProducts.map(p => ({ id: p.id, name: p.name })),
             };
             await postPendingChange({
                 entityType: 'ScoringRules',
@@ -396,7 +537,13 @@ export function CreditScoreEngineClient({ initialProviders, initialScoringParame
                 changeType: 'UPDATE',
                 payload: JSON.stringify(payload)
             }, 'Failed to submit changes for approval.');
-            
+
+            setPendingChanges(prev => [
+                ...prev.filter(c => c.providerId !== selectedProviderId),
+                { id: 'submitted', providerId: selectedProviderId, createdAt: new Date().toISOString(), submittedBy: null },
+            ]);
+            setShowProblems(false);
+            setIsApplyDialogOpen(false);
             toast({
                 title: 'Submitted for Approval',
                 description: `Your new scoring configuration has been submitted for review.`,
@@ -409,41 +556,27 @@ export function CreditScoreEngineClient({ initialProviders, initialScoringParame
             });
         } finally {
             setIsSaving(false);
-            setIsApplyDialogOpen(false);
-            setSelectedProducts({});
         }
     }
-    
-    const handleDeleteHistory = async () => {
-        if (!deletingHistoryId) return;
-        if (scoringReadOnly) {
-            toast({ title: 'Not authorized', description: 'You are not authorized to delete scoring history.', variant: 'destructive' });
-            return;
-        }
-
-        try {
-            const response = await fetch(`/api/scoring-history?id=${deletingHistoryId}`, {
-                method: 'DELETE',
-            });
-            if (!response.ok) {
-                throw new Error((await response.json()).error || 'Failed to delete history item.');
-            }
-            setScoringHistory(prev => prev.filter(item => item.id !== deletingHistoryId));
-            toast({ title: 'Success', description: 'History item deleted.' });
-        } catch (error: any) {
-            toast({ title: 'Error', description: error.message, variant: 'destructive' });
-        } finally {
-            setDeletingHistoryId(null);
-        }
-    };
 
     const handleRestoreFromHistory = () => {
         if (!restoringHistoryItem) return;
         try {
             const paramsFromHistory = restoringHistoryItem.parameters;
             if (Array.isArray(paramsFromHistory)) {
-                setCurrentParameters(paramsFromHistory);
-                toast({ title: 'Configuration Loaded', description: 'The historical configuration has been loaded into the editor.' });
+                const stamp = Date.now();
+                const loaded = paramsFromHistory.map((p, i) => {
+                    const id = `param-${stamp}-${i}`;
+                    return {
+                        ...p,
+                        id,
+                        providerId: selectedProviderId,
+                        rules: (p.rules || []).map((r, j) => ({ ...r, id: `rule-${stamp}-${i}-${j}`, parameterId: id, field: p.name })),
+                    };
+                });
+                setCurrentParameters(loaded);
+                setTab('scorecard');
+                toast({ title: 'Configuration Loaded', description: `Version ${versionOf(restoringHistoryItem)} is in the editor. Submit it for approval to use it again.` });
             } else {
                 throw new Error("Invalid history data format.");
             }
@@ -452,6 +585,11 @@ export function CreditScoreEngineClient({ initialProviders, initialScoringParame
         } finally {
             setRestoringHistoryItem(null);
         }
+    };
+
+    const discardEdits = () => {
+        setCurrentParameters(approvedParameters);
+        setShowProblems(false);
     };
 
 
@@ -465,8 +603,6 @@ export function CreditScoreEngineClient({ initialProviders, initialScoringParame
             </div>
         );
     }
-    
-    const currentProvider = providers.find(p => p.id === selectedProviderId);
 
     return (
         <div className="flex-1 space-y-4 p-8 pt-6">
@@ -490,189 +626,264 @@ export function CreditScoreEngineClient({ initialProviders, initialScoringParame
                     </Select>
                 </div>
             </div>
-            
-            <DataProvisioningTab 
-                providerId={selectedProviderId}
-                initialConfigs={currentDataConfigs}
-                onConfigChange={(newConfigs) => {
-                    setAllDataConfigs(prev => [...prev.filter(c => c.providerId !== selectedProviderId), ...newConfigs]);
-                    fetchProviderData();
-                }}
-                allProviderProducts={currentProvider?.products || []}
-            />
 
-            <DataFetchSettingsCard onSettings={(s) => setStatementMonths(s.statementMonths)} />
+            <Tabs value={tab} onValueChange={setTab} className="space-y-4">
+                <TabsList>
+                    <TabsTrigger value="scorecard">
+                        Scorecard
+                        {isDirty && <span className="ml-2 h-2 w-2 rounded-full bg-amber-500" aria-label="Unsaved changes" />}
+                    </TabsTrigger>
+                    <TabsTrigger value="data">Data Sources</TabsTrigger>
+                    <TabsTrigger value="versions">Versions</TabsTrigger>
+                </TabsList>
 
-            <StatementParametersCard months={statementMonths} />
+                <TabsContent value="scorecard" className="space-y-4">
+                    {pending && (
+                        <div className="flex items-start gap-3 rounded-md border border-amber-300 bg-amber-50 p-4 text-sm text-amber-900 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-100">
+                            <Clock className="mt-0.5 h-4 w-4 shrink-0" />
+                            <p>
+                                {pending.submittedBy
+                                    ? `A scoring change submitted by ${pending.submittedBy} on ${format(new Date(pending.createdAt), 'MMMM d, yyyy h:mm a')} is awaiting approval.`
+                                    : 'Your scoring change has been submitted and is awaiting approval.'}
+                                {' '}Another change can be submitted once it is approved or rejected.
+                            </p>
+                        </div>
+                    )}
 
-            <StatementFiguresCard />
+                    {showProblems && problems.length > 0 && (
+                        <div className="rounded-md border border-destructive/50 bg-destructive/10 p-4 text-sm">
+                            <p className="font-medium text-destructive">Fix these before submitting:</p>
+                            <ul className="mt-2 list-disc space-y-1 pl-5">
+                                {problems.map(problem => <li key={problem}>{problem}</li>)}
+                            </ul>
+                        </div>
+                    )}
 
-            <Card>
-                <CardHeader className="flex flex-row items-center justify-between">
-                    <div>
-                        <CardTitle>Parameters & Rules</CardTitle>
-                        <CardDescription>
-                            Define parameters, their weights, and the rules that assign scores.
-                        </CardDescription>
-                    </div>
-                     <Button onClick={handleOpenSaveDialog} style={{ backgroundColor: themeColor }} className="text-white" disabled={isSaving || scoringReadOnly}>
-                        {isSaving ? <Loader className="mr-2 h-4 w-4 animate-spin" /> : <Save className="mr-2 h-4 w-4" />}
-                        Submit for Approval
-                    </Button>
-                </CardHeader>
-                <CardContent>
-                    <Accordion type="multiple" className="w-full space-y-2">
-                        {currentParameters.map((param) => {
-                            const paramFieldInfo = customParams.find(p => p.value === param.name);
-                             return (
-                             <AccordionItem value={param.id} key={param.id} className="border-none">
-                                <Card className="overflow-hidden">
-                                    <div className="flex items-center p-4 bg-muted/50">
-                                        <GripVertical className="h-5 w-5 text-muted-foreground cursor-grab"/>
-                                        <div className="flex-1 grid grid-cols-2 gap-4 items-center ml-4">
-                                            <div className="space-y-1">
-                                                <Label htmlFor={`param-name-${param.id}`}>Parameter</Label>
-                                                <Select value={param.name} onValueChange={(value) => handleUpdateParameter(param.id, 'name', value)}>
-                                                    <SelectTrigger id={`param-name-${param.id}`} className="w-full bg-background shadow-sm focus:ring-2 focus:ring-[--ring-color]" style={{'--ring-color': themeColor} as React.CSSProperties} disabled={scoringReadOnly}>
-                                                        <SelectValue placeholder="Select Parameter Field" />
-                                                    </SelectTrigger>
-                                                    <SelectContent>
-                                                        <SelectGroup>
-                                                            <SelectLabel>Custom Fields</SelectLabel>
-                                                            {customParams.length > 0 ? customParams.map(field => (
-                                                                <SelectItem key={field.value} value={field.value}>{field.label}</SelectItem>
-                                                            )) : <div className="text-xs text-muted-foreground px-2 py-1.5">No custom fields found.</div>}
-                                                        </SelectGroup>
-                                                    </SelectContent>
-                                                </Select>
-                                            </div>
-                                            <div className="space-y-1">
-                                                <Label htmlFor={`param-weight-${param.id}`}>Weight (Max Points)</Label>
-                                                <Input
-                                                    id={`param-weight-${param.id}`}
-                                                    type="number"
-                                                    value={param.weight}
-                                                    onChange={(e) => handleUpdateParameter(param.id, 'weight', parseInt(e.target.value) || 0)}
-                                                    className="w-full bg-background"
-                                                    disabled={scoringReadOnly}
-                                                />
-                                            </div>
-                                        </div>
-                                        <AccordionTrigger className="p-0 hover:no-underline"></AccordionTrigger>
-                                        <Button variant="ghost" size="icon" className="ml-4" onClick={(e) => { e.stopPropagation(); handleRemoveParameter(param.id); }} disabled={scoringReadOnly}>
-                                            <Trash2 className="h-4 w-4 text-destructive" />
+                    <Card>
+                        <CardHeader className="flex flex-row items-center justify-between gap-4">
+                            <div>
+                                <CardTitle>Parameters & Rules</CardTitle>
+                                <CardDescription>
+                                    {currentVersionItem ? `Editing from version ${versionOf(currentVersionItem)}. ` : ''}
+                                    For each parameter, the highest-scoring rule that matches counts, up to the parameter&apos;s weight. A borrower without a value gets no points for that parameter.
+                                </CardDescription>
+                            </div>
+                            <div className="flex items-center gap-2">
+                                {isDirty && (
+                                    <>
+                                        <Badge variant="outline">Unsaved changes</Badge>
+                                        <Button variant="ghost" size="sm" onClick={discardEdits} disabled={isSaving}>
+                                            <RotateCcw className="mr-2 h-4 w-4" /> Discard
                                         </Button>
-                                    </div>
-                                     <AccordionContent className="p-4">
-                                        <div className="space-y-2">
-                                            {(param.rules || []).map(rule => (
-                                                <RuleRow 
-                                                    key={rule.id}
-                                                    rule={rule}
-                                                    onUpdate={(updatedRule) => handleUpdateRule(param.id, rule.id, updatedRule)}
-                                                    onRemove={() => handleRemoveRule(param.id, rule.id)}
-                                                    color={themeColor}
-                                                    maxScore={param.weight}
-                                                    paramFieldInfo={paramFieldInfo}
-                                                    readOnly={scoringReadOnly}
-                                                />
-                                            ))}
-                                            <Button variant="outline" className="w-full mt-2" onClick={() => handleAddRule(param.id)} disabled={scoringReadOnly}>
-                                                <PlusCircle className="mr-2 h-4 w-4" /> Add Rule
+                                    </>
+                                )}
+                                <Button
+                                    onClick={handleOpenSaveDialog}
+                                    style={{ backgroundColor: themeColor }}
+                                    className="text-white"
+                                    disabled={isSaving || scoringReadOnly || !!pending || !isDirty}
+                                    title={pending ? 'A scoring change is already awaiting approval.' : !isDirty ? 'No changes to submit.' : undefined}
+                                >
+                                    {isSaving ? <Loader className="mr-2 h-4 w-4 animate-spin" /> : <Save className="mr-2 h-4 w-4" />}
+                                    Submit for Approval
+                                </Button>
+                            </div>
+                        </CardHeader>
+                        <CardContent>
+                            <Accordion type="multiple" className="w-full space-y-2">
+                                {currentParameters.map((param) => {
+                                    const paramFieldInfo = customParams.find(p => p.value === param.name);
+                                    const ruleCount = (param.rules || []).length;
+                                     return (
+                                     <AccordionItem value={param.id} key={param.id} className="border-none">
+                                        <Card className="overflow-hidden">
+                                            <div className="flex items-center p-4 bg-muted/50">
+                                                <GripVertical className="h-5 w-5 text-muted-foreground cursor-grab"/>
+                                                <div className="flex-1 grid grid-cols-2 gap-4 items-start ml-4">
+                                                    <div className="space-y-1">
+                                                        <Label htmlFor={`param-name-${param.id}`}>Parameter</Label>
+                                                        <Select value={param.name} onValueChange={(value) => handleUpdateParameter(param.id, 'name', value)}>
+                                                            <SelectTrigger id={`param-name-${param.id}`} className="w-full bg-background shadow-sm focus:ring-2 focus:ring-[--ring-color]" style={{'--ring-color': themeColor} as React.CSSProperties} disabled={scoringReadOnly}>
+                                                                <SelectValue placeholder="Select Parameter Field" />
+                                                            </SelectTrigger>
+                                                            <SelectContent>
+                                                                <SelectGroup>
+                                                                    <SelectLabel>Custom Fields</SelectLabel>
+                                                                    {customParams.length > 0 ? customParams.map(field => (
+                                                                        <SelectItem key={field.value} value={field.value}>
+                                                                            {field.label}{isProtectedField(field.value) ? ' (protected attribute)' : ''}
+                                                                        </SelectItem>
+                                                                    )) : <div className="text-xs text-muted-foreground px-2 py-1.5">No custom fields found.</div>}
+                                                                </SelectGroup>
+                                                            </SelectContent>
+                                                        </Select>
+                                                        {param.name && isProtectedField(param.name) && (
+                                                            <p className="text-xs text-amber-700 dark:text-amber-300">
+                                                                Scoring on this attribute can be discriminatory. Check it is allowed before using it.
+                                                            </p>
+                                                        )}
+                                                    </div>
+                                                    <div className="space-y-1">
+                                                        <Label htmlFor={`param-weight-${param.id}`}>Weight (Max Points)</Label>
+                                                        <Input
+                                                            id={`param-weight-${param.id}`}
+                                                            type="number"
+                                                            value={param.weight}
+                                                            onChange={(e) => handleUpdateParameter(param.id, 'weight', parseInt(e.target.value) || 0)}
+                                                            className="w-full bg-background"
+                                                            disabled={scoringReadOnly}
+                                                        />
+                                                        <p className="text-xs text-muted-foreground">
+                                                            {ruleCount} {ruleCount === 1 ? 'rule' : 'rules'} · up to {highestPossibleScore([param])} points
+                                                        </p>
+                                                    </div>
+                                                </div>
+                                                <AccordionTrigger className="p-0 hover:no-underline"></AccordionTrigger>
+                                                <Button variant="ghost" size="icon" className="ml-4" onClick={(e) => { e.stopPropagation(); handleRemoveParameter(param.id); }} disabled={scoringReadOnly}>
+                                                    <Trash2 className="h-4 w-4 text-destructive" />
+                                                </Button>
+                                            </div>
+                                             <AccordionContent className="p-4">
+                                                <div className="space-y-2">
+                                                    {(param.rules || []).map(rule => (
+                                                        <RuleRow
+                                                            key={rule.id}
+                                                            rule={rule}
+                                                            onUpdate={(updatedRule) => handleUpdateRule(param.id, rule.id, updatedRule)}
+                                                            onRemove={() => handleRemoveRule(param.id, rule.id)}
+                                                            color={themeColor}
+                                                            maxScore={param.weight}
+                                                            paramFieldInfo={paramFieldInfo}
+                                                            readOnly={scoringReadOnly}
+                                                        />
+                                                    ))}
+                                                    <Button variant="outline" className="w-full mt-2" onClick={() => handleAddRule(param.id)} disabled={scoringReadOnly}>
+                                                        <PlusCircle className="mr-2 h-4 w-4" /> Add Rule
+                                                    </Button>
+                                                </div>
+                                             </AccordionContent>
+                                        </Card>
+                                     </AccordionItem>
+                                     )
+                                })}
+                            </Accordion>
+                        </CardContent>
+                        <CardFooter className="flex flex-col items-stretch gap-4">
+                            <Button
+                                variant="outline"
+                                className="w-full"
+                                onClick={handleAddParameter}
+                                disabled={scoringReadOnly}
+                            >
+                                <PlusCircle className="mr-2 h-4 w-4" /> Add Parameter
+                            </Button>
+                            <Separator />
+                            <div className="flex justify-end items-baseline gap-4">
+                                <span className="text-sm text-muted-foreground">Highest Possible Score</span>
+                                <span className="text-2xl font-bold">
+                                    {maxScore}
+                                </span>
+                            </div>
+                        </CardFooter>
+                    </Card>
+
+                    <ScorePreview parameters={currentParameters} availableFields={customParams} providerColor={themeColor} />
+                </TabsContent>
+
+                <TabsContent value="data" className="space-y-4">
+                    <DataProvisioningTab
+                        providerId={selectedProviderId}
+                        initialConfigs={currentDataConfigs}
+                        onConfigChange={(newConfigs) => {
+                            setAllDataConfigs(prev => [...prev.filter(c => c.providerId !== selectedProviderId), ...newConfigs]);
+                            fetchProviderData();
+                        }}
+                        allProviderProducts={currentProvider?.products || []}
+                    />
+
+                    <DataFetchSettingsCard onSettings={(s) => setStatementMonths(s.statementMonths)} />
+
+                    <StatementParametersCard months={statementMonths} />
+
+                    <StatementFiguresCard />
+                </TabsContent>
+
+                <TabsContent value="versions" className="space-y-4">
+                    <Card>
+                        <CardHeader>
+                            <CardTitle>Configuration History</CardTitle>
+                            <CardDescription>
+                                Every approved scoring configuration for this provider. All of its products are scored with the version in effect; load an older one into the editor to submit it again.
+                            </CardDescription>
+                        </CardHeader>
+                        <CardContent>
+                            {isHistoryLoading ? <div className="text-center p-8"><Loader className="h-6 w-6 animate-spin mx-auto"/></div> :
+                            scoringHistory.length > 0 ? (
+                                <ul className="space-y-4">
+                                {scoringHistory.map(item => (
+                                    <li key={item.id} className="p-4 border rounded-md flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                                        <div className="space-y-1">
+                                            <p>
+                                                <span className="font-semibold">Version {versionOf(item)}</span>
+                                                <span className="ml-2 text-muted-foreground">{format(new Date(item.savedAt), 'MMMM d, yyyy h:mm a')}</span>
+                                            </p>
+                                            <p className="text-sm text-muted-foreground">
+                                                Recorded for: <span className="font-medium text-foreground">{item.appliedProducts.map(p => p.product.name).join(', ') || 'N/A'}</span>
+                                            </p>
+                                            {item.id === currentVersionItem?.id ? (
+                                                <Badge variant="secondary">In effect for every scored product</Badge>
+                                            ) : (
+                                                <Badge variant="outline">Not in effect</Badge>
+                                            )}
+                                        </div>
+                                        <div className="flex items-center gap-2">
+                                            <Button variant="outline" size="sm" onClick={() => setViewingHistoryItem(item)}>
+                                                <Eye className="mr-2 h-4 w-4" /> View
+                                            </Button>
+                                            <Button variant="outline" size="sm" onClick={() => setRestoringHistoryItem(item)} disabled={scoringReadOnly}>
+                                                <FileClock className="mr-2 h-4 w-4" /> Load into editor
                                             </Button>
                                         </div>
-                                     </AccordionContent>
-                                </Card>
-                             </AccordionItem>
-                             )
-                        })}
-                    </Accordion>
-                </CardContent>
-                <CardFooter className="flex flex-col items-stretch gap-4">
-                    <Button
-                        variant="outline"
-                        className="w-full"
-                        onClick={handleAddParameter}
-                        disabled={scoringReadOnly}
-                    >
-                        <PlusCircle className="mr-2 h-4 w-4" /> Add Parameter
-                    </Button>
-                    <Separator />
-                    <div className="flex justify-end items-baseline gap-4">
-                        <span className="text-sm text-muted-foreground">Total Maximum Score</span>
-                        <span className="text-2xl font-bold">
-                            {totalMaximumScore}
-                        </span>
-                    </div>
-                </CardFooter>
-            </Card>
-
-            <ScorePreview parameters={currentParameters} availableFields={customParams} providerColor={themeColor} />
-            
-             <Card>
-                <CardHeader>
-                    <CardTitle>Configuration History</CardTitle>
-                    <CardDescription>View and manage past scoring configurations for this provider.</CardDescription>
-                </CardHeader>
-                <CardContent>
-                    {isHistoryLoading ? <div className="text-center p-8"><Loader className="h-6 w-6 animate-spin mx-auto"/></div> :
-                    scoringHistory.length > 0 ? (
-                        <ul className="space-y-4">
-                        {scoringHistory.map(item => (
-                            <li key={item.id} className="p-4 border rounded-md flex justify-between items-center">
-                                <div>
-                                    <p className="font-semibold">{format(new Date(item.savedAt), 'MMMM d, yyyy h:mm a')}</p>
-                                    <p className="text-sm text-muted-foreground">Applied to: <span className="font-medium text-foreground">{item.appliedProducts.map(p => p.product.name).join(', ') || 'N/A'}</span></p>
-                                </div>
-                                <div className="flex items-center gap-2">
-                                     <Button variant="outline" size="icon" className="h-8 w-8" onClick={() => setRestoringHistoryItem(item)}>
-                                        <FileClock className="h-4 w-4" />
-                                    </Button>
-                                    <Button variant="ghost" size="icon" className="text-destructive h-8 w-8" onClick={() => setDeletingHistoryId(item.id)}>
-                                        <Trash2 className="h-4 w-4" />
-                                    </Button>
-                                </div>
-                            </li>
-                        ))}
-                        </ul>
-                    ) : <p className="text-sm text-muted-foreground text-center p-8">No history found.</p>
-                    }
-                </CardContent>
-            </Card>
+                                    </li>
+                                ))}
+                                </ul>
+                            ) : <p className="text-sm text-muted-foreground text-center p-8">No history found.</p>
+                            }
+                        </CardContent>
+                    </Card>
+                </TabsContent>
+            </Tabs>
 
             <Dialog open={isApplyDialogOpen} onOpenChange={setIsApplyDialogOpen}>
                 <DialogContent>
                     <DialogHeader>
-                        <DialogTitle>Apply Scoring Rules to Products</DialogTitle>
+                        <DialogTitle>Submit Scoring Rules for Approval</DialogTitle>
                         <DialogDescription>
-                            Select which products will use this new scoring configuration. This will be submitted for approval.
+                            Once approved, these rules replace the current rules of {currentProvider?.name} and every one of its products is scored with them. Highest possible score: {maxScore}.
                         </DialogDescription>
                     </DialogHeader>
-                    <div className="py-4 space-y-2">
-                        <Label>Available Products for {currentProvider?.name}</Label>
-                        {(currentProvider?.products || []).map(product => (
-                            <div key={product.id} className="flex items-center space-x-2">
-                                <Checkbox
-                                    id={`product-${product.id}`}
-                                    checked={selectedProducts[product.id] || false}
-                                    onCheckedChange={(checked) => setSelectedProducts(prev => ({...prev, [product.id]: !!checked}))}
-                                    disabled={scoringReadOnly}
-                                />
-                                <label
-                                    htmlFor={`product-${product.id}`}
-                                    className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70"
-                                >
-                                    {product.name}
-                                </label>
+                    <div className="py-4 space-y-3">
+                        <Label>Products scored with these rules</Label>
+                        {scoredProducts.length > 0 ? (
+                            <ul className="list-disc space-y-1 pl-5 text-sm">
+                                {scoredProducts.map(product => <li key={product.id}>{product.name}</li>)}
+                            </ul>
+                        ) : (
+                            <p className="text-sm text-muted-foreground">This provider has no scored products yet.</p>
+                        )}
+                        {salaryAdvanceCount > 0 && (
+                            <p className="text-xs text-muted-foreground">Salary advance products are not scored; their limit comes from the salary list.</p>
+                        )}
+                        {tierProblems.length > 0 && (
+                            <div className="space-y-1 rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-100">
+                                {tierProblems.map(problem => <p key={problem}>{problem}</p>)}
+                                <p>Extend those products&apos; loan amount tiers so every score gets an amount.</p>
                             </div>
-                        ))}
-                        {(currentProvider?.products || []).length === 0 && (
-                            <p className="text-sm text-muted-foreground">No products available for this provider.</p>
                         )}
                     </div>
                     <DialogFooter className="pt-4">
                         <DialogClose asChild><Button variant="outline">Cancel</Button></DialogClose>
-                        <Button onClick={handleSaveAndApply} style={{backgroundColor: themeColor}} className="text-white" disabled={isSaving || scoringReadOnly || Object.values(selectedProducts).every(v => !v)}>
+                        <Button onClick={handleSaveAndApply} style={{backgroundColor: themeColor}} className="text-white" disabled={isSaving || scoringReadOnly}>
                              {isSaving && <Loader className="mr-2 h-4 w-4 animate-spin" />}
                              Submit for Approval
                         </Button>
@@ -680,27 +891,55 @@ export function CreditScoreEngineClient({ initialProviders, initialScoringParame
                 </DialogContent>
             </Dialog>
 
-            <AlertDialog open={!!deletingHistoryId} onOpenChange={() => setDeletingHistoryId(null)}>
-                <AlertDialogContent>
-                    <AlertDialogHeader>
-                        <AlertDialogTitle>Are you sure?</AlertDialogTitle>
-                        <AlertDialogDescription>
-                            This will permanently delete this configuration history record. This action cannot be undone.
-                        </AlertDialogDescription>
-                    </AlertDialogHeader>
-                    <AlertDialogFooter>
-                        <AlertDialogCancel>Cancel</AlertDialogCancel>
-                        <AlertDialogAction onClick={handleDeleteHistory} className="bg-destructive hover:bg-destructive/90" disabled={scoringReadOnly}>Delete</AlertDialogAction>
-                    </AlertDialogFooter>
-                </AlertDialogContent>
-            </AlertDialog>
-            
+            <Dialog open={!!viewingHistoryItem} onOpenChange={(open) => { if (!open) setViewingHistoryItem(null); }}>
+                <DialogContent className="max-w-2xl">
+                    {viewingHistoryItem && (
+                        <>
+                            <DialogHeader>
+                                <DialogTitle>Version {versionOf(viewingHistoryItem)}</DialogTitle>
+                                <DialogDescription>
+                                    {format(new Date(viewingHistoryItem.savedAt), 'MMMM d, yyyy h:mm a')} · highest possible score {highestPossibleScore(viewingHistoryItem.parameters || [])}
+                                </DialogDescription>
+                            </DialogHeader>
+                            <div className="max-h-[60vh] space-y-4 overflow-y-auto">
+                                {(viewingHistoryItem.parameters || []).map((param, index) => (
+                                    <div key={`${param.name}-${index}`} className="space-y-2">
+                                        <p className="font-medium">
+                                            {param.name || '—'}
+                                            <span className="ml-2 text-sm font-normal text-muted-foreground">weight {param.weight}</span>
+                                        </p>
+                                        <div className="rounded-md border">
+                                            <Table>
+                                                <TableHeader>
+                                                    <TableRow>
+                                                        <TableHead>Rule</TableHead>
+                                                        <TableHead className="text-right">Points</TableHead>
+                                                    </TableRow>
+                                                </TableHeader>
+                                                <TableBody>
+                                                    {(param.rules || []).map((rule, ruleIndex) => (
+                                                        <TableRow key={ruleIndex}>
+                                                            <TableCell>{describeRule(rule)}</TableCell>
+                                                            <TableCell className="text-right tabular-nums">{rule.score}</TableCell>
+                                                        </TableRow>
+                                                    ))}
+                                                </TableBody>
+                                            </Table>
+                                        </div>
+                                    </div>
+                                ))}
+                            </div>
+                        </>
+                    )}
+                </DialogContent>
+            </Dialog>
+
             <AlertDialog open={!!restoringHistoryItem} onOpenChange={() => setRestoringHistoryItem(null)}>
                 <AlertDialogContent>
                     <AlertDialogHeader>
                         <AlertDialogTitle>Load Configuration?</AlertDialogTitle>
                         <AlertDialogDescription>
-                            This will replace your current unsaved configuration in the editor with the selected historical version. Are you sure you want to proceed?
+                            This will replace the rules in the editor with {restoringHistoryItem ? `version ${versionOf(restoringHistoryItem)}` : 'the selected version'}. Nothing changes until it is submitted and approved.
                         </AlertDialogDescription>
                     </AlertDialogHeader>
                     <AlertDialogFooter>

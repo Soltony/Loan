@@ -39,6 +39,25 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Forbidden" }, { status: 403 });
     }
 
+    // Only an account linked to this phone number (checked with the bank when
+    // it was linked) is fetched: its customer info and statement are what
+    // scoring reads for this borrower.
+    const linked = await prisma.phoneAccount.findUnique({
+      where: {
+        phoneNumber_accountNumber: {
+          phoneNumber: String(phoneNumber),
+          accountNumber: String(accountNumber).trim(),
+        },
+      },
+      select: { id: true },
+    });
+    if (!linked) {
+      return NextResponse.json(
+        { error: "Link this account to your phone number first." },
+        { status: 403 }
+      );
+    }
+
     // Deterministic column mapping for ExternalCustomerInfo
     const desiredColumns = [
       {

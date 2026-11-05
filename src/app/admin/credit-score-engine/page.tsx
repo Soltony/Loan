@@ -1,6 +1,6 @@
 
 
-import { CreditScoreEngineClient } from '@/components/admin/credit-score-engine-client';
+import { CreditScoreEngineClient, type PendingScoringChange } from '@/components/admin/credit-score-engine-client';
 import prisma from '@/lib/prisma';
 import type { LoanProvider, ScoringParameter } from '@/lib/types';
 import { getUserFromSession } from '@/lib/user';
@@ -21,11 +21,15 @@ async function getProviders(userId: string): Promise<LoanProvider[]> {
         where: whereClause,
         include: {
             products: {
-                // We need eligibilityUploadId to filter these out of the general uploads list
+                // We need eligibilityUploadId to filter these out of the general uploads list,
+                // and the tiers to warn when they stop below the highest possible score.
                 select: {
                     id: true,
                     name: true,
+                    status: true,
+                    isSalaryAdvance: true,
                     eligibilityUploadId: true,
+                    loanAmountTiers: { select: { fromScore: true, toScore: true } },
                 }
             },
             dataProvisioningConfigs: {
@@ -77,6 +81,21 @@ async function getScoringParameters(providerIds: string[]): Promise<ScoringParam
     return parameters as ScoringParameter[];
 }
 
+// Scoring changes awaiting approval, so the editor can say so instead of letting a second one in.
+async function getPendingScoringChanges(providerIds: string[]): Promise<PendingScoringChange[]> {
+    if (providerIds.length === 0) return [];
+    const changes = await prisma.pendingChange.findMany({
+        where: { entityType: 'ScoringRules', status: 'PENDING', entityId: { in: providerIds } },
+        select: { id: true, entityId: true, createdAt: true, createdBy: { select: { fullName: true } } },
+        orderBy: { createdAt: 'desc' },
+    });
+    return changes.map(change => ({
+        id: change.id,
+        providerId: change.entityId as string,
+        createdAt: change.createdAt.toISOString(),
+        submittedBy: change.createdBy?.fullName ?? null,
+    }));
+}
 
 export default async function CreditScoreEnginePage() {
     await requireServerPermission('scoring-engine');
@@ -89,7 +108,16 @@ export default async function CreditScoreEnginePage() {
 
     const providers = await getProviders(user.id);
     const providerIds = providers.map(p => p.id);
-    const scoringParameters = await getScoringParameters(providerIds);
+    const [scoringParameters, pendingChanges] = await Promise.all([
+        getScoringParameters(providerIds),
+        getPendingScoringChanges(providerIds),
+    ]);
 
-    return <CreditScoreEngineClient initialProviders={providers} initialScoringParameters={scoringParameters} />;
+    return (
+        <CreditScoreEngineClient
+            initialProviders={providers}
+            initialScoringParameters={scoringParameters}
+            initialPendingChanges={pendingChanges}
+        />
+    );
 }

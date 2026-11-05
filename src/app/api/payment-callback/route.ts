@@ -11,6 +11,7 @@ import { getAsOfDate } from "@/lib/date-utils";
 import { ensureInstallmentRollover } from "@/lib/installment-rollover";
 import { createAuditLog } from "@/lib/audit-log";
 import { syncCbsDeletionForBorrower } from "@/actions/cbs-npl";
+import { repaymentBehaviorFor } from "@/lib/credit-history";
 
 // Local alias for repayment behavior values used in the code
 type RepaymentBehavior = "EARLY" | "ON_TIME" | "LATE";
@@ -622,9 +623,13 @@ export async function POST(request: NextRequest) {
             },
             data: { status: "PAID", isActive: false, paidAt: paymentDate },
           });
+          // Scoring reads how each repaid loan was repaid (see credit-history.ts).
           await tx.loan.update({
             where: { id: loanId },
-            data: { repaymentStatus: "Paid" },
+            data: {
+              repaymentStatus: "Paid",
+              repaymentBehavior: repaymentBehaviorFor(paymentDate, loan.dueDate),
+            },
           });
         } else if (isInstallmentFullyPaid) {
           // Mark all merged installments (that were merged INTO this active installment) as Paid
@@ -664,7 +669,10 @@ export async function POST(request: NextRequest) {
           } else {
             await tx.loan.update({
               where: { id: loanId },
-              data: { repaymentStatus: "Paid" },
+              data: {
+                repaymentStatus: "Paid",
+                repaymentBehavior: repaymentBehaviorFor(paymentDate, loan.dueDate),
+              },
             });
           }
         }

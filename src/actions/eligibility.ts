@@ -12,9 +12,12 @@ import { getSalaryEntryForProduct, computeAllowedFromSalary } from '@/lib/salary
 import { evaluateCondition } from '@/lib/utils';
 import { getPhoneNumbersForAccount } from '@/lib/account-utils';
 import { parseStoredPayload } from '@/lib/customer-data-api';
-import { statementScoringData } from '@/lib/statement-figures';
+import { STATEMENT_FIGURE_FIELDS, statementFiguresEnabled, statementScoringData } from '@/lib/statement-figures';
+import { loadStatementParameters } from '@/lib/statement-parameters';
+import { isLoanOverdue, repaymentHistory } from '@/lib/credit-history';
+import { getAsOfDate } from '@/lib/date-utils';
 import type { ScoringParameter as ScoringParameterType } from '@/lib/types';
-import { Loan, LoanProduct, Prisma } from '@prisma/client';
+import { Prisma } from '@prisma/client';
 
 
 // Helper to convert strings to camelCase
@@ -27,7 +30,7 @@ const toCamelCase = (str: string) => {
 async function getBorrowerDataForScoring(
     borrowerId: string, 
     providerId: string, 
-): Promise<Record<string, any>> {
+): Promise<{ data: Record<string, any>; statement: Record<string, any> }> {
 
     // Borrowers are identified by phone number in the mini-app/USSD flows.
     // Some provisioned datasets (e.g., salary lists) may be uploaded keyed by AccountNumber.
@@ -95,8 +98,8 @@ async function getBorrowerDataForScoring(
         }
     }
     // Statement figures live in the customer-info copy (see statement-figures.ts) and only count
-    // for the active account, when recent enough. Until the background fetch stores them, scoring
-    // goes ahead without.
+    // for the active account, when recent enough. checkLoanEligibility will not decide on rules
+    // that need them while they are missing.
     const statementData = activeAccount?.accountNumber
         ? await statementScoringData(provisionedDataEntries.map(e => parseStoredPayload(e.data as string)), activeAccount.accountNumber)
         : {};
@@ -104,76 +107,24 @@ async function getBorrowerDataForScoring(
         if (value != null) combinedData[key] = value;
     }
     
-    // Fetch all previous loans across all phone numbers linked to this account
-    // This ensures credit history is visible even after phone number changes
+    // Loan history across every phone number linked to this account, so it survives a change of
+    // phone number. See credit-history.ts for what counts as on time.
     const previousLoans = await prisma.loan.findMany({
         where: { borrowerId: { in: allPhoneNumbersForAccount } },
-        select: { repaymentBehavior: true },
+        select: { repaymentStatus: true, repaymentBehavior: true, disbursedDate: true },
     });
+    Object.assign(combinedData, repaymentHistory(previousLoans));
 
-    combinedData['totalLoansCount'] = previousLoans.length;
-    combinedData['loansOnTime'] = previousLoans.filter(l => l.repaymentBehavior === 'ON_TIME').length;
-    combinedData['loansLate'] = previousLoans.filter(l => l.repaymentBehavior === 'LATE').length;
-    combinedData['loansEarly'] = previousLoans.filter(l => l.repaymentBehavior === 'EARLY').length;
-    
-    // Fetch the latest Top-5 repayment transactions (combined across loans) and compute counts by category
-    // Check payments across all phone numbers linked to this account for complete history
-    try {
-        const recentPayments = await prisma.payment.findMany({
-            where: { loan: { is: { borrowerId: { in: allPhoneNumbersForAccount } } } },
-            include: { loan: { select: { dueDate: true } } },
-            orderBy: { date: 'desc' },
-            take: 5,
-        });
-
-        const recentCounts = { loansOnTimeTop5: 0, loansLateTop5: 0, loansEarlyTop5: 0 };
-        recentPayments.forEach(p => {
-            try {
-                const { startOfDay, isBefore, isEqual } = require('date-fns');
-                const due = p.loan?.dueDate ? startOfDay(new Date(p.loan.dueDate)) : null;
-                const paid = startOfDay(new Date(p.date));
-                if (due) {
-                    if (isBefore(paid, due)) recentCounts.loansEarlyTop5++;
-                    else if (isEqual(paid, due)) recentCounts.loansOnTimeTop5++;
-                    else recentCounts.loansLateTop5++;
-                }
-            } catch (e) {
-                // ignore malformed dates for a single payment
-            }
-        });
-
-        combinedData['loansOnTimeTop5'] = recentCounts.loansOnTimeTop5;
-        combinedData['loansLateTop5'] = recentCounts.loansLateTop5;
-        combinedData['loansEarlyTop5'] = recentCounts.loansEarlyTop5;
-    } catch (e) {
-        console.error('Failed to fetch recent payments for top-5 scoring:', e);
-        combinedData['loansOnTimeTop5'] = 0;
-        combinedData['loansLateTop5'] = 0;
-        combinedData['loansEarlyTop5'] = 0;
-    }
-    
-    return combinedData;
+    return { data: combinedData, statement: statementData };
 }
 
 
-async function calculateScoreForProvider(
-    borrowerId: string,
-    providerId: string,
-): Promise<number> {
-    
-    const borrowerDataForScoring = await getBorrowerDataForScoring(borrowerId, providerId);
-    
-    const parameters: ScoringParameterType[] = await prisma.scoringParameter.findMany({
-        where: { providerId },
-        include: {
-            rules: true,
-        },
-    });
-    
-    if (parameters.length === 0) {
-        return 0;
-    }
-    
+// The score: per parameter the best matching rule, capped at its weight. Rules on loansOnTime,
+// loansLate and loansEarly read the latest repaid loans (the ...Top5 fields).
+function calculateScore(
+    borrowerDataForScoring: Record<string, any>,
+    parameters: ScoringParameterType[],
+): number {
     let totalScore = 0;
 
     parameters.forEach(param => {
@@ -216,7 +167,13 @@ export async function checkLoanEligibility(borrowerId: string, providerId: strin
       return { isEligible: false, reason: 'Borrower profile not found.', score: 0, maxLoanAmount: 0 };
     }
 
-    if (borrower.status === 'NPL') {
+    // Every phone number linked to this account is the same customer (see account-utils.ts): an NPL
+    // or an overdue loan on any of them blocks borrowing from the others too.
+    const allPhoneNumbersForAccount = await getPhoneNumbersForAccount(borrowerId);
+    const nplOnAccount =
+        borrower.status === 'NPL' ||
+        (await prisma.borrower.count({ where: { id: { in: allPhoneNumbersForAccount }, status: 'NPL' } })) > 0;
+    if (nplOnAccount) {
         return { isEligible: false, reason: 'Your account is currently restricted due to a non-performing loan. Please contact support.', score: 0, maxLoanAmount: 0 };
     }
     
@@ -228,18 +185,22 @@ export async function checkLoanEligibility(borrowerId: string, providerId: strin
         return { isEligible: false, reason: 'Loan product not found.', score: 0, maxLoanAmount: 0 };
     }
     
-    type LoanWithProduct = Loan & { product: LoanProduct };
-    
-    // Get all phone numbers associated with this account to prevent phone number change bypass
-    const allPhoneNumbersForAccount = await getPhoneNumbersForAccount(borrowerId);
-    
-    const allActiveLoans: LoanWithProduct[] = await prisma.loan.findMany({
+    const allActiveLoans = await prisma.loan.findMany({
         where: {
             borrowerId: { in: allPhoneNumbersForAccount },
             repaymentStatus: 'Unpaid'
         },
-        include: { product: true }
+        include: {
+            product: true,
+            installments: { select: { dueDate: true, amount: true, paidAmount: true, status: true } },
+        }
     });
+    type LoanWithProduct = (typeof allActiveLoans)[number];
+
+    const overdueLoan = allActiveLoans.find((loan) => isLoanOverdue(loan, getAsOfDate()));
+    if (overdueLoan) {
+        return { isEligible: false, reason: `Your "${overdueLoan.product.name}" loan is overdue. Please repay it before applying for another loan.`, score: 0, maxLoanAmount: 0 };
+    }
 
     const hasActiveLoanOfSameType = allActiveLoans.some((loan: LoanWithProduct) => loan.productId === productId);
     if (hasActiveLoanOfSameType) {
@@ -251,7 +212,7 @@ export async function checkLoanEligibility(borrowerId: string, providerId: strin
         return { isEligible: false, reason: `This is an exclusive loan product. You must repay your active loans (${otherProductNames}) before applying.`, score: 0, maxLoanAmount: 0 };
     }
     
-    const borrowerDataForScoring = await getBorrowerDataForScoring(borrowerId, providerId);
+    const { data: borrowerDataForScoring, statement: statementForScoring } = await getBorrowerDataForScoring(borrowerId, providerId);
     
     if (product.dataProvisioningEnabled && product.eligibilityFilter) {
         const filter = JSON.parse(product.eligibilityFilter as string);
@@ -295,12 +256,33 @@ export async function checkLoanEligibility(borrowerId: string, providerId: strin
         }
     }
 
-    const scoringParameterCount = await prisma.scoringParameter.count({ where: { providerId } });
-    if (scoringParameterCount === 0) {
+    const scoringParameters: ScoringParameterType[] = await prisma.scoringParameter.findMany({
+        where: { providerId },
+        include: { rules: true },
+    });
+    if (scoringParameters.length === 0) {
         return { isEligible: false, reason: 'This provider has not configured their credit scoring rules.', score: 0, maxLoanAmount: 0 };
     }
 
-    const score = await calculateScoreForProvider(borrowerId, providerId);
+    // No decision without the statement figures the rules use: they are missing or too old until the
+    // background fetch (or the refresh before a loan request) stores them.
+    const statementFields = new Set<string>([
+        ...STATEMENT_FIGURE_FIELDS,
+        ...(await loadStatementParameters()).map(d => d.field),
+    ]);
+    const fieldsFromStatement = scoringParameters
+        .flatMap(p => (p.rules || []).map(r => toCamelCase(r.field)))
+        .filter(f => statementFields.has(f));
+    if (fieldsFromStatement.length > 0) {
+        if (!statementFiguresEnabled()) {
+            return { isEligible: false, reason: 'We cannot check your account activity right now. Please try again later.', score: 0, maxLoanAmount: 0 };
+        }
+        if (fieldsFromStatement.some(f => !(f in statementForScoring))) {
+            return { isEligible: false, reason: 'We are still checking your account activity. Please try again in a few minutes.', score: 0, maxLoanAmount: 0 };
+        }
+    }
+
+    const score = calculateScore(borrowerDataForScoring, scoringParameters);
 
     const applicableTier = await prisma.loanAmountTier.findFirst({
         where: {

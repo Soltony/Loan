@@ -13,6 +13,8 @@ import { loanCreationSchema } from "@/lib/schemas";
 import { checkLoanEligibility } from "@/actions/eligibility";
 import { createAuditLog } from "@/lib/audit-log";
 import { getPhoneNumbersForAccount } from "@/lib/account-utils";
+import { accountBelongsToPhone } from "@/lib/bank-accounts";
+import { syncBorrowerDataForDecision } from "@/lib/borrower-data-sync";
 import {
   MiniAppAuthError,
   requireMiniAppAuthContext,
@@ -381,13 +383,27 @@ export async function POST(req: NextRequest) {
     if (!creditAccount) {
       throw new Error("Select the account the loan should be paid into.");
     }
-    const linkedAccount = await prisma.phoneAccount.findFirst({
-      where: { phoneNumber: data.borrowerId, accountNumber: creditAccount },
-      select: { id: true },
+    // The score comes from the active account (its customer info and
+    // statement), so the loan is paid into that account only, and only when
+    // the bank lists it under this phone number.
+    const activeAccount = await prisma.phoneAccount.findFirst({
+      where: { phoneNumber: data.borrowerId, isActive: true },
+      select: { accountNumber: true },
     });
-    if (!linkedAccount) {
+    if (activeAccount?.accountNumber !== creditAccount) {
       throw new Error(
-        `Account ${creditAccount} is not linked to your phone number.`,
+        "Loans are paid into your selected account. Select this account first, then apply again.",
+      );
+    }
+    const ownership = await accountBelongsToPhone(data.borrowerId, creditAccount);
+    if (ownership === "no") {
+      throw new Error(
+        `Account ${creditAccount} is not registered to your phone number.`,
+      );
+    }
+    if (ownership === "unavailable") {
+      throw new Error(
+        "We could not confirm your account with the bank right now. Please try again shortly.",
       );
     }
 
@@ -411,6 +427,11 @@ export async function POST(req: NextRequest) {
       entity: "LOAN",
       details: logDetails,
     });
+
+    // Statement figures expire and customer info can be due again: refresh
+    // them before deciding. If they are still being fetched after the wait,
+    // the eligibility check answers "still checking" instead of deciding.
+    await syncBorrowerDataForDecision(data.borrowerId, creditAccount);
 
     // The unpaid loans the eligibility check sees. A loan booked by another
     // request after this point means the limit below is out of date.

@@ -11,6 +11,7 @@ import { MiniAppAuthError, requireMiniAppAuthContext } from '@/lib/miniapp-auth'
 import { getAsOfDate } from '@/lib/date-utils';
 import { ensureInstallmentRollover } from '@/lib/installment-rollover';
 import { syncCbsDeletionForBorrower } from '@/actions/cbs-npl';
+import { repaymentBehaviorFor } from '@/lib/credit-history';
 
 const paymentSchema = z.object({
     loanId: z.string(),
@@ -284,7 +285,8 @@ export async function POST(req: NextRequest) {
                     if (nextPayable) {
                         await tx.loanInstallment.update({ where: { id: nextPayable.id }, data: { isActive: true } });
                     } else {
-                        await tx.loan.update({ where: { id: loanId }, data: { repaymentStatus: 'Paid' } });
+                        // Scoring reads how each repaid loan was repaid (see credit-history.ts).
+                        await tx.loan.update({ where: { id: loanId }, data: { repaymentStatus: 'Paid', repaymentBehavior: repaymentBehaviorFor(paymentDate, loan.dueDate) } });
                     }
                 }
 

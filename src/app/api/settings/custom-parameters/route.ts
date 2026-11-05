@@ -37,10 +37,11 @@ export async function GET(req: NextRequest) {
 
         // --- NEW: Add hardcoded behavioral parameters ---
         const behavioralParameters = [
-            { value: 'totalLoansCount', label: 'Total Loans Count', type: 'number', options: [] },
-            { value: 'loansOnTime', label: 'Loans Paid On Time', type: 'number', options: [] },
-            { value: 'loansLate', label: 'Loans Paid Late', type: 'number', options: [] },
-            { value: 'loansEarly', label: 'Loans Paid Early', type: 'number', options: [] },
+            // History fields: see repaymentHistory in lib/credit-history.ts.
+            { value: 'totalLoansCount', label: 'Total Loans Count (reversed loans left out)', type: 'number', options: [] },
+            { value: 'loansOnTime', label: 'Loans Paid On Time (of the last 5 repaid, early included)', type: 'number', options: [] },
+            { value: 'loansLate', label: 'Loans Paid Late (of the last 5 repaid)', type: 'number', options: [] },
+            { value: 'loansEarly', label: 'Loans Paid Early (of the last 5 repaid)', type: 'number', options: [] },
             // Account statement derived metrics
             { value: 'monthsAtEbirr', label: 'Months with eBirr Activity', type: 'number', options: [] },
             { value: 'txCountRelevant', label: 'Relevant Transaction Count', type: 'number', options: [] },

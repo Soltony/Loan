@@ -23,7 +23,8 @@ export const DEFAULT_DATA_FETCH_SETTINGS: DataFetchSettings = {
   statementMonths: 6,
   statementRefreshDays: 7,
   statementMaxAgeDays: 31,
-  customerInfoRefreshDays: 0,
+  // Income, branch and TIN change; kept forever (0) they go stale while scoring keeps using them.
+  customerInfoRefreshDays: 30,
   updatedAt: null,
 };
 

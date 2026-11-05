@@ -1,3 +1,4 @@
+import prisma from './prisma';
 import { parseStoredPayload, storedAccountNumber } from './customer-data-api';
 import { loadCustomerInfoCopies, syncCustomerInfo, type CustomerInfoSyncResult } from './customer-info';
 import {
@@ -55,6 +56,23 @@ export function syncBorrowerData(borrowerId: string, accountNumber: string, conf
   };
   state.running.set(key, sync);
   return sync;
+}
+
+/** How long a loan request waits for the borrower's data before deciding with what it has. */
+export const DECISION_WAIT_MS = 25_000;
+
+/**
+ * Brings the borrower's customer info and statement figures for `accountNumber` up to date before
+ * a loan decision, waiting at most `ms`; anything still fetching carries on in the background. The
+ * decision itself then refuses rather than score without figures its rules need.
+ */
+export async function syncBorrowerDataForDecision(borrowerId: string, accountNumber: string, ms = DECISION_WAIT_MS) {
+  const config = await prisma.dataProvisioningConfig.findFirst({
+    where: { name: 'ExternalCustomerInfo' },
+    select: { id: true },
+  });
+  if (!config) return;
+  await within(syncBorrowerData(borrowerId, accountNumber, config.id).done, ms);
 }
 
 /** What is still fetching data for this borrower's account in this process, if anything. */

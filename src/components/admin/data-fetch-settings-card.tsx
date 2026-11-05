@@ -18,6 +18,16 @@ export type DataFetchSettings = {
   updatedAt?: string | null;
 };
 
+/** How current the statement data is (statementDataFreshness in lib/statement-figures.ts). */
+type StatementFreshness = {
+  newestTransactionDate: string | null; // YYYYMMDD
+  accountsChecked: number;
+  daysOld: number | null;
+  stale: boolean;
+};
+
+const showDate = (ymd: string) => `${ymd.slice(0, 4)}-${ymd.slice(4, 6)}-${ymd.slice(6, 8)}`;
+
 /**
  * How customer data is fetched: months of statement, how often it is fetched again, how old figures
  * may be, and how often customer info is refreshed. Saved straight away (no approval).
@@ -28,6 +38,7 @@ export function DataFetchSettingsCard({ onSettings }: { onSettings?: (settings: 
   const canUpdate = canModule('scoring-engine', 'update');
 
   const [form, setForm] = useState<DataFetchSettings | null>(null);
+  const [freshness, setFreshness] = useState<StatementFreshness | null>(null);
   const [saving, setSaving] = useState(false);
 
   const load = useCallback(async () => {
@@ -36,6 +47,7 @@ export function DataFetchSettingsCard({ onSettings }: { onSettings?: (settings: 
       const data = await res.json();
       if (!res.ok) throw new Error(data?.error || 'Could not load the data settings.');
       setForm(data.settings);
+      setFreshness(data.freshness ?? null);
       onSettings?.(data.settings);
     } catch (e: any) {
       toast({ title: 'Error', description: e.message, variant: 'destructive' });
@@ -121,7 +133,7 @@ export function DataFetchSettingsCard({ onSettings }: { onSettings?: (settings: 
                   <Input id="df-maxage" type="number" min={1} max={365} value={form.statementMaxAgeDays} onChange={(e) => set('statementMaxAgeDays', e.target.value)} disabled={!canUpdate} />
                   <span className="text-sm text-muted-foreground">days</span>
                 </div>
-                <p className="text-xs text-muted-foreground">Older figures are ignored and scoring goes ahead without them. Must be at least the fetch interval.</p>
+                <p className="text-xs text-muted-foreground">Older figures are not used: products scored on them answer &quot;still checking&quot; until they are fetched again. Must be at least the fetch interval.</p>
               </div>
 
               <div className="space-y-2">
@@ -131,8 +143,38 @@ export function DataFetchSettingsCard({ onSettings }: { onSettings?: (settings: 
                   <span className="text-sm text-muted-foreground">days</span>
                 </div>
                 <p className="text-xs text-muted-foreground">0 = fetch once and keep. A new account is always fetched.</p>
+                {Number(form.customerInfoRefreshDays) === 0 && (
+                  <p className="text-xs text-amber-700 dark:text-amber-300">
+                    Customer info is never refreshed: income, branch and TIN stay as first fetched. 30 to 90 days is recommended.
+                  </p>
+                )}
               </div>
             </div>
+
+            {freshness && (
+              <div
+                className={
+                  freshness.stale
+                    ? 'rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-100'
+                    : 'text-sm text-muted-foreground'
+                }
+              >
+                {freshness.newestTransactionDate ? (
+                  <p>
+                    {`Newest transaction in the statements fetched over the last 7 days: ${showDate(freshness.newestTransactionDate)}` +
+                      (freshness.daysOld !== null ? ` (${freshness.daysOld} ${freshness.daysOld === 1 ? 'day' : 'days'} ago)` : '') +
+                      ` - ${freshness.accountsChecked} ${freshness.accountsChecked === 1 ? 'account' : 'accounts'} checked.`}
+                  </p>
+                ) : (
+                  <p>No statements fetched in the last 7 days yet, so how current the bank data is cannot be shown.</p>
+                )}
+                {freshness.stale && (
+                  <p className="mt-1">
+                    Statements look out of date: check that ODS is loading every day. Missing months count as zero in every figure, so scores fall.
+                  </p>
+                )}
+              </div>
+            )}
 
             {canUpdate && (
               <div className="flex items-center gap-3">

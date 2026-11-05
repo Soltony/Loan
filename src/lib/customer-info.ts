@@ -33,12 +33,14 @@ export function loadCustomerInfoCopies(borrowerId: string) {
  *
  * Each borrower has ONE customer-info copy, shared by every provider. Older data can still hold one
  * copy per provider; all of them are rewritten with the same content so scoring never mixes them.
- * `configId` is only used when the borrower has no copy yet.
+ * `configId` is only used when the borrower has no copy yet. `force` fetches again regardless of
+ * the refresh interval (scripts/refresh-customer-info.ts).
  */
 export async function syncCustomerInfo(
   borrowerId: string,
   accountNumber: string,
-  configId: string
+  configId: string,
+  options: { force?: boolean } = {}
 ): Promise<CustomerInfoSyncResult> {
   const copies = await loadCustomerInfoCopies(borrowerId);
   const parsed = copies.map((c) => parseStoredPayload(c.data));
@@ -48,6 +50,7 @@ export async function syncCustomerInfo(
   const { customerInfoRefreshDays } = await loadDataFetchSettings();
   const keepForever = customerInfoRefreshDays === 0;
   if (
+    !options.force &&
     parsed.length > 0 &&
     parsed.every(isThisAccount) &&
     (keepForever || isFetchedWithin(parsed[newest], customerInfoRefreshDays * DAY_MS))

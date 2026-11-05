@@ -1,7 +1,14 @@
 import prisma from './prisma';
 import { fetchAccountStatement, parseStoredPayload, storedAccountNumber } from './customer-data-api';
 import { loadCustomerInfoCopies } from './customer-info';
-import { computeMetrics, normalizeStatementLines, parseAmount, type StatementParameterDefinition } from './statement-utils';
+import {
+  computeMetrics,
+  normalizeStatementLines,
+  parseAmount,
+  statementDay,
+  type StatementLine,
+  type StatementParameterDefinition,
+} from './statement-utils';
 import { definitionsVersion, loadStatementParameters } from './statement-parameters';
 import { loadDataFetchSettings, type DataFetchSettings } from './data-fetch-settings';
 import { runWithFetchSlot } from './fetch-queue';
@@ -14,8 +21,9 @@ import { runWithFetchSlot } from './fetch-queue';
  * transactions themselves stay in the data API's shared store.
  *
  * The first statement fetch of the day can take minutes, so /api/phone-accounts/fetch-customer
- * starts it in the background (see borrower-data-sync.ts) and scoring goes ahead without the
- * figures until they are stored; the dashboard then recalculates the limit.
+ * starts it in the background (see borrower-data-sync.ts). Until the figures are stored, a product
+ * whose rules use them answers "still checking" instead of deciding (see checkLoanEligibility);
+ * the dashboard then recalculates the limit.
  */
 
 export type StatementFigures = ReturnType<typeof computeMetrics> & {
@@ -26,7 +34,21 @@ export type StatementFigures = ReturnType<typeof computeMetrics> & {
   computedAt: string; // ISO time the figures were computed
   odsFetchedAt: string | null; // when the data API read the statement from ODS, if it said
   definitionsVersion?: string; // the statement parameters `custom` was computed with
+  latestTransactionDate?: string | null; // YYYYMMDD of the newest transaction in the statement
 };
+
+/** The built-in figures scoring rules can use; keep in step with statementFiguresForScoring. */
+export const STATEMENT_FIGURE_FIELDS = [
+  'monthsAtEbirr',
+  'txCountRelevant',
+  'billPaymentsCount',
+  'avgMonthlyDeposit',
+  'avgUniqueDepositSources',
+  'avgMonthlyAirtimeCount',
+  'avgMonthlyAirtimeValue',
+  'withdrawalToDepositRatio',
+  'avgBalance',
+] as const;
 
 export type StatementRefreshResult =
   | { ok: true; outcome: 'fresh' | 'saved'; figures: StatementFigures }
@@ -94,7 +116,8 @@ export function statementFiguresForScoring(figures: StatementFigures, includeCus
 /**
  * What scoring may use from the stored figures of `accountNumber`: nothing when there are none or
  * they are older than the Scoring Engine allows, and no statement-parameter values computed under
- * definitions that have changed since. Scoring goes ahead without them until the next refresh.
+ * definitions that have changed since. A product whose rules need what is missing answers "still
+ * checking" until the next refresh (see checkLoanEligibility).
  */
 export async function statementScoringData(
   payloads: Array<Record<string, any> | null>,
@@ -118,6 +141,55 @@ export function figureWindow(months: number, today = new Date()) {
   const firstDay = new Date(today.getFullYear(), today.getMonth() - months, 1);
   const lastDay = new Date(today.getFullYear(), today.getMonth(), 0); // last day of last month
   return { periodStart: ymd(firstDay), periodEnd: ymd(lastDay), asOf: ymd(today) };
+}
+
+/** YYYYMMDD of the newest dated line (booking date, else value date); null when none has a date. */
+export function newestTransactionDay(lines: StatementLine[]): string | null {
+  let newest: number | null = null;
+  for (const line of lines) {
+    const day = statementDay(line.bookDate ?? line.valueDate);
+    if (day !== null && (newest === null || day > newest)) newest = day;
+  }
+  if (newest === null) return null;
+  const d = new Date(newest * DAY_MS);
+  return `${d.getUTCFullYear()}${String(d.getUTCMonth() + 1).padStart(2, '0')}${String(d.getUTCDate()).padStart(2, '0')}`;
+}
+
+/**
+ * ODS loads every day, so across the accounts fetched lately the newest transaction should be a day
+ * or two old. Older than this suggests ODS (or the data API) stopped receiving data, and every
+ * figure would read the missing months as zero.
+ */
+export const STALE_STATEMENT_DAYS = 4;
+
+/**
+ * How current the statement data is: the newest transaction among statements fetched in the last
+ * 7 days. A dormant account says nothing, but the newest across all of them shows the source's
+ * cut-off. Figures computed before latestTransactionDate was recorded are not counted.
+ */
+export async function statementDataFreshness(now = new Date()) {
+  const since = new Date(now.getTime() - 7 * DAY_MS);
+  const rows = await prisma.provisionedData.findMany({
+    where: { uploadId: null, updatedAt: { gte: since }, config: { name: 'ExternalCustomerInfo' } },
+    select: { data: true },
+  });
+  let newest: string | null = null;
+  let accountsChecked = 0;
+  for (const row of rows) {
+    const figures = parseStoredPayload(row.data)?.statementFigures;
+    if (!figures?.latestTransactionDate || !(Date.parse(figures.computedAt) >= since.getTime())) continue;
+    accountsChecked++;
+    if (!newest || figures.latestTransactionDate > newest) newest = figures.latestTransactionDate;
+  }
+  const newestDay = newest ? statementDay(newest) : null;
+  const today = Math.floor(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()) / DAY_MS);
+  const daysOld = newestDay === null ? null : today - newestDay;
+  return {
+    newestTransactionDate: newest,
+    accountsChecked,
+    daysOld,
+    stale: daysOld !== null && daysOld > STALE_STATEMENT_DAYS,
+  };
 }
 
 /**
@@ -208,6 +280,7 @@ async function fetchAndStore(
     computedAt: new Date().toISOString(),
     odsFetchedAt: upstream.odsFetchedAt,
     definitionsVersion: version,
+    latestTransactionDate: newestTransactionDay(lines),
     ...computeMetrics(lines, asOf, parseAmount(info.OpeningBalance), definitions, settings.statementMonths),
   };
 
