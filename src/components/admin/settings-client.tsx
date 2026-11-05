@@ -55,6 +55,7 @@ import { produce } from 'immer';
 import { IconDisplay } from '@/components/icons';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group';
 import { Textarea } from '../ui/textarea';
 import { Skeleton } from '../ui/skeleton';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '../ui/collapsible';
@@ -638,71 +639,98 @@ const ProductSettingsForm = ({ product, providerColor, onDelete, onUpdate }: {
                             A change to this product is waiting for approval. Its settings are locked until a checker approves or rejects it.
                         </p>
                     )}
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                        <div className="flex items-center space-x-2">
-                            <Switch
-                                id={`status-${product.id}`}
-                                checked={product.status === 'Active'}
-                                onCheckedChange={(checked) => handleSwitchChange('status', checked)}
-                                disabled={!canEditProduct || isStatusSaving}
-                                className="data-[state=checked]:bg-[--provider-color]"
-                                style={{'--provider-color': providerColor} as React.CSSProperties}
-                            />
-                            <div>
-                                <Label htmlFor={`status-${product.id}`}>{product.status === 'Active' ? 'Enabled' : 'Disabled'}</Label>
-                                <p className="text-xs text-muted-foreground">Applies immediately, without approval.</p>
+                    <div className="space-y-6">
+                        <section className="grid gap-3 sm:grid-cols-2" aria-label="Availability">
+                            <div className="flex items-start gap-3 rounded-md border p-3">
+                                <Switch
+                                    id={`status-${product.id}`}
+                                    checked={product.status === 'Active'}
+                                    onCheckedChange={(checked) => handleSwitchChange('status', checked)}
+                                    disabled={!canEditProduct || isStatusSaving}
+                                    className="mt-0.5 data-[state=checked]:bg-[--provider-color]"
+                                    style={{'--provider-color': providerColor} as React.CSSProperties}
+                                />
+                                <div>
+                                    <Label htmlFor={`status-${product.id}`}>{product.status === 'Active' ? 'Enabled' : 'Disabled'}</Label>
+                                    <p className="text-xs text-muted-foreground">Borrowers can apply only while enabled. Applies immediately, without approval.</p>
+                                </div>
                             </div>
-                        </div>
-                        <div className="flex items-center space-x-2">
-                            <Switch
-                                id={`allowConcurrentLoans-${product.id}`}
-                                checked={!!formData.allowConcurrentLoans}
-                                onCheckedChange={(checked) => handleSwitchChange('allowConcurrentLoans', Boolean(checked))}
-                                disabled={!canEditFields}
-                                className="data-[state=checked]:bg-[--provider-color]"
-                                style={{'--provider-color': providerColor} as React.CSSProperties}
-                            />
-                            <Label htmlFor={`allowConcurrentLoans-${product.id}`}>Combinable with Other Loans</Label>
-                        </div>
-                        <div className="space-y-2">
-                            <Label htmlFor={`minLoan-${product.id}`}>Min Loan Amount</Label>
-                            <Input
-                                id={`minLoan-${product.id}`}
-                                name="minLoan"
-                                type="number"
-                                value={formData.minLoan ?? ''}
-                                onChange={handleChange}
-                                placeholder="e.g., 500"
-                                disabled={!canEditFields || !!formData.isSalaryAdvance}
-                            />
-                        </div>
-                        <div className="space-y-2">
-                            <Label htmlFor={`maxLoan-${product.id}`}>Max Loan Amount</Label>
-                            <Input
-                                id={`maxLoan-${product.id}`}
-                                name="maxLoan"
-                                type="number"
-                                value={formData.maxLoan ?? ''}
-                                onChange={handleChange}
-                                placeholder="e.g., 2500"
-                                disabled={!canEditFields || !!formData.isSalaryAdvance}
-                            />
-                        </div>
-                        <div className="space-y-2">
-                            <Label htmlFor={`duration-${product.id}`}>Loan Duration (days)</Label>
-                            <Input
-                                id={`duration-${product.id}`}
-                                name="duration"
-                                type="number"
-                                value={formData.duration ?? ''}
-                                onChange={handleChange}
-                                placeholder="e.g., 30"
-                                disabled={!canEditFields}
-                            />
-                        </div>
-                        <div className="space-y-2">
-                            <Label className="">Salary Advance</Label>
-                            <div className="flex items-center gap-2">
+                            <div className="flex items-start gap-3 rounded-md border p-3">
+                                <Switch
+                                    id={`allowConcurrentLoans-${product.id}`}
+                                    checked={!!formData.allowConcurrentLoans}
+                                    onCheckedChange={(checked) => handleSwitchChange('allowConcurrentLoans', Boolean(checked))}
+                                    disabled={!canEditFields}
+                                    className="mt-0.5 data-[state=checked]:bg-[--provider-color]"
+                                    style={{'--provider-color': providerColor} as React.CSSProperties}
+                                />
+                                <div>
+                                    <Label htmlFor={`allowConcurrentLoans-${product.id}`}>Combinable with other loans</Label>
+                                    <p className="text-xs text-muted-foreground">Borrowers may hold this loan alongside loans from other products.</p>
+                                </div>
+                            </div>
+                        </section>
+
+                        <section className="space-y-3">
+                            <h5 className="text-sm font-semibold">Loan terms</h5>
+                            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+                                {!formData.isSalaryAdvance && (
+                                    <>
+                                        <div className="space-y-2">
+                                            <Label htmlFor={`minLoan-${product.id}`}>Min loan amount</Label>
+                                            <Input
+                                                id={`minLoan-${product.id}`}
+                                                name="minLoan"
+                                                type="number"
+                                                min={0}
+                                                value={formData.minLoan ?? ''}
+                                                onChange={handleChange}
+                                                placeholder="e.g., 500"
+                                                disabled={!canEditFields}
+                                            />
+                                        </div>
+                                        <div className="space-y-2">
+                                            <Label htmlFor={`maxLoan-${product.id}`}>Max loan amount</Label>
+                                            <Input
+                                                id={`maxLoan-${product.id}`}
+                                                name="maxLoan"
+                                                type="number"
+                                                min={0}
+                                                value={formData.maxLoan ?? ''}
+                                                onChange={handleChange}
+                                                placeholder="e.g., 2500"
+                                                disabled={!canEditFields}
+                                            />
+                                        </div>
+                                    </>
+                                )}
+                                <div className="space-y-2">
+                                    <Label htmlFor={`duration-${product.id}`}>Loan duration (days)</Label>
+                                    <Input
+                                        id={`duration-${product.id}`}
+                                        name="duration"
+                                        type="number"
+                                        min={1}
+                                        value={formData.duration ?? ''}
+                                        onChange={handleChange}
+                                        placeholder="e.g., 30"
+                                        disabled={!canEditFields}
+                                    />
+                                </div>
+                            </div>
+                            {formData.isSalaryAdvance && (
+                                <p className="text-xs text-muted-foreground">
+                                    A salary advance is sized from the borrower&apos;s salary and the advance percent, so min and max loan amounts don&apos;t apply.
+                                </p>
+                            )}
+                        </section>
+
+                        <section className="space-y-4 rounded-md border p-4">
+                            <div className="flex items-start justify-between gap-4">
+                                <div>
+                                    <Label htmlFor={`isSalaryAdvance-${product.id}`} className="text-sm font-semibold">Salary advance</Label>
+                                    <p className="text-xs text-muted-foreground">Lend a share of the borrower&apos;s salary, repaid in installments.</p>
+                                </div>
                                 <Switch
                                     id={`isSalaryAdvance-${product.id}`}
                                     checked={!!formData.isSalaryAdvance}
@@ -711,100 +739,107 @@ const ProductSettingsForm = ({ product, providerColor, onDelete, onUpdate }: {
                                     className="data-[state=checked]:bg-[--provider-color]"
                                     style={{'--provider-color': providerColor} as React.CSSProperties}
                                 />
-                                <span className="text-sm">Enable salary advance for this product</span>
                             </div>
-                        </div>
-                        {formData.isSalaryAdvance && (
-                          <>
-                            <div className="space-y-2">
-                                <Label htmlFor={`advancePercent-${product.id}`}>Advance Percent</Label>
-                                <Input
-                                    id={`advancePercent-${product.id}`}
-                                    name="advancePercent"
-                                    type="number"
-                                    value={formData.advancePercent ?? ''}
-                                    onChange={handleChange}
-                                    placeholder="e.g., 50"
-                                    disabled={!canEditFields}
-                                />
-                            </div>
-                            <div className="space-y-2">
-                                <Label htmlFor={`installments-${product.id}`}>Installments</Label>
-                                <Input
-                                    id={`installments-${product.id}`}
-                                    name="installments"
-                                    type="number"
-                                    value={formData.installments ?? ''}
-                                    onChange={handleChange}
-                                    placeholder="e.g., 12"
-                                    disabled={!canEditFields}
-                                />
-                            </div>
-                            {formData.installments && Number(formData.installments) > 0 && (
-                              <div className="space-y-2">
-                                <Label>Repayment Interval</Label>
-                                <div className="text-sm text-muted-foreground">Every {Math.floor((Number(formData.duration) || 0) / Number(formData.installments)) || 0} days</div>
-                              </div>
-                            )}
-                            <div className="space-y-4">
-                                <Label>Salary Mapping Upload</Label>
-                                <div className="space-y-3">
-                                    {/* Upload Mode Selector */}
-                                    <div className="flex items-center gap-4 p-3 bg-muted/50 rounded-md">
-                                        <span className="text-sm font-medium">Upload Mode:</span>
-                                        <label className="flex items-center gap-2 cursor-pointer">
-                                            <input 
-                                                type="radio" 
-                                                name={`uploadMode-${product.id}`}
-                                                checked={salaryUploadMode === 'append'} 
-                                                onChange={() => setSalaryUploadMode('append')}
+                            {formData.isSalaryAdvance && (
+                                <div className="space-y-5 border-t pt-4">
+                                    <div className="grid gap-4 sm:grid-cols-3">
+                                        <div className="space-y-2">
+                                            <Label htmlFor={`advancePercent-${product.id}`}>Advance percent</Label>
+                                            <div className="relative">
+                                                <Input
+                                                    id={`advancePercent-${product.id}`}
+                                                    name="advancePercent"
+                                                    type="number"
+                                                    min={1}
+                                                    max={100}
+                                                    value={formData.advancePercent ?? ''}
+                                                    onChange={handleChange}
+                                                    placeholder="e.g., 50"
+                                                    className="pr-8"
+                                                    disabled={!canEditFields}
+                                                />
+                                                <span className="absolute right-3 top-1/2 -translate-y-1/2 text-sm text-muted-foreground">%</span>
+                                            </div>
+                                        </div>
+                                        <div className="space-y-2">
+                                            <Label htmlFor={`installments-${product.id}`}>Installments</Label>
+                                            <Input
+                                                id={`installments-${product.id}`}
+                                                name="installments"
+                                                type="number"
+                                                min={1}
+                                                value={formData.installments ?? ''}
+                                                onChange={handleChange}
+                                                placeholder="e.g., 12"
                                                 disabled={!canEditFields}
-                                                className="h-4 w-4"
                                             />
-                                            <span className="text-sm">Add to existing list</span>
-                                        </label>
-                                        <label className="flex items-center gap-2 cursor-pointer">
-                                            <input 
-                                                type="radio" 
-                                                name={`uploadMode-${product.id}`}
-                                                checked={salaryUploadMode === 'replace'} 
-                                                onChange={() => setSalaryUploadMode('replace')}
-                                                disabled={!canEditFields}
-                                                className="h-4 w-4"
-                                            />
-                                            <span className="text-sm">Replace entire list</span>
-                                        </label>
+                                        </div>
+                                        <div className="space-y-2">
+                                            <Label>Repayment interval</Label>
+                                            <p className="flex h-10 items-center text-sm text-muted-foreground">
+                                                {Number(formData.installments) > 0 && Number(formData.duration) > 0
+                                                    ? `Every ${Math.floor(Number(formData.duration) / Number(formData.installments))} days`
+                                                    : 'Set duration and installments'}
+                                            </p>
+                                        </div>
                                     </div>
-                                    <div className="text-xs text-muted-foreground">
-                                        {salaryUploadMode === 'append' 
-                                            ? '• New entries will be added, existing account numbers will be updated with new salary values'
-                                            : '• Warning: This will remove all existing mappings and replace with the new file'}
-                                    </div>
-                                    <div>
-                                        <Input type="file" accept=".csv,.xlsx" onChange={(e) => handleFileSalaryUpload(e.currentTarget)} disabled={!canEditFields} className="max-w-sm cursor-pointer" />
-                                        <div className="text-sm text-muted-foreground mt-1">A .csv or .xlsx file with an account number column and a salary column.</div>
+
+                                    <div className="space-y-3">
+                                        <div className="flex flex-wrap items-center justify-between gap-2">
+                                            <div>
+                                                <Label>Salary mappings</Label>
+                                                <p className="text-xs text-muted-foreground">
+                                                    {parsedMappings.length.toLocaleString()} account{parsedMappings.length === 1 ? '' : 's'} on the list
+                                                    {'salaryAdvanceMappings' in edits ? ' (changed, not submitted)' : ''}
+                                                </p>
+                                            </div>
+                                            {formData.salaryAdvanceMappings && (
+                                                <Button
+                                                    type="button"
+                                                    variant="outline"
+                                                    size="sm"
+                                                    onClick={() => {
+                                                        setMappingsPage(1);
+                                                        setMappingsSearchQuery('');
+                                                        setIsMappingsDialogOpen(true);
+                                                    }}
+                                                >
+                                                    <Settings2 className="h-4 w-4 mr-2" />
+                                                    Manage Mappings
+                                                </Button>
+                                            )}
+                                        </div>
+                                        <RadioGroup
+                                            value={salaryUploadMode}
+                                            onValueChange={(v) => setSalaryUploadMode(v as 'append' | 'replace')}
+                                            className="flex flex-wrap gap-x-6 gap-y-2"
+                                            disabled={!canEditFields}
+                                            aria-label="Upload mode"
+                                        >
+                                            <div className="flex items-center gap-2">
+                                                <RadioGroupItem value="append" id={`uploadMode-append-${product.id}`} />
+                                                <Label htmlFor={`uploadMode-append-${product.id}`} className="font-normal">Add to existing list</Label>
+                                            </div>
+                                            <div className="flex items-center gap-2">
+                                                <RadioGroupItem value="replace" id={`uploadMode-replace-${product.id}`} />
+                                                <Label htmlFor={`uploadMode-replace-${product.id}`} className="font-normal">Replace entire list</Label>
+                                            </div>
+                                        </RadioGroup>
+                                        <p className={cn('text-xs', salaryUploadMode === 'replace' ? 'text-destructive' : 'text-muted-foreground')}>
+                                            {salaryUploadMode === 'append'
+                                                ? 'New accounts are added; accounts already on the list get the new salary.'
+                                                : 'Every current mapping is removed and replaced by the file.'}
+                                        </p>
+                                        <div>
+                                            <Input type="file" accept=".csv,.xlsx" onChange={(e) => handleFileSalaryUpload(e.currentTarget)} disabled={!canEditFields} className="max-w-sm cursor-pointer" aria-label="Salary mapping file" />
+                                            <p className="mt-1 text-xs text-muted-foreground">A .csv or .xlsx file with an account number column and a salary column.</p>
+                                        </div>
                                     </div>
                                 </div>
-                                {formData.salaryAdvanceMappings && (
-                                    <div className="flex items-center justify-between">
-                                        <div className="text-sm text-muted-foreground">Current mappings: {parsedMappings.length} rows</div>
-                                        <Button 
-                                            type="button" 
-                                            variant="outline" 
-                                            size="sm"
-                                            onClick={() => {
-                                                setMappingsPage(1);
-                                                setMappingsSearchQuery('');
-                                                setIsMappingsDialogOpen(true);
-                                            }}
-                                        >
-                                            <Settings2 className="h-4 w-4 mr-2" />
-                                            Manage Mappings
-                                        </Button>
-                                    </div>
-                                )}
-                            </div>
-
+                            )}
+                        </section>
+                        {formData.isSalaryAdvance && (
+                          <>
                             {/* Salary Mappings Management Dialog */}
                             <UIDialog open={isMappingsDialogOpen} onOpenChange={(open) => {
                                 setIsMappingsDialogOpen(open);
@@ -1403,7 +1438,7 @@ type DailyFeeRule = FeeRule & { calculationBase?: 'principal' | 'compound' };
 
 const FeeInput = ({ label, fee, onChange, isEnabled }: { label: string; fee: FeeRule; onChange: (fee: FeeRule) => void; isEnabled: boolean; }) => {
     return (
-        <div className="flex flex-wrap items-center gap-2">
+        <div className="flex max-w-2xl flex-wrap items-center gap-2">
             <Label className={cn("w-28", !isEnabled && "text-muted-foreground/50")}>{label}</Label>
             <Select value={fee.type} onValueChange={(type: 'fixed' | 'percentage') => onChange({ ...fee, type })} disabled={!isEnabled}>
                 <SelectTrigger className="w-32" disabled={!isEnabled} aria-label={`${label} type`}>
@@ -1446,7 +1481,7 @@ const DailyFeeInput = ({ label, fee, onChange, isEnabled }: { label: string; fee
                 })}
             />
             {isEnabled && fee.type === 'percentage' && (
-                <div className="flex flex-wrap items-center gap-2 sm:pl-[120px]">
+                <div className="flex max-w-2xl flex-wrap items-center gap-2 sm:pl-[120px]">
                     <Label className="w-32 text-sm text-muted-foreground">Calculation Base</Label>
                     <Select value={fee.calculationBase || 'principal'} onValueChange={(base: 'principal' | 'compound') => onChange({ ...fee, calculationBase: base })}>
                         <SelectTrigger className="min-w-[12rem] flex-1" aria-label="Daily fee calculation base">
@@ -1465,61 +1500,80 @@ const DailyFeeInput = ({ label, fee, onChange, isEnabled }: { label: string; fee
 
 const PENALTY_GRID = 'grid grid-cols-2 gap-2 md:grid-cols-[5rem_5rem_minmax(10rem,1fr)_8rem_minmax(6rem,1fr)_2.5rem] md:items-center';
 
+// One grid cell. On wide screens the column header row labels the fields; on
+// a phone that row is hidden, so each field carries its own small label.
+const PenaltyCell = ({ label, children }: { label: string; children: React.ReactNode }) => (
+    <div className="space-y-1 md:space-y-0">
+        <span className="block text-xs text-muted-foreground md:hidden">{label}</span>
+        {children}
+    </div>
+);
+
 const PenaltyRuleRow = ({ rule, onChange, onRemove, isEnabled }: { rule: PenaltyRule, onChange: (rule: PenaltyRule) => void, onRemove: () => void, isEnabled: boolean }) => {
     return (
         <div className={cn(PENALTY_GRID, 'rounded-md border bg-background p-2 md:border-0 md:bg-transparent md:p-0')}>
-            <Input
-                type="number"
-                min={0}
-                value={rule.fromDay ?? ''}
-                onChange={(e) => onChange({...rule, fromDay: e.target.value === '' ? '' : parseInt(e.target.value)})}
-                placeholder="From day"
-                aria-label="From day"
-                disabled={!isEnabled}
-            />
-            <Input
-                type="number"
-                min={0}
-                value={rule.toDay === Infinity ? '' : (rule.toDay ?? '')}
-                onChange={(e) => onChange({...rule, toDay: e.target.value === '' ? null : parseInt(e.target.value)})}
-                placeholder="To day (blank = no end)"
-                aria-label="To day"
-                disabled={!isEnabled}
-            />
-            <Select value={rule.type} onValueChange={(type: 'fixed' | 'percentageOfPrincipal' | 'percentageOfCompound') => onChange({ ...rule, type })} disabled={!isEnabled}>
-                <SelectTrigger disabled={!isEnabled} aria-label="Penalty type">
-                    <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                    <SelectItem value="fixed">Fixed Amount</SelectItem>
-                    <SelectItem value="percentageOfPrincipal">Percentage of Principal</SelectItem>
-                    <SelectItem value="percentageOfCompound">Percentage of Compound</SelectItem>
-                </SelectContent>
-            </Select>
-             <Select value={rule.frequency || 'daily'} onValueChange={(freq: 'daily' | 'one-time') => onChange({ ...rule, frequency: freq })} disabled={!isEnabled}>
-                <SelectTrigger disabled={!isEnabled} aria-label="Penalty frequency">
-                    <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                    <SelectItem value="daily">Daily</SelectItem>
-                    <SelectItem value="one-time">One Time</SelectItem>
-                </SelectContent>
-            </Select>
-             <div className="relative">
+            <PenaltyCell label="From day">
                 <Input
                     type="number"
                     min={0}
-                    step="any"
-                    value={rule.value ?? ''}
-                    onChange={(e) => onChange({ ...rule, value: e.target.value === '' ? '' : Number(e.target.value) })}
-                    placeholder="Value"
-                    aria-label="Penalty value"
-                    className={cn(rule.type !== 'fixed' ? "pr-8" : "")}
+                    value={rule.fromDay ?? ''}
+                    onChange={(e) => onChange({...rule, fromDay: e.target.value === '' ? '' : parseInt(e.target.value)})}
+                    placeholder="From day"
+                    aria-label="From day"
                     disabled={!isEnabled}
                 />
-                 {rule.type !== 'fixed' && <span className={cn("absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground", !isEnabled && "text-muted-foreground/50")}>%</span>}
-            </div>
-             <Button type="button" variant="ghost" size="icon" onClick={onRemove} className="justify-self-end text-destructive" disabled={!isEnabled} aria-label="Remove penalty rule"><Trash2 className="h-4 w-4" /></Button>
+            </PenaltyCell>
+            <PenaltyCell label="To day (blank = no end)">
+                <Input
+                    type="number"
+                    min={0}
+                    value={rule.toDay === Infinity ? '' : (rule.toDay ?? '')}
+                    onChange={(e) => onChange({...rule, toDay: e.target.value === '' ? null : parseInt(e.target.value)})}
+                    placeholder="No end"
+                    aria-label="To day"
+                    disabled={!isEnabled}
+                />
+            </PenaltyCell>
+            <PenaltyCell label="Type">
+                <Select value={rule.type} onValueChange={(type: 'fixed' | 'percentageOfPrincipal' | 'percentageOfCompound') => onChange({ ...rule, type })} disabled={!isEnabled}>
+                    <SelectTrigger disabled={!isEnabled} aria-label="Penalty type">
+                        <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                        <SelectItem value="fixed">Fixed Amount</SelectItem>
+                        <SelectItem value="percentageOfPrincipal">Percentage of Principal</SelectItem>
+                        <SelectItem value="percentageOfCompound">Percentage of Compound</SelectItem>
+                    </SelectContent>
+                </Select>
+            </PenaltyCell>
+            <PenaltyCell label="Frequency">
+                <Select value={rule.frequency || 'daily'} onValueChange={(freq: 'daily' | 'one-time') => onChange({ ...rule, frequency: freq })} disabled={!isEnabled}>
+                    <SelectTrigger disabled={!isEnabled} aria-label="Penalty frequency">
+                        <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                        <SelectItem value="daily">Daily</SelectItem>
+                        <SelectItem value="one-time">One Time</SelectItem>
+                    </SelectContent>
+                </Select>
+            </PenaltyCell>
+            <PenaltyCell label="Value">
+                <div className="relative">
+                    <Input
+                        type="number"
+                        min={0}
+                        step="any"
+                        value={rule.value ?? ''}
+                        onChange={(e) => onChange({ ...rule, value: e.target.value === '' ? '' : Number(e.target.value) })}
+                        placeholder="Value"
+                        aria-label="Penalty value"
+                        className={cn(rule.type !== 'fixed' ? "pr-8" : "")}
+                        disabled={!isEnabled}
+                    />
+                    {rule.type !== 'fixed' && <span className={cn("absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground", !isEnabled && "text-muted-foreground/50")}>%</span>}
+                </div>
+            </PenaltyCell>
+            <Button type="button" variant="ghost" size="icon" onClick={onRemove} className="self-end justify-self-end text-destructive md:self-auto" disabled={!isEnabled} aria-label="Remove penalty rule"><Trash2 className="h-4 w-4" /></Button>
         </div>
     );
 };
@@ -1564,23 +1618,20 @@ function LoanTiersForm({ product, onUpdate, locked }: {
     };
 
     return (
-         <Collapsible open={isOpen} onOpenChange={setIsOpen} className="space-y-2">
-            <Card>
+         <Collapsible open={isOpen} onOpenChange={setIsOpen} className="rounded-md border">
                 <CollapsibleTrigger asChild>
-                    <CardHeader className="cursor-pointer">
-                        <div className="flex items-center justify-between gap-4">
-                            <div>
-                                <CardTitle>Loan Amount Tiers</CardTitle>
-                                <CardDescription>
-                                    Loan amount a borrower can get for each credit-score range. {tiers.length ? `${tiers.length} tier(s) defined.` : 'No tiers defined.'}
-                                </CardDescription>
-                            </div>
-                            <ChevronDown className={cn('h-4 w-4 shrink-0 transition-transform duration-200', isOpen && 'rotate-180')} />
+                    <button type="button" className="flex w-full items-center justify-between gap-4 rounded-md p-4 text-left transition-colors hover:bg-muted/50">
+                        <div>
+                            <div className="text-sm font-medium">Loan Amount Tiers</div>
+                            <p className="text-sm text-muted-foreground">
+                                Loan amount a borrower can get for each credit-score range. {tiers.length ? `${tiers.length} tier(s) defined.` : 'No tiers defined.'}
+                            </p>
                         </div>
-                    </CardHeader>
+                        <ChevronDown className={cn('h-4 w-4 shrink-0 transition-transform duration-200', isOpen && 'rotate-180')} />
+                    </button>
                 </CollapsibleTrigger>
                 <CollapsibleContent>
-                    <CardContent className="space-y-4 pt-0">
+                    <div className="space-y-4 px-4 pb-4">
                          {tiers.map((tier, index) => (
                             <div key={tier.id} className="flex flex-wrap items-center gap-x-4 gap-y-2 p-2 rounded-md bg-muted/50">
                                 <Label htmlFor={`tier-from-${tier.id}`} className="w-20">From Score</Label>
@@ -1620,9 +1671,8 @@ function LoanTiersForm({ product, onUpdate, locked }: {
                          <Button type="button" variant="outline" onClick={handleAddTier} className="w-full" disabled={locked}>
                             <PlusCircle className="mr-2 h-4 w-4" /> Add Tier
                         </Button>
-                    </CardContent>
+                    </div>
                 </CollapsibleContent>
-            </Card>
         </Collapsible>
     );
 }
@@ -2064,7 +2114,8 @@ function TaxTab({ taxConfigs }: { taxConfigs: Tax[] }) {
                     <p className="text-sm text-muted-foreground">No tax is configured, so fees are not taxed.</p>
                 ) : (
                     <div className="overflow-x-auto rounded-md border">
-                        <Table>
+                        {/* Fixed minimum width: on a phone the table scrolls sideways instead of squeezing every cell. */}
+                        <Table className="min-w-[640px]">
                             <TableHeader>
                                 <TableRow>
                                     <TableHead>Name</TableHead>
@@ -2094,7 +2145,7 @@ function TaxTab({ taxConfigs }: { taxConfigs: Tax[] }) {
                                                     <span className="text-sm text-muted-foreground">Nothing (has no effect)</span>
                                                 )}
                                             </TableCell>
-                                            <TableCell className="text-sm">{tax.isInclusive ? 'Inclusive (deducted from principal)' : 'Exclusive'}</TableCell>
+                                            <TableCell className="whitespace-nowrap text-sm">{tax.isInclusive ? 'Inclusive (deducted from principal)' : 'Exclusive'}</TableCell>
                                             <TableCell>
                                                 <Badge variant={isActive ? 'default' : 'secondary'} className={cn(isActive && 'bg-green-600')}>
                                                     {isActive ? 'Active' : status.replace(/_/g, ' ').toLowerCase()}
@@ -2122,10 +2173,7 @@ const readFileAsBase64 = (file: File) => new Promise<string>((resolve, reject) =
     reader.readAsDataURL(file);
 });
 
-function EligibilityTab({ providers, onProductUpdate }: {
-    providers: LoanProvider[],
-    onProductUpdate: (providerId: string, productId: string, update: Partial<LoanProduct>) => void;
-}) {
+function EligibilityTab({ providers }: { providers: LoanProvider[] }) {
     const [viewingUpload, setViewingUpload] = useState<DataProvisioningUpload | null>(null);
 
     if (providers.length === 0) {
@@ -2152,7 +2200,6 @@ function EligibilityTab({ providers, onProductUpdate }: {
                                     key={product.id}
                                     provider={provider}
                                     product={product}
-                                    onProductUpdate={(update) => onProductUpdate(provider.id, product.id, update)}
                                     onView={setViewingUpload}
                                 />
                             ))}
@@ -2171,10 +2218,9 @@ function EligibilityTab({ providers, onProductUpdate }: {
     );
 }
 
-function EligibilityProductCard({ provider, product, onProductUpdate, onView }: {
+function EligibilityProductCard({ provider, product, onView }: {
     provider: LoanProvider;
     product: LoanProduct;
-    onProductUpdate: (update: Partial<LoanProduct>) => void;
     onView: (upload: DataProvisioningUpload) => void;
 }) {
     const { entityActions } = usePermissions();
@@ -2307,17 +2353,25 @@ function EligibilityProductCard({ provider, product, onProductUpdate, onView }: 
         }
     };
 
+    // Deleting goes to a checker; the list stays in force until approved.
     const handleDeleteList = async () => {
         setConfirmDelete(false);
+        if (!currentList) return;
         setBusy('deleting');
         try {
-            const response = await fetch(`/api/settings/products/eligibility-filter?productId=${product.id}`, { method: 'DELETE' });
-            if (!response.ok) {
-                const errorData = await response.json().catch(() => ({}));
-                throw new Error(errorData.error || 'Failed to delete the list.');
-            }
-            onProductUpdate({ eligibilityFilter: null, eligibilityUploadId: null, eligibilityUpload: undefined });
-            toast({ title: 'List deleted', description: `${product.name} is no longer restricted to an allow-list.` });
+            await postPendingChange({
+                entityType: 'EligibilityList',
+                entityId: product.id,
+                changeType: 'DELETE',
+                payload: JSON.stringify({
+                    original: {
+                        name: product.name, providerId: product.providerId, productId: product.id,
+                        fileName: currentList.fileName, rowCount: currentList.rowCount, uploadedAt: currentList.uploadedAt,
+                    },
+                }),
+            }, 'Failed to submit the deletion for approval.');
+            markPending('eligibility', product.id);
+            toast({ title: 'Submitted for Approval', description: `Deleting the list for ${product.name} is waiting for a checker. The list still applies until then.` });
         } catch (error: any) {
             toast({ title: 'Error', description: error.message, variant: 'destructive' });
         } finally {
@@ -2402,7 +2456,7 @@ function EligibilityProductCard({ provider, product, onProductUpdate, onView }: 
                                 disabled={uploadLocked}
                                 className="max-w-sm cursor-pointer"
                             />
-                            {listPending && <p className="text-xs text-muted-foreground">A list for this product is already waiting for approval.</p>}
+                            {listPending && <p className="text-xs text-muted-foreground">A change to this product&apos;s list is waiting for approval.</p>}
                         </div>
 
                         {staged && (
@@ -2437,7 +2491,7 @@ function EligibilityProductCard({ provider, product, onProductUpdate, onView }: 
                             <div className="flex gap-2">
                                 <Button type="button" variant="outline" size="sm" onClick={() => onView(currentList)}>View</Button>
                                 {canDeleteList && (
-                                    <Button type="button" variant="destructive" size="sm" onClick={() => setConfirmDelete(true)} disabled={busy !== null}>
+                                    <Button type="button" variant="destructive" size="sm" onClick={() => setConfirmDelete(true)} disabled={busy !== null || listPending}>
                                         {busy === 'deleting' && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
                                         Delete List
                                     </Button>
@@ -2457,13 +2511,13 @@ function EligibilityProductCard({ provider, product, onProductUpdate, onView }: 
                             <AlertTriangle className="h-5 w-5 text-destructive" /> Delete the eligibility list for {product.name}?
                         </AlertDialogTitle>
                         <AlertDialogDescription>
-                            This takes effect immediately, without approval. With no list, the product is no longer restricted:
-                            every borrower who passes the other checks can apply.
+                            This sends a deletion request to a checker; the list keeps applying until it is approved.
+                            Once approved, the allow-list is switched off and every borrower who passes the other checks can apply.
                         </AlertDialogDescription>
                     </AlertDialogHeader>
                     <AlertDialogFooter>
                         <AlertDialogCancel>Cancel</AlertDialogCancel>
-                        <AlertDialogAction className={buttonVariants({ variant: 'destructive' })} onClick={handleDeleteList}>Delete list</AlertDialogAction>
+                        <AlertDialogAction className={buttonVariants({ variant: 'destructive' })} onClick={handleDeleteList}>Request deletion</AlertDialogAction>
                     </AlertDialogFooter>
                 </AlertDialogContent>
             </AlertDialog>
@@ -2479,7 +2533,7 @@ function LoanCycleTab({ providers }: { providers: LoanProvider[] }) {
         <div className="space-y-4">
             <p className="text-sm text-muted-foreground">
                 Limits how much of their scored loan amount a borrower can take, based on their credit-score grade (rows)
-                and how many qualifying loans they have had (columns). A borrower whose score is below every grade is not limited.
+                and how many qualifying loans they have had (columns). A score below every grade uses the lowest grade.
             </p>
             <Accordion type="multiple" defaultValue={defaultOpenProviders(providers)} className="w-full space-y-4">
                 {providers.map((provider) => (
@@ -2692,12 +2746,12 @@ function LoanCycleForm({ product, providerColor }: {
     }
 
     const statusBadge = loadState === 'loading'
-        ? <Badge variant="secondary">Loading…</Badge>
+        ? <Badge variant="outline" className="text-muted-foreground">Loading…</Badge>
         : loadState === 'error'
             ? <Badge variant="outline" className="border-destructive text-destructive">Couldn&apos;t load</Badge>
             : loanCycleConfig
-                ? <Badge variant={loanCycleConfig.enabled === false ? 'secondary' : 'default'}>{loanCycleConfig.enabled === false ? 'Configured · off' : 'Configured'}</Badge>
-                : <Badge variant="secondary">Not configured</Badge>;
+                ? <Badge variant={loanCycleConfig.enabled === false ? 'outline' : 'default'}>{loanCycleConfig.enabled === false ? 'Configured · off' : 'Configured'}</Badge>
+                : <Badge variant="outline" className="text-muted-foreground">Not configured</Badge>;
 
     return (
          <Collapsible open={isOpen} onOpenChange={setIsOpen}>
@@ -2746,7 +2800,7 @@ function LoanCycleForm({ product, providerColor }: {
 
                 <div>
                     <Label>Cycle ranges</Label>
-                    <p className="text-xs text-muted-foreground">Loan-count bands, lowest first. Counts above the last band use the last band.</p>
+                    <p className="text-xs text-muted-foreground">Loan-count bands, lowest first. A count above the last band uses the last band; one below the first band, or between bands, uses the band below it (or the first).</p>
                     <div className="space-y-2 mt-2">
                         {editingCycleRanges.length === 0 && <div className="text-xs text-muted-foreground">No cycle ranges defined.</div>}
                         {editingCycleRanges.map((r, idx) => (
@@ -2919,7 +2973,7 @@ export function SettingsClient({ initialProviders, initialTaxConfigs, initialPen
                             <LoanCycleTab providers={providers} />
                         </TabsContent>
                         <TabsContent value="eligibility">
-                            <EligibilityTab providers={providers} onProductUpdate={onProductUpdate} />
+                            <EligibilityTab providers={providers} />
                         </TabsContent>
                         <TabsContent value="agreement">
                             <AgreementsTab providers={providers} />

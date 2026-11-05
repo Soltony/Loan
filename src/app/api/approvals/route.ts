@@ -15,6 +15,7 @@ import { calculateTotalRepayable } from "@/lib/loan-calculator";
 import { reverseAllLoanJournalEntries } from "@/lib/loan-ledger-reversal";
 import { syncCbsDeletionForBorrower } from "@/actions/cbs-npl";
 import { isSafeOnlyProductUpdate } from "@/lib/loan-product-changes";
+import { deleteEligibilityList } from "@/lib/eligibility-list";
 import { normalizeFtReference } from "@/lib/repayment-reference";
 import {
   applyStatementParameterChange,
@@ -922,6 +923,20 @@ async function applyChange(
     case "EligibilityList":
       if (changeType === "CREATE") {
         await applyEligibilityList(change, data);
+      } else if (changeType === "DELETE") {
+        const deleted = await deleteEligibilityList(String(entityId));
+        if (!deleted) {
+          throw new Error("This product no longer has an eligibility list to delete.");
+        }
+        await createAuditLog({
+          actorId: context?.actorId ?? change.createdById,
+          action: "ELIGIBILITY_LIST_DELETED",
+          entity: "LoanProduct",
+          entityId: String(entityId),
+          details: { ...deleted, requestedBy: change.createdById, changeId: change.id },
+          ipAddress: context?.ipAddress,
+          userAgent: context?.userAgent,
+        });
       }
       break;
     case "DataProvisioningConfig":

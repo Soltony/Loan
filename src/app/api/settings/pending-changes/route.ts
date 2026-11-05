@@ -124,6 +124,53 @@ function removeSensitiveFields(obj: any) {
   return out;
 }
 
+// Returned when a provider-owned item's provider can't be found (unknown id,
+// missing providerId in the payload, or a provider-linked user creating a
+// provider); provider-linked staff are refused in that case.
+const PROVIDER_UNRESOLVED = Symbol('provider-unresolved');
+
+// Which provider a change touches. null = a bank-wide item (tax, statement
+// parameters, reversals, payments…) that provider scoping doesn't apply to.
+async function resolveOwningProviderId(
+  entityType: string,
+  entityId: string | undefined,
+  changeType: string,
+  payload: any,
+): Promise<string | null | typeof PROVIDER_UNRESOLVED> {
+  const productProvider = async (id: unknown) => {
+    if (!id) return PROVIDER_UNRESOLVED;
+    const row = await prisma.loanProduct.findUnique({ where: { id: String(id) }, select: { providerId: true } });
+    return row?.providerId ?? PROVIDER_UNRESOLVED;
+  };
+  const configProvider = async (id: unknown) => {
+    if (!id) return PROVIDER_UNRESOLVED;
+    const row = await prisma.dataProvisioningConfig.findUnique({ where: { id: String(id) }, select: { providerId: true } });
+    return row?.providerId ?? PROVIDER_UNRESOLVED;
+  };
+  const given = (id: unknown) => (id ? String(id) : PROVIDER_UNRESOLVED);
+
+  switch (entityType) {
+    case 'LoanProvider':
+      return changeType === 'CREATE' ? PROVIDER_UNRESOLVED : given(entityId);
+    case 'LoanProduct':
+      return changeType === 'CREATE' ? given(payload?.created?.providerId) : productProvider(entityId);
+    case 'EligibilityList':
+    case 'LoanCycleConfig':
+      return productProvider(entityId ?? payload?.created?.productId);
+    case 'TermsAndConditions':
+      // Approval publishes the new version for the payload's provider.
+      return given(payload?.updated?.providerId);
+    case 'ScoringRules':
+      return given(entityId); // entityId is the provider id
+    case 'DataProvisioningConfig':
+      return changeType === 'CREATE' ? given(payload?.created?.providerId) : configProvider(entityId);
+    case 'DataProvisioningUpload':
+      return configProvider(payload?.created?.configId ?? entityId);
+    default:
+      return null;
+  }
+}
+
 export async function POST(req: NextRequest) {
   const session = await getSession();
   if (!session?.userId) {
@@ -156,10 +203,26 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ error: 'Not authorized to perform this action' }, { status: 403 });
       }
 
+    const parsedPayload = (() => {
+      try {
+        return JSON.parse(payload);
+      } catch {
+        return null;
+      }
+    })();
+
+    // Staff tied to a provider may only request changes to that provider's
+    // items. Bank-level staff (no provider link) are not limited.
+    if (user.loanProviderId) {
+      const owner = await resolveOwningProviderId(entityType, entityId, changeType, parsedPayload);
+      if (owner === PROVIDER_UNRESOLVED || (owner !== null && owner !== user.loanProviderId)) {
+        return NextResponse.json({ error: 'You can only change items that belong to your provider.' }, { status: 403 });
+      }
+    }
+
     // One open request per Settings item. Two pending edits of the same product
     // are each built from the same "original", so approving one silently undoes
-    // or mixes with the other. Checked before any status change below, so a
-    // refused request leaves the item untouched.
+    // or mixes with the other.
     if (entityId && ONE_PENDING_CHANGE_PER_ENTITY.has(entityType)) {
       const open = await prisma.pendingChange.findFirst({
         where: { entityType, entityId, status: 'PENDING' },
@@ -173,40 +236,13 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // For update/delete requests we change the original entity state to prevent
-    // it from being used while the change is pending. For products we disable
-    // them immediately so they cannot be selected; providers remain PENDING_APPROVAL.
-    if (entityId && (changeType === 'UPDATE' || changeType === 'DELETE')) {
-      if (entityType === 'LoanProvider') {
-        await prisma.loanProvider.update({ where: { id: entityId }, data: { status: 'PENDING_APPROVAL' }});
-      } else if (entityType === 'LoanProduct') {
-        // Safe-only updates (e.g. salary mappings, eligibility) don't change
-        // existing loan terms, so keep the product in its current status while
-        // the change is pending. The maker-checker flow is unchanged.
-        let keepProductStatus = false;
-        if (changeType === 'UPDATE') {
-          try {
-            keepProductStatus = isSafeOnlyProductUpdate(JSON.parse(payload));
-          } catch {
-            keepProductStatus = false;
-          }
-        }
-        if (!keepProductStatus) {
-          await prisma.loanProduct.update({ where: { id: entityId }, data: { status: 'Disabled' }});
-        }
-      } else if (entityType === 'Tax') {
-        await prisma.tax.update({ where: { id: entityId }, data: { status: 'PENDING_APPROVAL' }});
-      }
-      // Scoring rules don't have a status on a single entity, it's a collection.
-    }
-
+    // Every check that can refuse the request runs before the status changes
+    // further down; otherwise a refused request left the product disabled (or
+    // the provider/tax PENDING_APPROVAL) with nothing waiting for approval.
 
     // Statement parameters are checked now (clear errors for the maker) and again on approval.
     if (entityType === 'StatementParameter') {
-      let parsedPayload: any = null;
-      try {
-        parsedPayload = JSON.parse(payload);
-      } catch {
+      if (!parsedPayload) {
         return NextResponse.json({ error: 'Invalid statement parameter.' }, { status: 400 });
       }
       const checked = await checkStatementParameterChange(changeType, entityId, parsedPayload);
@@ -216,10 +252,9 @@ export async function POST(req: NextRequest) {
     }
 
     // Validate embedded file payloads for uploads submitted via pending changes
-    if (entityType === 'DataProvisioningUpload' || entityType === 'EligibilityList') {
+    if ((entityType === 'DataProvisioningUpload' || entityType === 'EligibilityList') && changeType === 'CREATE') {
       try {
-        const parsed = JSON.parse(payload);
-        const created = parsed?.created;
+        const created = parsedPayload?.created;
         const fileContent = created?.fileContent;
         const fileName = created?.fileName;
 
@@ -244,6 +279,37 @@ export async function POST(req: NextRequest) {
         console.error('Invalid file payload for pending change:', err);
         return NextResponse.json({ error: 'File upload failed. Please try again.' }, { status: 400 });
       }
+    }
+
+    // Deleting an eligibility list goes through approval (it used to be an
+    // immediate call); there must be a list to delete.
+    if (entityType === 'EligibilityList' && changeType === 'DELETE') {
+      const product = entityId
+        ? await prisma.loanProduct.findUnique({ where: { id: entityId }, select: { eligibilityUploadId: true } })
+        : null;
+      if (!product?.eligibilityUploadId) {
+        return NextResponse.json({ error: 'This product has no eligibility list to delete.' }, { status: 400 });
+      }
+    }
+
+    // For update/delete requests we change the original entity state to prevent
+    // it from being used while the change is pending. For products we disable
+    // them immediately so they cannot be selected; providers remain PENDING_APPROVAL.
+    if (entityId && (changeType === 'UPDATE' || changeType === 'DELETE')) {
+      if (entityType === 'LoanProvider') {
+        await prisma.loanProvider.update({ where: { id: entityId }, data: { status: 'PENDING_APPROVAL' }});
+      } else if (entityType === 'LoanProduct') {
+        // Safe-only updates (e.g. salary mappings, eligibility) don't change
+        // existing loan terms, so keep the product in its current status while
+        // the change is pending. The maker-checker flow is unchanged.
+        const keepProductStatus = changeType === 'UPDATE' && !!parsedPayload && isSafeOnlyProductUpdate(parsedPayload);
+        if (!keepProductStatus) {
+          await prisma.loanProduct.update({ where: { id: entityId }, data: { status: 'Disabled' }});
+        }
+      } else if (entityType === 'Tax') {
+        await prisma.tax.update({ where: { id: entityId }, data: { status: 'PENDING_APPROVAL' }});
+      }
+      // Scoring rules don't have a status on a single entity, it's a collection.
     }
 
     const sanitizedPayload = sanitizePendingChangePayload(entityType, payload);

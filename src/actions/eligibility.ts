@@ -323,30 +323,32 @@ export async function checkLoanEligibility(borrowerId: string, providerId: strin
                 const grades = typeof cycleConfig.grades === 'string' ? JSON.parse(cycleConfig.grades) as Array<{ label: string; minScore: number; percentages: number[] }> : (cycleConfig.grades as any[]);
                 const ranges = typeof cycleConfig.cycleRanges === 'string' ? JSON.parse(cycleConfig.cycleRanges) as Array<{ label?: string; min: number; max: number }> : (cycleConfig.cycleRanges as any[]);
 
-                // determine which range index the metricCount falls into
+                // Which range the count falls into: the last range starting at or
+                // below it (counts above the last range use the last range).
+                // A count below the first range, or in a gap, used to fall to
+                // the *last* range, the most generous column.
                 let idx = -1;
                 for (let i = 0; i < ranges.length; i++) {
                     const r = ranges[i];
-                    if (typeof r?.min === 'number' && typeof r?.max === 'number') {
-                        if (metricCount >= r.min && metricCount <= r.max) {
-                            idx = i;
-                            break;
-                        }
-                    }
+                    if (typeof r?.min === 'number' && metricCount >= r.min) idx = i;
                 }
-                
-                if (idx === -1 && ranges.length > 0) {
-                    idx = ranges.length - 1;
-                }
+                if (idx === -1 && ranges.length > 0) idx = 0;
 
                 // find matching grade by score - choose highest minScore <= score
                 let matchedGrade = null as null | (typeof grades)[0];
-                const sortedGrades = (grades || []).slice().sort((a, b) => (b?.minScore ?? 0) - (a?.minScore ?? 0));
+                const sortedGrades = (grades || [])
+                    .filter(g => typeof g?.minScore === 'number')
+                    .sort((a, b) => b.minScore - a.minScore);
                 for (const g of sortedGrades) {
-                    if (typeof g?.minScore === 'number' && score >= g.minScore) {
+                    if (score >= g.minScore) {
                         matchedGrade = g;
                         break;
                     }
+                }
+                // Below every grade: use the lowest grade instead of no limit
+                // (this used to leave cyclePercentage at 100%).
+                if (!matchedGrade && sortedGrades.length > 0) {
+                    matchedGrade = sortedGrades[sortedGrades.length - 1];
                 }
 
                 if (matchedGrade && Array.isArray(matchedGrade.percentages)) {

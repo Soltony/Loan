@@ -95,9 +95,10 @@ body {
 }
 
 /* Inter is never loaded (next/font would need network access at build time), so
-   `font-body` resolved to the browser's serif default. Mini-app pages use the phone's own
-   UI font instead; setting it on :root also reaches dialogs, which portal out to <body>. */
-:root:has(.miniapp) {
+   `font-body` resolved to the browser's serif default (Times New Roman). Every page now uses
+   the device's own UI font: the phone's in the mini-app, Segoe UI on staff Windows machines.
+   Setting it on :root also reaches dialogs, which portal out to <body>. */
+:root {
   --font-inter: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans",
     "Noto Sans Ethiopic", "Helvetica Neue", Arial, sans-serif;
 }
