@@ -22,8 +22,9 @@ import { Button, buttonVariants } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Switch } from '@/components/ui/switch';
-import { PlusCircle, Trash2, Loader2, Edit, ChevronDown, Settings2, Save, FilePlus2, Upload, FileClock, Pencil, Link as LinkIcon, ChevronRight, ChevronLeft, Search, X } from 'lucide-react';
-import type { LoanProvider, LoanProduct, FeeRule, PenaltyRule, DataProvisioningConfig, LoanAmountTier, TermsAndConditions, DataColumn, DataProvisioningUpload, Tax, LoanCycleConfig } from '@/lib/types';
+import { PlusCircle, Trash2, Loader2, Edit, ChevronDown, Settings2, Save, Pencil, ChevronRight, ChevronLeft, Search, X, Clock, AlertTriangle, Undo2 } from 'lucide-react';
+import type { LoanProvider, LoanProduct, FeeRule, PenaltyRule, LoanAmountTier, TermsAndConditions, DataProvisioningUpload, Tax, LoanCycleConfig } from '@/lib/types';
+import type { SettingsPendingState } from '@/lib/settings-pending';
 import { AddProviderDialog } from '@/components/loan/add-provider-dialog';
 import { AddProductDialog } from '@/components/loan/add-product-dialog';
 import { cn } from '@/lib/utils';
@@ -58,10 +59,8 @@ import { Textarea } from '../ui/textarea';
 import { Skeleton } from '../ui/skeleton';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '../ui/collapsible';
 import { Badge } from '../ui/badge';
-import { Separator } from '../ui/separator';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../ui/table';
 import { format } from 'date-fns';
-import { Checkbox } from '../ui/checkbox';
 import Link from 'next/link';
 import { usePermissions } from '@/hooks/use-permissions';
 
@@ -78,62 +77,185 @@ const safeParseJson = (data: any, field: string, defaultValue: any) => {
     return data?.[field] ?? defaultValue;
 };
 
-// Sanitize product object for inclusion in pending change payloads
-// Removes large/secret fields (notably eligibility upload fileContent) while
-// keeping useful metadata (id, fileName, status) so diffs remain meaningful.
-const sanitizeProductForPayload = (p: any) => {
-    if (!p) return p;
-    // shallow copy
-    const copy: any = { ...p };
-    if (copy.eligibilityUpload) {
-        const eu = copy.eligibilityUpload;
-        copy.eligibilityUpload = {
-            id: eu.id,
-            fileName: eu.fileName,
-            status: eu.status,
-            uploadedAt: eu.uploadedAt,
-            uploadedBy: eu.uploadedBy,
-        } as any;
-    }
-    // Clear any embedded large data that should not be part of product change diffs
-    if (copy.eligibilityUpload && (copy.eligibilityUpload as any).fileContent) {
-        delete (copy.eligibilityUpload as any).fileContent;
-    }
-    return copy;
-};
-
-const sanitizeProviderForPayload = (prov: any) => {
+// Provider rows as stored: no nested products, configs or terms. A provider
+// payload used to carry every product (salary mappings, icons…), megabytes
+// per approval request.
+const providerScalars = (prov: any) => {
     if (!prov) return prov;
-    const c = { ...prov };
-    if (Array.isArray(c.products)) {
-        c.products = c.products.map((pp: any) => sanitizeProductForPayload(pp));
-    }
-    // avoid including any nested uploads with large content
-    return c;
+    const rest = { ...prov };
+    for (const key of ['products', 'dataProvisioningConfigs', 'termsAndConditions', 'ledgerAccounts']) delete rest[key];
+    return rest;
 };
 
-const ProductSettingsForm = ({ provider, product, providerColor, onSave, onDelete, onUpdate, allDataConfigs }: {
-    provider: LoanProvider;
+// ---------------------------------------------------------------------------
+// Approval payload helpers
+// ---------------------------------------------------------------------------
+
+// Builds { original, updated } holding only the fields that differ, plus
+// id/name/providerId so the approvals list can label the request. Approval
+// applies every field in `updated`, so sending the whole product let unrelated,
+// unsubmitted edits from another tab ride along unseen by the checker.
+// `baseline` is what the form would show for the saved item (defaults to
+// `original`); comparing against it keeps untouched fields out, while the
+// stored value goes into `original` for the checker.
+const buildChangePayload = (
+    context: { id: string; name?: string; providerId?: string },
+    original: Record<string, any>,
+    candidate: Record<string, any>,
+    keys: readonly string[],
+    baseline: Record<string, any> = original,
+) => {
+    const before: Record<string, any> = {};
+    const after: Record<string, any> = {};
+    for (const key of keys) {
+        if (candidate[key] === undefined) continue;
+        if (JSON.stringify(baseline?.[key] ?? null) !== JSON.stringify(candidate[key] ?? null)) {
+            before[key] = original?.[key] ?? null;
+            after[key] = candidate[key];
+        }
+    }
+    const ctx = Object.fromEntries(Object.entries(context).filter(([, v]) => v !== undefined));
+    return {
+        changedKeys: Object.keys(after),
+        payload: { original: { ...ctx, ...before }, updated: { ...ctx, ...after } },
+    };
+};
+
+const toNumberOrNull = (value: unknown): number | null => {
+    if (value === '' || value === null || value === undefined) return null;
+    const n = Number(value);
+    return Number.isFinite(n) ? n : null;
+};
+
+// Excel cells can hold dates, rich text, formulas or hyperlinks. React can't
+// render those objects, and String() turns them into "[object Object]".
+const cellToText = (value: unknown): string => {
+    if (value === null || value === undefined) return '';
+    if (value instanceof Date) return format(value, 'yyyy-MM-dd');
+    if (typeof value === 'object') {
+        const v = value as any;
+        if (Array.isArray(v.richText)) return v.richText.map((part: any) => part.text ?? '').join('');
+        if ('result' in v) return cellToText(v.result);
+        if ('text' in v) return cellToText(v.text);
+        if ('error' in v) return String(v.error);
+        return JSON.stringify(v);
+    }
+    return String(value);
+};
+
+// Minimal CSV line splitter that honours double quotes ("12,000").
+const splitCsvLine = (line: string): string[] => {
+    const out: string[] = [];
+    let current = '';
+    let quoted = false;
+    for (let i = 0; i < line.length; i++) {
+        const ch = line[i];
+        if (ch === '"') {
+            if (quoted && line[i + 1] === '"') { current += '"'; i++; }
+            else quoted = !quoted;
+        } else if (ch === ',' && !quoted) {
+            out.push(current.trim());
+            current = '';
+        } else {
+            current += ch;
+        }
+    }
+    out.push(current.trim());
+    return out;
+};
+
+// ---------------------------------------------------------------------------
+// Pending approvals: loaded on the server, updated as the admin submits.
+// ---------------------------------------------------------------------------
+type PendingKind = keyof SettingsPendingState;
+type PendingApi = {
+    isPending: (kind: PendingKind, id: string | null | undefined) => boolean;
+    markPending: (kind: PendingKind, id: string) => void;
+};
+const PendingContext = React.createContext<PendingApi>({ isPending: () => false, markPending: () => {} });
+const usePending = () => React.useContext(PendingContext);
+
+const PendingBadge = () => (
+    <Badge variant="outline" className="gap-1 border-amber-500 text-amber-700 dark:text-amber-400">
+        <Clock className="h-3 w-3" /> Pending approval
+    </Badge>
+);
+
+// Opens a single provider's accordion straight away; with one provider the
+// extra click on every tab is pure friction.
+const defaultOpenProviders = (providers: LoanProvider[]) => (providers.length === 1 ? [providers[0].id] : []);
+
+// Fields the Providers & Products form submits. Fees, penalties and tiers
+// belong to the Fee tab; eligibility and status have their own flows.
+const PRODUCT_TERM_FIELDS = [
+    'minLoan', 'maxLoan', 'duration', 'allowConcurrentLoans', 'isSalaryAdvance', 'advancePercent',
+    'installments', 'repaymentIntervalDays', 'penaltyPerInstallment', 'salaryAdvanceMappings',
+] as const;
+
+// One shape for both the saved product and the form, so untouched fields
+// compare equal and only real edits reach the approval request.
+const normalizeProductTerms = (p: any) => {
+    const isSalary = !!p.isSalaryAdvance;
+    const duration = toNumberOrNull(p.duration);
+    const installments = isSalary ? toNumberOrNull(p.installments) : null;
+    return {
+        allowConcurrentLoans: !!p.allowConcurrentLoans,
+        isSalaryAdvance: isSalary,
+        duration,
+        minLoan: isSalary ? undefined : toNumberOrNull(p.minLoan),
+        maxLoan: isSalary ? undefined : toNumberOrNull(p.maxLoan),
+        advancePercent: isSalary ? toNumberOrNull(p.advancePercent) : undefined,
+        installments: isSalary ? installments : undefined,
+        repaymentIntervalDays: isSalary && duration && installments ? Math.floor(duration / installments) : undefined,
+        // Per-installment penalties default on when a product becomes a salary
+        // advance; afterwards the Fee tab's switch owns this field.
+        penaltyPerInstallment: isSalary ? true : undefined,
+        salaryAdvanceMappings: isSalary ? (p.salaryAdvanceMappings ?? null) : undefined,
+    };
+};
+
+// Returns a message for the first problem, or null when the terms are valid.
+const validateProductTerms = (t: ReturnType<typeof normalizeProductTerms>): string | null => {
+    if (t.duration === null || !Number.isInteger(t.duration) || t.duration <= 0) {
+        return 'Loan duration must be a whole number of days greater than 0.';
+    }
+    if (!t.isSalaryAdvance) {
+        if (t.minLoan === null || t.minLoan === undefined || t.minLoan < 0) return 'Min loan amount must be 0 or more.';
+        if (t.maxLoan === null || t.maxLoan === undefined || t.maxLoan <= 0) return 'Max loan amount must be greater than 0.';
+        if (t.minLoan > t.maxLoan) return 'Min loan amount cannot be greater than the max loan amount.';
+        return null;
+    }
+    if (t.advancePercent !== null && t.advancePercent !== undefined
+        && (!Number.isInteger(t.advancePercent) || t.advancePercent < 1 || t.advancePercent > 100)) {
+        return 'Advance percent must be a whole number from 1 to 100.';
+    }
+    if (!t.installments || !Number.isInteger(t.installments) || t.installments <= 0) {
+        return 'Salary-advance products need a whole number of installments greater than 0.';
+    }
+    if (t.installments > t.duration) return 'Installments cannot be more than the loan duration in days.';
+    return null;
+};
+
+const ProductSettingsForm = ({ product, providerColor, onDelete, onUpdate }: {
     product: LoanProduct;
     providerColor?: string;
-    onSave: (product: LoanProduct) => void;
     onDelete: () => void;
     onUpdate: (updatedProduct: Partial<LoanProduct>) => void;
-    allDataConfigs: DataProvisioningConfig[];
 }) => {
-    const { currentUser } = useAuth();
     const { entityActions } = usePermissions();
+    const { isPending, markPending } = usePending();
     const [isSaving, setIsSaving] = useState(false);
-    const [isUploading, setIsUploading] = useState(false);
     const [isOpen, setIsOpen] = useState(false);
-    // Keep a snapshot of the original product when the settings collapsible is opened
-    // so we can send correct "original" values for approval payloads even though
-    // edits are applied optimistically to the parent provider state via onUpdate.
-    const originalSnapshotRef = React.useRef<LoanProduct | null>(null);
-    const snapshotProductIdRef = React.useRef<string | null>(null);
+    // Unsubmitted edits live here, not in the shared provider state, so they
+    // can't look saved, leak into another tab's request, or survive "Discard".
+    const [edits, setEdits] = useState<Partial<LoanProduct>>({});
+    const stageEdit = (update: Partial<LoanProduct>) => setEdits(prev => ({ ...prev, ...update }));
+    const hasEdits = Object.keys(edits).length > 0;
+    const [statusToConfirm, setStatusToConfirm] = useState<boolean | null>(null);
+    const [isStatusSaving, setIsStatusSaving] = useState(false);
     const { toast } = useToast();
-    
-    const fileInputRef = React.useRef<HTMLInputElement>(null);
+    const productPending = isPending('products', product.id);
+
     // Upload mode: 'replace' replaces all mappings, 'append' merges with existing
     const [salaryUploadMode, setSalaryUploadMode] = useState<'replace' | 'append'>('append');
     // Salary mappings management dialog state
@@ -146,43 +268,24 @@ const ProductSettingsForm = ({ provider, product, providerColor, onSave, onDelet
     const MAPPINGS_PAGE_SIZE = 10;
 
     const productActions = entityActions('LoanProduct');
-    const eligibilityActions = entityActions('EligibilityList');
-    const canEditProduct = !!(productActions.create || productActions.update);
+    // Submitting a product edit is an UPDATE request, which the server allows
+    // with `update` only; `create` alone used to unlock a form that then 403'd.
+    const canEditProduct = !!productActions.update;
     const canDeleteProduct = !!productActions.delete;
-    const canCreateEligibilityList = !!eligibilityActions.create;
+    // Fields lock while a change waits for approval; the status switch doesn't.
+    const canEditFields = canEditProduct && !productPending;
 
-    const formData = useMemo(() => {
-        return {
-            ...product,
-            serviceFee: safeParseJson(product, 'serviceFee', { type: 'percentage', value: 0 }),
-            dailyFee: safeParseJson(product, 'dailyFee', { type: 'percentage', value: 0, calculationBase: 'principal' }),
-            penaltyRules: safeParseJson(product, 'penaltyRules', []),
-            eligibilityFilter: product.eligibilityFilter,
-            installments: product.installments ?? '',
-            repaymentIntervalDays: product.repaymentIntervalDays ?? undefined,
-        };
-    }, [product]);
-    
+    const formData = useMemo(() => ({
+        ...product,
+        ...edits,
+        // A cleared input stages null; show it empty rather than the saved value.
+        installments: ('installments' in edits ? edits.installments : product.installments) ?? '',
+    }), [product, edits]);
+
     const handleChange = (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => {
         const { name, value } = e.target;
-        onUpdate({ [name]: value === '' ? null : value });
+        stageEdit({ [name]: value === '' ? null : value } as Partial<LoanProduct>);
     };
-
-    // Capture original snapshot when the editor opens so we can later
-    // use the original values when submitting a change request for approval.
-    useEffect(() => {
-        if (!isOpen) {
-            originalSnapshotRef.current = null;
-            snapshotProductIdRef.current = null;
-            return;
-        }
-
-        // Capture snapshot once per open session (or when switching products)
-        if (!snapshotProductIdRef.current || snapshotProductIdRef.current !== product.id) {
-            originalSnapshotRef.current = { ...product } as LoanProduct;
-            snapshotProductIdRef.current = product.id;
-        }
-    }, [isOpen, product]);
 
     const handleSwitchChange = (name: keyof LoanProduct, checked: boolean) => {
         if (!canEditProduct) {
@@ -190,174 +293,123 @@ const ProductSettingsForm = ({ provider, product, providerColor, onSave, onDelet
             return;
         }
         if (name === 'status') {
-            handleStatusChange(checked);
+            // Takes effect at once for borrowers, so confirm first.
+            setStatusToConfirm(checked);
         } else {
-            onUpdate({ [name]: checked });
+            stageEdit({ [name]: checked } as Partial<LoanProduct>);
         }
     }
 
-    const handleFileSalaryUpload = async (file?: File | null) => {
+    const handleFileSalaryUpload = async (input: HTMLInputElement) => {
+        const file = input.files?.[0];
+        // Clear the picker so choosing the same file again still triggers onChange.
+        const reset = () => { input.value = ''; };
         if (!file) return;
-        
-        // Client-side validation: reject unsupported file types and oversized files early
+
         const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB
-        const allowedTypes = [
-            'text/csv',
-            'application/vnd.ms-excel',
-            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-        ];
-        const allowedExtensions = ['csv', 'xlsx', 'xls'];
-        
-        const name = file.name || '';
-        const ext = name.split('.').pop()?.toLowerCase();
-        
-        // Validate file extension
-        if (!ext || !allowedExtensions.includes(ext)) {
-            toast({ 
-                title: 'Invalid file type', 
-                description: 'Only .csv, .xlsx, and .xls files are allowed.', 
-                variant: 'destructive' 
-            });
-            return;
+        const ext = (file.name || '').split('.').pop()?.toLowerCase();
+        // ExcelJS reads .xlsx only; legacy .xls failed with a parser error.
+        if (!ext || !['csv', 'xlsx'].includes(ext)) {
+            toast({ title: 'Invalid file type', description: 'Use a .csv or .xlsx file.', variant: 'destructive' });
+            return reset();
         }
-        
-        // Validate file type (MIME type) - allow if either MIME type matches or extension is valid
-        // Some systems may not report correct MIME types for CSV files
-        if (file.type && !allowedTypes.includes(file.type) && !file.type.includes('sheet') && !file.type.includes('csv')) {
-            toast({ 
-                title: 'Invalid file type', 
-                description: 'Only .csv, .xlsx, and .xls files are allowed.', 
-                variant: 'destructive' 
-            });
-            return;
-        }
-        
-        // Validate file size
         if (file.size > MAX_FILE_SIZE) {
-            toast({ 
-                title: 'File too large', 
-                description: 'Maximum file size is 10MB.', 
-                variant: 'destructive' 
-            });
-            return;
+            toast({ title: 'File too large', description: 'Maximum file size is 10MB.', variant: 'destructive' });
+            return reset();
         }
-        
+
+        const headerKind = (header: string): 'accountNumber' | 'salary' | null => {
+            const norm = header.toLowerCase().replace(/[^a-z0-9]/g, '');
+            if (norm.includes('account') || norm.includes('acct')) return 'accountNumber';
+            if (norm.includes('salary') || norm.includes('amount') || norm.includes('pay')) return 'salary';
+            return null;
+        };
+
         try {
-            let mappings: Array<any> = [];
-            if (ext === 'xlsx' || ext === 'xls' || (file.type && file.type.includes('sheet'))) {
-                // parse with ExcelJS
-                const buffer = await file.arrayBuffer();
+            // Raw [account, salary] text pairs, header row excluded.
+            const rows: Array<[string, string]> = [];
+            if (ext === 'xlsx') {
                 const workbook = new ExcelJS.Workbook();
-                await workbook.xlsx.load(buffer);
+                await workbook.xlsx.load(await file.arrayBuffer());
                 const sheet = workbook.worksheets[0];
-                if (sheet) {
-                    const headerRow = sheet.getRow(1).values as any[];
-                    const rawHeaders = (headerRow || []).slice(1).map((h: any) => String(h || '').trim());
-                    const canonicalHeaders = rawHeaders.map(h => {
-                        const norm = String(h || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-                        if (norm.includes('account') || norm.includes('acct')) return 'accountNumber';
-                        if (norm.includes('salary') || norm.includes('amount') || norm.includes('pay')) return 'salary';
-                        return norm || h;
-                    });
-                    for (let i = 2; i <= sheet.rowCount; i++) {
-                        const row = sheet.getRow(i).values as any[];
-                        if (!row || row.length <= 1) continue;
-                        const data: any = {};
-                        canonicalHeaders.forEach((h: string, idx: number) => {
-                          data[h] = row[idx + 1] ?? '';
-                        });
-                        mappings.push({
-                            accountNumber: String(data.accountNumber || '').trim(),
-                            salary: Number(data.salary || 0)
-                        });
-                    }
+                if (!sheet) throw new Error('The workbook has no sheets.');
+                let accountCol = 0;
+                let salaryCol = 0;
+                sheet.getRow(1).eachCell((cell, col) => {
+                    const kind = headerKind(cell.text || '');
+                    if (kind === 'accountNumber' && !accountCol) accountCol = col;
+                    if (kind === 'salary' && !salaryCol) salaryCol = col;
+                });
+                if (!accountCol || !salaryCol) throw new Error('The first row needs an account number column and a salary column.');
+                for (let r = 2; r <= sheet.rowCount; r++) {
+                    const row = sheet.getRow(r);
+                    // cell.text keeps the displayed digits instead of objects or float noise.
+                    rows.push([row.getCell(accountCol).text, row.getCell(salaryCol).text]);
                 }
             } else {
-                const text = await file.text();
-                const lines = text.split(/\r?\n/).filter(l => l.trim() !== '');
-                if (lines.length) {
-                    const raw = lines[0].split(',').map(h => h.trim());
-                    const headers = raw.map(h => {
-                        const norm = h.toLowerCase().replace(/[^a-z0-9]/g, '');
-                        if (norm.includes('account') || norm.includes('acct')) return 'accountNumber';
-                        if (norm.includes('salary') || norm.includes('amount') || norm.includes('pay')) return 'salary';
-                        return h;
-                    });
-                    const rows = lines.slice(1).map(line => {
-                        const cols = line.split(',');
-                        const obj: any = {};
-                        headers.forEach((h, i) => obj[h] = cols[i] ? cols[i].trim() : '');
-                        return obj;
-                    });
-                    mappings = rows.map((r: any) => ({
-                        accountNumber: String(r.accountNumber || '').trim(),
-                        salary: Number(r.salary || 0)
-                    })).filter((r: any) => r.accountNumber);
+                const lines = (await file.text()).split(/\r?\n/).filter(l => l.trim() !== '');
+                const headers = lines.length ? splitCsvLine(lines[0]) : [];
+                const accountCol = headers.findIndex(h => headerKind(h) === 'accountNumber');
+                const salaryCol = headers.findIndex(h => headerKind(h) === 'salary');
+                if (accountCol < 0 || salaryCol < 0) throw new Error('The header row needs an account number column and a salary column.');
+                for (const line of lines.slice(1)) {
+                    const cols = splitCsvLine(line);
+                    rows.push([cols[accountCol] ?? '', cols[salaryCol] ?? '']);
                 }
             }
 
-            mappings = mappings.filter((m: any) => m.accountNumber);
-            
+            let skipped = 0;
+            const mappings: Array<{ accountNumber: string; salary: number }> = [];
+            for (const [accountText, salaryText] of rows) {
+                const accountNumber = String(accountText || '').trim();
+                if (!accountNumber) continue; // blank row
+                const salary = Number(String(salaryText || '').replace(/,/g, '').trim());
+                if (!Number.isFinite(salary) || salary <= 0) { skipped++; continue; }
+                mappings.push({ accountNumber, salary });
+            }
+
             if (mappings.length === 0) {
-                toast({ 
-                    title: 'No valid data found', 
-                    description: 'The file must contain at least one row with an account number.', 
-                    variant: 'destructive' 
+                toast({
+                    title: 'No valid rows found',
+                    description: skipped
+                        ? `${skipped} row(s) had a missing or invalid salary.`
+                        : 'The file must contain at least one row with an account number and a salary.',
+                    variant: 'destructive',
                 });
-                return;
+                return reset();
             }
+            const skippedNote = skipped ? ` Skipped ${skipped} row(s) with a missing or invalid salary.` : '';
 
-            // Handle append mode - merge with existing mappings
-            let finalMappings = mappings;
-            if (salaryUploadMode === 'append' && formData.salaryAdvanceMappings) {
-                try {
-                    const existingMappings = JSON.parse(formData.salaryAdvanceMappings as string) as Array<{ accountNumber: string; salary: number }>;
-                    // Create a map of existing entries for efficient lookup
-                    const existingMap = new Map(existingMappings.map(m => [String(m.accountNumber), m]));
-                    
-                    // Add or update with new mappings
-                    let addedCount = 0;
-                    let updatedCount = 0;
-                    for (const newMapping of mappings) {
-                        const accountKey = String(newMapping.accountNumber);
-                        if (existingMap.has(accountKey)) {
-                            // Update existing entry
-                            existingMap.set(accountKey, newMapping);
-                            updatedCount++;
-                        } else {
-                            // Add new entry
-                            existingMap.set(accountKey, newMapping);
-                            addedCount++;
-                        }
-                    }
-                    
-                    finalMappings = Array.from(existingMap.values());
-                    
-                    onUpdate({ salaryAdvanceMappings: JSON.stringify(finalMappings) });
-                    toast({ 
-                        title: 'Mappings updated', 
-                        description: `Added ${addedCount} new mapping${addedCount !== 1 ? 's' : ''}, updated ${updatedCount} existing mapping${updatedCount !== 1 ? 's' : ''}. Total: ${finalMappings.length} mappings.` 
-                    });
-                    return;
-                } catch (e) {
-                    console.error('Failed to parse existing mappings for append', e);
-                    // Fall back to replace mode if parsing fails
+            if (salaryUploadMode === 'append') {
+                const merged = new Map(parsedMappings.map(m => [String(m.accountNumber), m]));
+                let added = 0;
+                let updated = 0;
+                for (const m of mappings) {
+                    if (merged.has(m.accountNumber)) updated++; else added++;
+                    merged.set(m.accountNumber, m);
                 }
+                const finalMappings = Array.from(merged.values());
+                stageEdit({ salaryAdvanceMappings: JSON.stringify(finalMappings) });
+                toast({
+                    title: 'Mappings staged',
+                    description: `Added ${added}, updated ${updated}. Total: ${finalMappings.length}.${skippedNote} Submit for approval to apply.`,
+                });
+            } else {
+                stageEdit({ salaryAdvanceMappings: JSON.stringify(mappings) });
+                toast({
+                    title: 'Mappings staged',
+                    description: `The list will be replaced with ${mappings.length} mapping(s).${skippedNote} Submit for approval to apply.`,
+                });
             }
-            
-            onUpdate({ salaryAdvanceMappings: JSON.stringify(finalMappings) });
-            toast({ 
-                title: 'File uploaded', 
-                description: `Successfully ${salaryUploadMode === 'replace' ? 'replaced with' : 'loaded'} ${finalMappings.length} salary mapping${finalMappings.length !== 1 ? 's' : ''}.` 
-            });
         } catch (err: any) {
             console.error('Failed to parse salary mapping file', err);
-            toast({ 
-                title: 'Failed to parse file', 
-                description: err?.message || 'Could not read the salary mapping file. Please check the file format.', 
-                variant: 'destructive' 
+            toast({
+                title: 'Failed to read file',
+                description: err?.message || 'Check the file format and try again.',
+                variant: 'destructive',
             });
         }
+        reset();
     }
 
     // Parse salary mappings for display and management
@@ -414,24 +466,23 @@ const ProductSettingsForm = ({ provider, product, providerColor, onSave, onDelet
             return;
         }
         
-        const newMappings = [...parsedMappings];
-        const oldAccountNumber = newMappings[editingMappingIndex].accountNumber;
-        
-        // Check if new account number already exists (if changed)
-        if (editingAccountNumber !== oldAccountNumber) {
-            const exists = newMappings.some((m, i) => i !== editingMappingIndex && String(m.accountNumber) === editingAccountNumber);
-            if (exists) {
-                toast({ title: 'Duplicate account', description: 'This account number already exists in the list.', variant: 'destructive' });
-                return;
-            }
+        const salary = Number(editingSalary);
+        if (!Number.isFinite(salary) || salary <= 0) {
+            toast({ title: 'Invalid salary', description: 'Salary must be a number greater than 0.', variant: 'destructive' });
+            return;
         }
-        
-        newMappings[editingMappingIndex] = {
-            accountNumber: editingAccountNumber.trim(),
-            salary: Number(editingSalary) || 0
-        };
-        
-        onUpdate({ salaryAdvanceMappings: JSON.stringify(newMappings) });
+
+        const newMappings = [...parsedMappings];
+        const accountNumber = editingAccountNumber.trim();
+        const exists = newMappings.some((m, i) => i !== editingMappingIndex && String(m.accountNumber) === accountNumber);
+        if (exists) {
+            toast({ title: 'Duplicate account', description: 'This account number already exists in the list.', variant: 'destructive' });
+            return;
+        }
+
+        newMappings[editingMappingIndex] = { accountNumber, salary };
+
+        stageEdit({ salaryAdvanceMappings: JSON.stringify(newMappings) });
         toast({ title: 'Mapping updated', description: `Account ${editingAccountNumber} has been updated.` });
         handleCancelEditMapping();
     };
@@ -442,7 +493,7 @@ const ProductSettingsForm = ({ provider, product, providerColor, onSave, onDelet
         if (!mapping) return;
         
         const newMappings = parsedMappings.filter((_, i) => i !== originalIndex);
-        onUpdate({ salaryAdvanceMappings: JSON.stringify(newMappings) });
+        stageEdit({ salaryAdvanceMappings: JSON.stringify(newMappings) });
         toast({ title: 'Mapping removed', description: `Account ${mapping.accountNumber} has been removed from the list.` });
 
         if (editingMappingIndex === originalIndex) {
@@ -471,13 +522,15 @@ const ProductSettingsForm = ({ provider, product, providerColor, onSave, onDelet
             toast({ title: 'Duplicate account', description: 'This account number already exists in the list.', variant: 'destructive' });
             return;
         }
-        
-        const newMappings = [...parsedMappings, {
-            accountNumber: newMappingAccount.trim(),
-            salary: Number(newMappingSalary) || 0
-        }];
-        
-        onUpdate({ salaryAdvanceMappings: JSON.stringify(newMappings) });
+        const salary = Number(newMappingSalary);
+        if (!Number.isFinite(salary) || salary <= 0) {
+            toast({ title: 'Invalid salary', description: 'Salary must be a number greater than 0.', variant: 'destructive' });
+            return;
+        }
+
+        const newMappings = [...parsedMappings, { accountNumber: newMappingAccount.trim(), salary }];
+
+        stageEdit({ salaryAdvanceMappings: JSON.stringify(newMappings) });
         toast({ title: 'Mapping added', description: `Account ${newMappingAccount} has been added.` });
         setNewMappingAccount('');
         setNewMappingSalary('');
@@ -491,244 +544,71 @@ const ProductSettingsForm = ({ provider, product, providerColor, onSave, onDelet
             toast({ title: 'Not authorized', description: 'You only have read access for Settings.', variant: 'destructive' });
             return;
         }
+        const previousStatus = product.status;
         const newStatus = checked ? 'Active' : 'Disabled';
-        // Optimistically update the UI
-        onUpdate({ status: newStatus }); 
-        
+        setIsStatusSaving(true);
+        onUpdate({ status: newStatus });
         try {
             const response = await fetch('/api/settings/products', {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ id: product.id, status: newStatus })
             });
-
             if (!response.ok) {
-                const errorData = await response.json();
+                const errorData = await response.json().catch(() => ({}));
                 throw new Error(errorData.error || 'Failed to update status.');
             }
-            
-            toast({
-                title: 'Status Updated',
-                description: `${product.name} has been set to ${newStatus}.`
-            });
-            // The onUpdate call above already updated the state, so no need to do it again on success.
-
+            toast({ title: 'Status updated', description: `${product.name} is now ${newStatus === 'Active' ? 'enabled' : 'disabled'}.` });
         } catch (error: any) {
             toast({ title: 'Error', description: error.message, variant: 'destructive' });
-            // Revert UI on failure
-            onUpdate({ status: product.status });
-        }
-    };
-    
-    const handleFilterFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
-        const file = event.target.files?.[0];
-        if (!file || !product.dataProvisioningConfigId) return;
-
-        if (!canCreateEligibilityList) {
-            toast({ title: 'Not authorized', description: 'You only have read access for Eligibility.', variant: 'destructive' });
-            if (event.target) event.target.value = '';
-            return;
-        }
-
-        // Client-side validation: reject unsupported file types and oversized files early
-        const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB
-        const allowedTypes = ['application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'];
-        const allowedExtensions = ['xlsx'];
-        
-        const fileName = file.name || '';
-        const ext = fileName.split('.').pop()?.toLowerCase();
-        
-        // Validate file extension
-        if (!ext || !allowedExtensions.includes(ext)) {
-            toast({ 
-                title: 'Invalid file type', 
-                description: 'Only .xlsx files are allowed.', 
-                variant: 'destructive' 
-            });
-            if (event.target) event.target.value = '';
-            return;
-        }
-        
-        // Validate file type (MIME type)
-        if (file.type && !allowedTypes.includes(file.type) && !file.type.includes('sheet')) {
-            toast({ 
-                title: 'Invalid file type', 
-                description: 'Only .xlsx files are allowed.', 
-                variant: 'destructive' 
-            });
-            if (event.target) event.target.value = '';
-            return;
-        }
-        
-        // Validate file size
-        if (file.size > MAX_FILE_SIZE) {
-            toast({ 
-                title: 'File too large', 
-                description: 'Maximum file size is 10MB.', 
-                variant: 'destructive' 
-            });
-            if (event.target) event.target.value = '';
-            return;
-        }
-
-        setIsUploading(true);
-        try {
-            const fileReader = new FileReader();
-            fileReader.readAsDataURL(file);
-            fileReader.onload = async (e) => {
-                const fileContentBase64 = (e.target?.result as string)?.split(',')[1];
-                if (!fileContentBase64) {
-                    throw new Error("Could not read file content.");
-                }
-
-                const tempUpload: DataProvisioningUpload = {
-                    id: `temp-${Date.now()}`,
-                    configId: product.dataProvisioningConfigId!,
-                    fileName: file.name,
-                    rowCount: 0, // Placeholder
-                    uploadedAt: new Date().toISOString(),
-                    uploadedBy: 'you (unsaved)',
-                    status: 'PENDING_APPROVAL',
-                    // Store content for submission
-                    fileContent: fileContentBase64,
-                } as any;
-
-                onUpdate({ eligibilityUpload: tempUpload });
-            };
-
-        } catch (error: any) {
-            toast({ title: "Error reading file", description: error.message, variant: 'destructive'});
+            onUpdate({ status: previousStatus });
         } finally {
-            setIsUploading(false);
-            if (event.target) event.target.value = '';
+            setIsStatusSaving(false);
         }
     };
-    
-    const handleEligibilitySubmitForApproval = async () => {
-        if (!canCreateEligibilityList) {
-            toast({ title: 'Not authorized', description: 'You only have read access for Eligibility.', variant: 'destructive' });
-            return;
-        }
-        if (!product.eligibilityUpload || !(product.eligibilityUpload as any).fileContent) {
-            toast({ title: "No file to submit", description: "Please upload a file first.", variant: "destructive"});
-            return;
-        }
-
-        setIsSaving(true);
-        try {
-            const { eligibilityUpload } = product;
-            const payload = {
-                created: {
-                    configId: eligibilityUpload.configId,
-                    fileName: eligibilityUpload.fileName,
-                    fileContent: (eligibilityUpload as any).fileContent,
-                    productId: product.id,
-                }
-            };
-                await postPendingChange({
-                    entityType: 'EligibilityList',
-                    entityId: product.id,
-                    changeType: 'CREATE', // Using CREATE since it creates a new upload and filter
-                    payload: JSON.stringify(payload),
-                }, 'Failed to submit eligibility list for approval.');
-            toast({ title: "Submitted for Approval", description: `The new eligibility list for "${product.name}" is pending review.` });
-
-            // Replace the temporary upload with a "pending" state placeholder
-            onUpdate({ eligibilityUpload: { ...product.eligibilityUpload, id: 'pending-approval', status: 'PENDING_APPROVAL' } as any });
-
-        } catch (error: any) {
-            toast({ title: "Error", description: error.message, variant: "destructive" });
-        } finally {
-            setIsSaving(false);
-        }
-    };
-
 
     const submitForApproval = async (e: React.FormEvent) => {
         e.preventDefault();
 
-        if (!canEditProduct) {
+        if (!canEditFields) {
             toast({ title: 'Not authorized', description: 'You only have read access for Products.', variant: 'destructive' });
             return;
         }
+
+        const candidate = normalizeProductTerms(formData);
+        const problem = validateProductTerms(candidate);
+        if (problem) {
+            toast({ title: 'Check the product settings', description: problem, variant: 'destructive' });
+            return;
+        }
+
+        const { changedKeys, payload } = buildChangePayload(
+            { id: product.id, name: product.name, providerId: product.providerId },
+            product,
+            candidate,
+            PRODUCT_TERM_FIELDS,
+            normalizeProductTerms(product),
+        );
+        if (changedKeys.length === 0) {
+            toast({ title: 'Nothing to submit', description: 'You have not changed any of this product\'s settings.' });
+            return;
+        }
+
         setIsSaving(true);
         try {
-            const parsedDuration = parseInt(String(formData.duration)) || 30;
-            const parsedInstallments = formData.isSalaryAdvance
-                ? (formData.installments === '' || formData.installments === null || formData.installments === undefined
-                    ? null
-                    : Number(formData.installments))
-                : null;
-
-            if (formData.isSalaryAdvance) {
-                if (!parsedInstallments || !Number.isFinite(parsedInstallments) || parsedInstallments <= 0) {
-                    throw new Error('For salary-advance products, Installments is required and must be greater than 0.');
-                }
-                if (parsedDuration <= 0) {
-                    throw new Error('For salary-advance products, Loan Duration (days) must be greater than 0.');
-                }
-                if (parsedInstallments > parsedDuration) {
-                    throw new Error('Installments cannot be greater than duration (days).');
-                }
-            }
-
-            const computedIntervalDays = (formData.isSalaryAdvance && parsedInstallments)
-                ? Math.floor(parsedDuration / parsedInstallments)
-                : null;
-
-             const productToSave = {
-                ...formData,
-                minLoan: formData.isSalaryAdvance ? undefined : (parseFloat(String(formData.minLoan)) || 0),
-                maxLoan: formData.isSalaryAdvance ? undefined : (parseFloat(String(formData.maxLoan)) || 0),
-                duration: parsedDuration,
-                advancePercent: formData.isSalaryAdvance ? (formData.advancePercent ? Number(formData.advancePercent) : null) : undefined,
-                salaryAdvanceMappings: formData.isSalaryAdvance ? formData.salaryAdvanceMappings : undefined,
-                installments: formData.isSalaryAdvance ? parsedInstallments : undefined,
-                repaymentIntervalDays: formData.isSalaryAdvance ? (computedIntervalDays || undefined) : undefined,
-                // For installment-based products, apply penalties per installment.
-                penaltyPerInstallment: formData.isSalaryAdvance ? true : undefined,
-                // Exclude status and eligibility from the main product approval payload
-                status: undefined, 
-                dataProvisioningEnabled: undefined,
-                dataProvisioningConfigId: undefined,
-                eligibilityUpload: undefined,
-                eligibilityUploadId: undefined,
-                eligibilityFilter: undefined,
-            };
-
-            // Use the snapshot of the product captured when the editor was opened
-            // (falls back to provider state if snapshot is missing)
-            const originalProduct = originalSnapshotRef.current ?? provider.products.find(p => p.id === product.id);
-            // Build a small original object that only contains keys that are being updated
-            const keysToSend = Object.keys(productToSave).filter(k => (productToSave as any)[k] !== undefined);
-            const pick = (obj: any, keys: string[]) => keys.reduce((acc: any, k: string) => { if (obj && (k in obj)) acc[k] = (obj as any)[k]; return acc; }, {});
-            const originalSubset = pick(originalProduct, keysToSend);
-
-            const payload = {
-                original: sanitizeProductForPayload(originalSubset),
-                updated: sanitizeProductForPayload(productToSave)
-            };
-
-                await postPendingChange({
-                    entityType: 'LoanProduct',
-                    entityId: product.id,
-                    changeType: 'UPDATE',
-                    payload: JSON.stringify(payload)
-                }, 'Failed to submit product changes for approval.');
+            await postPendingChange({
+                entityType: 'LoanProduct',
+                entityId: product.id,
+                changeType: 'UPDATE',
+                payload: JSON.stringify(payload)
+            }, 'Failed to submit product changes for approval.');
 
             // Safe-only changes (e.g. salary mappings) keep the product enabled;
-            // only term changes disable it while pending.
-            const safeOnlyChange = isSafeOnlyProductUpdate(payload);
-            onUpdate(
-                safeOnlyChange
-                    ? ({ _optimisticPending: true } as any)
-                    : ({ status: 'Disabled', _optimisticPending: true } as any)
-            );
+            // term changes disable it while pending (same rule as the server).
+            markPending('products', product.id);
+            if (!isSafeOnlyProductUpdate(payload)) onUpdate({ status: 'Disabled' });
 
-            toast({
-                title: 'Submitted for Approval',
-                description: `Changes to ${product.name} have been submitted successfully.`,
-            });
+            toast({ title: 'Submitted for approval', description: `Changes to ${product.name} are waiting for a checker.` });
         } catch (error: any) {
             toast({ title: 'Error', description: error.message, variant: 'destructive' });
         } finally {
@@ -741,34 +621,44 @@ const ProductSettingsForm = ({ provider, product, providerColor, onSave, onDelet
        <Collapsible open={isOpen} onOpenChange={setIsOpen} className="space-y-2">
             <CollapsibleTrigger asChild>
                 <button className="flex items-center justify-between w-full space-x-4 px-4 py-2 border rounded-lg bg-background hover:bg-muted/50 transition-colors">
-                    <div className="flex items-center gap-2">
+                    <div className="flex flex-wrap items-center gap-2 text-left">
                         <h4 className="text-sm font-semibold">{product.name}</h4>
-                        {(((product as any)._optimisticPending) || product.status === 'PENDING_APPROVAL') && <Badge variant="outline">Pending Approval</Badge>}
-                        {!(((product as any)._optimisticPending) || product.status === 'PENDING_APPROVAL') && <Badge variant={product.status === 'Active' ? 'default' : 'destructive'} className={cn(product.status === 'Active' && 'bg-green-600')}>{product.status}</Badge>}
+                        <Badge variant={product.status === 'Active' ? 'default' : 'destructive'} className={cn(product.status === 'Active' && 'bg-green-600')}>{product.status}</Badge>
+                        {productPending && <PendingBadge />}
+                        {hasEdits && !productPending && <Badge variant="secondary">Unsaved changes</Badge>}
                     </div>
-                    <ChevronDown className="h-4 w-4 transition-transform duration-200 data-[state=open]:rotate-180" />
+                    <ChevronDown className={cn('h-4 w-4 shrink-0 transition-transform duration-200', isOpen && 'rotate-180')} />
                 </button>
             </CollapsibleTrigger>
             <CollapsibleContent>
                  <form onSubmit={submitForApproval} className="p-4 border rounded-lg bg-background space-y-6">
+                    {productPending && (
+                        <p className="flex items-start gap-2 rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-200">
+                            <Clock className="mt-0.5 h-4 w-4 shrink-0" />
+                            A change to this product is waiting for approval. Its settings are locked until a checker approves or rejects it.
+                        </p>
+                    )}
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                         <div className="flex items-center space-x-2">
-                            <Switch 
+                            <Switch
                                 id={`status-${product.id}`}
-                                checked={formData.status === 'Active'} 
+                                checked={product.status === 'Active'}
                                 onCheckedChange={(checked) => handleSwitchChange('status', checked)}
-                                disabled={!canEditProduct}
+                                disabled={!canEditProduct || isStatusSaving}
                                 className="data-[state=checked]:bg-[--provider-color]"
                                 style={{'--provider-color': providerColor} as React.CSSProperties}
                             />
-                            <Label htmlFor={`status-${product.id}`}>Status ({formData.status})</Label>
+                            <div>
+                                <Label htmlFor={`status-${product.id}`}>{product.status === 'Active' ? 'Enabled' : 'Disabled'}</Label>
+                                <p className="text-xs text-muted-foreground">Applies immediately, without approval.</p>
+                            </div>
                         </div>
                         <div className="flex items-center space-x-2">
                             <Switch
                                 id={`allowConcurrentLoans-${product.id}`}
                                 checked={!!formData.allowConcurrentLoans}
                                 onCheckedChange={(checked) => handleSwitchChange('allowConcurrentLoans', Boolean(checked))}
-                                disabled={!canEditProduct}
+                                disabled={!canEditFields}
                                 className="data-[state=checked]:bg-[--provider-color]"
                                 style={{'--provider-color': providerColor} as React.CSSProperties}
                             />
@@ -783,7 +673,7 @@ const ProductSettingsForm = ({ provider, product, providerColor, onSave, onDelet
                                 value={formData.minLoan ?? ''}
                                 onChange={handleChange}
                                 placeholder="e.g., 500"
-                                disabled={!canEditProduct || !!formData.isSalaryAdvance}
+                                disabled={!canEditFields || !!formData.isSalaryAdvance}
                             />
                         </div>
                         <div className="space-y-2">
@@ -795,7 +685,7 @@ const ProductSettingsForm = ({ provider, product, providerColor, onSave, onDelet
                                 value={formData.maxLoan ?? ''}
                                 onChange={handleChange}
                                 placeholder="e.g., 2500"
-                                disabled={!canEditProduct || !!formData.isSalaryAdvance}
+                                disabled={!canEditFields || !!formData.isSalaryAdvance}
                             />
                         </div>
                         <div className="space-y-2">
@@ -807,7 +697,7 @@ const ProductSettingsForm = ({ provider, product, providerColor, onSave, onDelet
                                 value={formData.duration ?? ''}
                                 onChange={handleChange}
                                 placeholder="e.g., 30"
-                                disabled={!canEditProduct}
+                                disabled={!canEditFields}
                             />
                         </div>
                         <div className="space-y-2">
@@ -817,7 +707,7 @@ const ProductSettingsForm = ({ provider, product, providerColor, onSave, onDelet
                                     id={`isSalaryAdvance-${product.id}`}
                                     checked={!!formData.isSalaryAdvance}
                                     onCheckedChange={(checked) => handleSwitchChange('isSalaryAdvance', Boolean(checked))}
-                                    disabled={!canEditProduct}
+                                    disabled={!canEditFields}
                                     className="data-[state=checked]:bg-[--provider-color]"
                                     style={{'--provider-color': providerColor} as React.CSSProperties}
                                 />
@@ -835,7 +725,7 @@ const ProductSettingsForm = ({ provider, product, providerColor, onSave, onDelet
                                     value={formData.advancePercent ?? ''}
                                     onChange={handleChange}
                                     placeholder="e.g., 50"
-                                    disabled={!canEditProduct}
+                                    disabled={!canEditFields}
                                 />
                             </div>
                             <div className="space-y-2">
@@ -847,7 +737,7 @@ const ProductSettingsForm = ({ provider, product, providerColor, onSave, onDelet
                                     value={formData.installments ?? ''}
                                     onChange={handleChange}
                                     placeholder="e.g., 12"
-                                    disabled={!canEditProduct}
+                                    disabled={!canEditFields}
                                 />
                             </div>
                             {formData.installments && Number(formData.installments) > 0 && (
@@ -868,7 +758,7 @@ const ProductSettingsForm = ({ provider, product, providerColor, onSave, onDelet
                                                 name={`uploadMode-${product.id}`}
                                                 checked={salaryUploadMode === 'append'} 
                                                 onChange={() => setSalaryUploadMode('append')}
-                                                disabled={!canEditProduct}
+                                                disabled={!canEditFields}
                                                 className="h-4 w-4"
                                             />
                                             <span className="text-sm">Add to existing list</span>
@@ -879,7 +769,7 @@ const ProductSettingsForm = ({ provider, product, providerColor, onSave, onDelet
                                                 name={`uploadMode-${product.id}`}
                                                 checked={salaryUploadMode === 'replace'} 
                                                 onChange={() => setSalaryUploadMode('replace')}
-                                                disabled={!canEditProduct}
+                                                disabled={!canEditFields}
                                                 className="h-4 w-4"
                                             />
                                             <span className="text-sm">Replace entire list</span>
@@ -891,8 +781,8 @@ const ProductSettingsForm = ({ provider, product, providerColor, onSave, onDelet
                                             : '• Warning: This will remove all existing mappings and replace with the new file'}
                                     </div>
                                     <div>
-                                        <input type="file" accept=".csv,.xlsx,.xls" onChange={(e) => handleFileSalaryUpload(e.target.files ? e.target.files[0] : undefined)} disabled={!canEditProduct} />
-                                        <div className="text-sm text-muted-foreground mt-1">CSV columns: accountNumber,salary</div>
+                                        <Input type="file" accept=".csv,.xlsx" onChange={(e) => handleFileSalaryUpload(e.currentTarget)} disabled={!canEditFields} className="max-w-sm cursor-pointer" />
+                                        <div className="text-sm text-muted-foreground mt-1">A .csv or .xlsx file with an account number column and a salary column.</div>
                                     </div>
                                 </div>
                                 {formData.salaryAdvanceMappings && (
@@ -927,7 +817,7 @@ const ProductSettingsForm = ({ provider, product, providerColor, onSave, onDelet
                                     <UIDialogHeader>
                                         <UIDialogTitle>Manage Salary Mappings</UIDialogTitle>
                                         <UIDialogDescription>
-                                            View, edit, or remove salary mappings. Total: {parsedMappings.length} entries.
+                                            View, edit, or remove salary mappings. Total: {parsedMappings.length} entries. Edits are staged until you submit the product for approval.
                                         </UIDialogDescription>
                                     </UIDialogHeader>
                                     
@@ -955,7 +845,7 @@ const ProductSettingsForm = ({ provider, product, providerColor, onSave, onDelet
                                                 </Button>
                                             )}
                                         </div>
-                                        {canEditProduct && !isAddingMapping && (
+                                        {canEditFields && !isAddingMapping && (
                                             <Button variant="outline" size="sm" onClick={() => setIsAddingMapping(true)}>
                                                 <PlusCircle className="h-4 w-4 mr-2" />
                                                 Add Entry
@@ -1001,13 +891,13 @@ const ProductSettingsForm = ({ provider, product, providerColor, onSave, onDelet
                                                     <TableHead className="w-16">#</TableHead>
                                                     <TableHead>Account Number</TableHead>
                                                     <TableHead className="w-32">Salary</TableHead>
-                                                    {canEditProduct && <TableHead className="w-24 text-right">Actions</TableHead>}
+                                                    {canEditFields && <TableHead className="w-24 text-right">Actions</TableHead>}
                                                 </TableRow>
                                             </TableHeader>
                                             <TableBody>
                                                 {paginatedMappingEntries.length === 0 ? (
                                                     <TableRow>
-                                                        <TableCell colSpan={canEditProduct ? 4 : 3} className="text-center text-muted-foreground py-8">
+                                                        <TableCell colSpan={canEditFields ? 4 : 3} className="text-center text-muted-foreground py-8">
                                                             {mappingsSearchQuery ? 'No matching entries found.' : 'No salary mappings yet.'}
                                                         </TableCell>
                                                     </TableRow>
@@ -1042,7 +932,7 @@ const ProductSettingsForm = ({ provider, product, providerColor, onSave, onDelet
                                                                         <span>{mapping.salary.toLocaleString()}</span>
                                                                     )}
                                                                 </TableCell>
-                                                                {canEditProduct && (
+                                                                {canEditFields && (
                                                                     <TableCell className="text-right">
                                                                         {isEditing ? (
                                                                             <div className="flex items-center justify-end gap-1">
@@ -1112,25 +1002,55 @@ const ProductSettingsForm = ({ provider, product, providerColor, onSave, onDelet
                         )}
                     </div>
 
-                    <div className="flex items-center space-x-2 justify-end">
+                    <div className="flex flex-wrap items-center justify-end gap-2">
                         {canDeleteProduct && (
-                            <Button variant="destructive" type="button" onClick={onDelete} disabled={isSaving}>
+                            <Button variant="destructive" type="button" onClick={onDelete} disabled={isSaving || productPending} className="mr-auto">
                                 <Trash2 className="h-4 w-4 mr-2" /> Delete
+                            </Button>
+                        )}
+                        {hasEdits && !productPending && (
+                            <Button type="button" variant="outline" onClick={() => setEdits({})} disabled={isSaving}>
+                                <Undo2 className="h-4 w-4 mr-2" /> Discard changes
                             </Button>
                         )}
                         <Button
                             type="submit"
                             style={{ backgroundColor: providerColor }}
                             className="text-white"
-                            disabled={!canEditProduct || isSaving || (((product as any)._optimisticPending) || product.status === 'PENDING_APPROVAL')}
+                            disabled={!canEditFields || isSaving || !hasEdits}
                         >
                             {isSaving && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-                            {(((product as any)._optimisticPending) || product.status === 'PENDING_APPROVAL') ? 'Pending Approval' : 'Submit for Approval'}
+                            {productPending ? 'Pending Approval' : 'Submit for Approval'}
                         </Button>
                     </div>
                 </form>
             </CollapsibleContent>
         </Collapsible>
+        <AlertDialog open={statusToConfirm !== null} onOpenChange={(open) => { if (!open) setStatusToConfirm(null); }}>
+            <AlertDialogContent>
+                <AlertDialogHeader>
+                    <AlertDialogTitle>{statusToConfirm ? `Enable ${product.name}?` : `Disable ${product.name}?`}</AlertDialogTitle>
+                    <AlertDialogDescription>
+                        {statusToConfirm
+                            ? 'Borrowers can apply for this product as soon as you confirm. The switch takes effect immediately, without approval.'
+                            : 'Borrowers can no longer apply for this product. Loans already taken are not affected. The switch takes effect immediately, without approval.'}
+                    </AlertDialogDescription>
+                </AlertDialogHeader>
+                <AlertDialogFooter>
+                    <AlertDialogCancel>Cancel</AlertDialogCancel>
+                    <AlertDialogAction
+                        className={cn(!statusToConfirm && buttonVariants({ variant: 'destructive' }))}
+                        onClick={() => {
+                            const next = statusToConfirm;
+                            setStatusToConfirm(null);
+                            if (next !== null) handleStatusChange(next);
+                        }}
+                    >
+                        {statusToConfirm ? 'Enable product' : 'Disable product'}
+                    </AlertDialogAction>
+                </AlertDialogFooter>
+            </AlertDialogContent>
+        </AlertDialog>
        </>
     )
 }
@@ -1146,7 +1066,7 @@ function ProvidersTab({ providers, onProvidersChange }: {
     const [isAddProductDialogOpen, setIsAddProductDialogOpen] = useState(false);
     const [selectedProviderId, setSelectedProviderId] = useState<string | null>(null);
     const [deletingId, setDeletingId] = useState<{ type: 'provider' | 'product'; providerId: string; productId?: string } | null>(null);
-    const [dataConfigs, setDataConfigs] = useState<DataProvisioningConfig[]>(providers.flatMap(p => p.dataProvisioningConfigs || []));
+    const { isPending, markPending } = usePending();
 
     const { toast } = useToast();
 
@@ -1157,17 +1077,23 @@ function ProvidersTab({ providers, onProvidersChange }: {
     const canDeleteProvider = !!providerActions.delete;
     const canCreateProduct = !!productActions.create;
     const canDeleteProduct = !!productActions.delete;
-    
-    useEffect(() => {
-        setDataConfigs(providers.flatMap(p => p.dataProvisioningConfigs || []));
-    }, [providers]);
-    
+
+    // The user's own provider colour, else the first provider's. (This looked
+    // for a provider named 'NIb Bank'; the row is 'NIB BANK', so it never matched.)
     const themeColor = useMemo(() => {
-        if (currentUser?.role === 'Super Admin' || currentUser?.role === 'Admin') {
-            return providers.find(p => p.name === 'NIb Bank')?.colorHex || '#fdb913';
-        }
-        return providers.find(p => p.name === currentUser?.providerName)?.colorHex || '#fdb913';
+        const own = providers.find(p => p.name.toLowerCase() === currentUser?.providerName?.toLowerCase());
+        return (own ?? providers[0])?.colorHex || '#fdb913';
     }, [currentUser, providers]);
+
+    const providerIsPending = (provider: LoanProvider) =>
+        isPending('providers', provider.id) || (provider as any).status === 'PENDING_APPROVAL';
+
+    const deletingLabel = useMemo(() => {
+        if (!deletingId) return '';
+        const provider = providers.find(p => p.id === deletingId.providerId);
+        if (deletingId.type === 'provider') return provider?.name ?? 'this provider';
+        return provider?.products.find(p => p.id === deletingId.productId)?.name ?? 'this product';
+    }, [deletingId, providers]);
     
     const handleOpenProviderDialog = (provider: LoanProvider | null = null) => {
         setEditingProvider(provider);
@@ -1188,16 +1114,25 @@ function ProvidersTab({ providers, onProvidersChange }: {
             const changeType = isEditing ? 'UPDATE' : 'CREATE';
             const entityId = isEditing ? providerData.id : undefined;
 
-            let originalProvider = null;
+            let payload: Record<string, any>;
             if (isEditing && entityId) {
-                originalProvider = providers.find(p => p.id === entityId) || null;
+                const originalProvider = providerScalars(providers.find(p => p.id === entityId));
+                if (!originalProvider) throw new Error('Provider not found');
+                const fields = Object.keys(providerData).filter(k => k !== 'id');
+                const diff = buildChangePayload(
+                    { id: entityId, name: originalProvider.name },
+                    originalProvider,
+                    providerData,
+                    fields,
+                );
+                if (diff.changedKeys.length === 0) {
+                    toast({ title: 'Nothing to submit', description: 'You have not changed this provider.' });
+                    return;
+                }
+                payload = diff.payload;
+            } else {
+                payload = { created: providerData };
             }
-
-            const payload = {
-                original: originalProvider,
-                updated: { ...originalProvider, ...providerData },
-                created: !isEditing ? providerData : undefined,
-            };
 
             await postPendingChange({
                 entityType: 'LoanProvider',
@@ -1206,12 +1141,7 @@ function ProvidersTab({ providers, onProvidersChange }: {
                 payload: JSON.stringify(payload)
             }, 'Failed to submit provider changes');
 
-            onProvidersChange(produce(draft => {
-                if (isEditing && entityId) {
-                    const index = draft.findIndex(p => p.id === entityId);
-                    if (index !== -1) draft[index].status = 'PENDING_APPROVAL';
-                }
-            }));
+            if (isEditing && entityId) markPending('providers', entityId);
 
             toast({ title: 'Submitted for Approval', description: `Changes for ${providerData.name} have been submitted for review.` });
         } catch (error: any) {
@@ -1245,7 +1175,7 @@ function ProvidersTab({ providers, onProvidersChange }: {
         }
     };
 
-    const handleUpdateProduct = (providerId: string, updatedProduct: LoanProduct) => {
+    const handleUpdateProduct = (providerId: string, updatedProduct: Partial<LoanProduct> & { id: string }) => {
         onProvidersChange(produce(draft => {
             const provider = draft.find(p => p.id === providerId);
             if (provider) {
@@ -1282,13 +1212,10 @@ function ProvidersTab({ providers, onProvidersChange }: {
                 entityType: 'LoanProvider',
                 entityId: providerId,
                 changeType: 'DELETE',
-                payload: JSON.stringify({ original: sanitizeProviderForPayload(providerToDelete) })
+                payload: JSON.stringify({ original: providerScalars(providerToDelete) })
             }, 'Could not submit deletion for approval.');
-            
-            onProvidersChange(produce(draft => {
-                const index = draft.findIndex(p => p.id === providerId);
-                if (index !== -1) draft[index].status = 'PENDING_APPROVAL';
-            }));
+
+            markPending('providers', providerId);
 
             toast({ title: "Deletion Submitted", description: 'Provider deletion is pending approval.' });
         } catch (error: any) {
@@ -1310,38 +1237,41 @@ function ProvidersTab({ providers, onProvidersChange }: {
                     entityType: 'LoanProduct',
                     entityId: productId,
                     changeType: 'DELETE',
-                    payload: JSON.stringify({ original: sanitizeProductForPayload(productToDelete) })
+                    // What the checker needs to recognise the product, not its
+                    // full salary list (hundreds of KB).
+                    payload: JSON.stringify({ original: {
+                        id: productToDelete.id, name: productToDelete.name, providerId: productToDelete.providerId,
+                        status: productToDelete.status, isSalaryAdvance: productToDelete.isSalaryAdvance,
+                        minLoan: productToDelete.minLoan, maxLoan: productToDelete.maxLoan, duration: productToDelete.duration,
+                    } })
                  }, 'Could not submit product deletion for approval.');
-            
-             onProvidersChange(produce(draft => {
-                const provider = draft.find(p => p.id === providerId);
-                if (provider) {
-                    const product = provider.products.find(p => p.id === productId);
-                    if (product) { product.status = 'Disabled'; (product as any)._optimisticPending = true; }
-                }
-            }));
+
+            // The server disables a product while its deletion is pending.
+            markPending('products', productId);
+            handleUpdateProduct(providerId, { id: productId, status: 'Disabled' });
             toast({ title: "Deletion Submitted", description: "Product deletion is pending approval." });
         } catch (error: any) {
              toast({ title: "Error", description: error.message, variant: 'destructive' });
         }
     }
     
+    const addProviderButton = canCreateProvider && (
+        <div className="mb-4 flex justify-end">
+            <Button onClick={() => handleOpenProviderDialog(null)} style={{ backgroundColor: themeColor }} className="text-white">
+                <PlusCircle className="mr-2 h-4 w-4" /> Add Provider
+            </Button>
+        </div>
+    );
+
     if (providers.length === 0) {
         return (
             <>
-                <div className="flex items-center justify-between space-y-2 mb-4">
-                    <div></div>
-                    {canCreateProvider && (
-                        <Button onClick={() => handleOpenProviderDialog(null)} style={{ backgroundColor: themeColor }} className="text-white">
-                            <PlusCircle className="mr-2 h-4 w-4" /> Add Provider
-                        </Button>
-                    )}
-                </div>
+                {addProviderButton}
                 <Card>
                     <CardHeader>
                         <CardTitle>Providers &amp; Products</CardTitle>
                         <CardDescription>
-                            {canCreateProvider 
+                            {canCreateProvider
                                 ? 'No providers available yet. Click "Add Provider" to create one.'
                                 : 'No providers available. Please contact a Super Admin.'}
                         </CardDescription>
@@ -1360,15 +1290,8 @@ function ProvidersTab({ providers, onProvidersChange }: {
 
     return (
     <>
-      <div className="flex items-center justify-between space-y-2 mb-4">
-        <div></div>
-                {canCreateProvider && (
-          <Button onClick={() => handleOpenProviderDialog(null)} style={{ backgroundColor: themeColor }} className="text-white">
-            <PlusCircle className="mr-2 h-4 w-4" /> Add Provider
-          </Button>
-        )}
-      </div>
-      <Accordion type="multiple" className="w-full space-y-4">
+      {addProviderButton}
+      <Accordion type="multiple" defaultValue={defaultOpenProviders(providers)} className="w-full space-y-4">
         {providers.map((provider) => (
           <AccordionItem value={provider.id} key={provider.id} className="border rounded-lg bg-card">
             <div className="flex items-center w-full p-4">
@@ -1377,55 +1300,55 @@ function ProvidersTab({ providers, onProvidersChange }: {
                   <IconDisplay iconName={provider.icon} className="h-6 w-6" />
                   <div>
                     <div className="text-lg font-semibold">{provider.name}</div>
-                    <div className="text-sm text-muted-foreground flex items-center">
+                    <div className="text-sm text-muted-foreground flex flex-wrap items-center gap-2">
                         {(provider.products || []).length} products
-                        {provider.status === 'PENDING_APPROVAL' && <Badge variant="outline" className="ml-2">Pending Approval</Badge>}
+                        {providerIsPending(provider) && <PendingBadge />}
                     </div>
                   </div>
                 </div>
               </AccordionTrigger>
               <div className="flex items-center gap-2 ml-auto pl-4">
-                                {(canUpdateProvider || canDeleteProvider) && (
-                  <>
-                                        {canUpdateProvider && (
-                                                <Button
-                                                        variant="ghost"
-                                                        size="icon"
-                                                        className="hover:bg-muted h-8 w-8"
-                                                        onClick={(e) => { e.stopPropagation(); handleOpenProviderDialog(provider); }}
-                                                >
-                                                        <Edit className="h-4 w-4" />
-                                                </Button>
-                                        )}
-                                        {canDeleteProvider && (
-                                                <Button
-                                                        variant="ghost"
-                                                        size="icon"
-                                                        className="hover:bg-destructive hover:text-destructive-foreground h-8 w-8"
-                                                        onClick={(e) => { e.stopPropagation(); setDeletingId({ type: 'provider', providerId: provider.id }); }}
-                                                >
-                                                        <Trash2 className="h-4 w-4" />
-                                                </Button>
-                                        )}
-                  </>
+                {canUpdateProvider && (
+                    <Button
+                        variant="ghost"
+                        size="icon"
+                        className="hover:bg-muted h-8 w-8"
+                        aria-label={`Edit ${provider.name}`}
+                        title="Edit provider"
+                        disabled={providerIsPending(provider)}
+                        onClick={(e) => { e.stopPropagation(); handleOpenProviderDialog(provider); }}
+                    >
+                        <Edit className="h-4 w-4" />
+                    </Button>
                 )}
-                <AccordionTrigger className="p-2">
-                  <span className="sr-only">Toggle</span>
-                </AccordionTrigger>
+                {canDeleteProvider && (
+                    <Button
+                        variant="ghost"
+                        size="icon"
+                        className="hover:bg-destructive hover:text-destructive-foreground h-8 w-8"
+                        aria-label={`Delete ${provider.name}`}
+                        title="Delete provider"
+                        disabled={providerIsPending(provider)}
+                        onClick={(e) => { e.stopPropagation(); setDeletingId({ type: 'provider', providerId: provider.id }); }}
+                    >
+                        <Trash2 className="h-4 w-4" />
+                    </Button>
+                )}
+                <AccordionTrigger className="p-2" aria-label={`Show ${provider.name} products`} />
               </div>
             </div>
             <AccordionContent className="p-4 border-t">
               <div className="space-y-6">
+                {(provider.products || []).length === 0 && (
+                  <p className="text-sm text-muted-foreground">This provider has no products yet.</p>
+                )}
                 {(provider.products || []).map(product => (
-                  <ProductSettingsForm 
+                  <ProductSettingsForm
                     key={product.id}
-                    provider={provider}
-                    product={{...product, icon: product.icon || 'PersonStanding'}} 
-                    providerColor={provider.colorHex} 
-                    onSave={(savedProduct) => handleUpdateProduct(provider.id, savedProduct)}
+                    product={product}
+                    providerColor={provider.colorHex}
                     onDelete={() => setDeletingId({ type: 'product', providerId: provider.id, productId: product.id })}
                     onUpdate={(updatedFields) => handleUpdateProduct(provider.id, { id: product.id, ...updatedFields })}
-                    allDataConfigs={dataConfigs.filter(c => c.providerId === provider.id)}
                   />
                 ))}
                 {canCreateProduct && (
@@ -1459,9 +1382,11 @@ function ProvidersTab({ providers, onProvidersChange }: {
       <AlertDialog open={!!deletingId} onOpenChange={() => setDeletingId(null)}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Are you absolutely sure?</AlertDialogTitle>
+            <AlertDialogTitle>Request deletion of {deletingLabel}?</AlertDialogTitle>
             <AlertDialogDescription>
-              This action will submit a request to delete the selected item. This cannot be undone once approved.
+              {deletingId?.type === 'product'
+                ? 'This sends a deletion request to a checker. The product is disabled while the request is pending, and deletion cannot be undone once approved.'
+                : 'This sends a deletion request to a checker. A provider that still has products cannot be deleted. Deletion cannot be undone once approved.'}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -1478,10 +1403,10 @@ type DailyFeeRule = FeeRule & { calculationBase?: 'principal' | 'compound' };
 
 const FeeInput = ({ label, fee, onChange, isEnabled }: { label: string; fee: FeeRule; onChange: (fee: FeeRule) => void; isEnabled: boolean; }) => {
     return (
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
             <Label className={cn("w-28", !isEnabled && "text-muted-foreground/50")}>{label}</Label>
             <Select value={fee.type} onValueChange={(type: 'fixed' | 'percentage') => onChange({ ...fee, type })} disabled={!isEnabled}>
-                <SelectTrigger className="w-32" disabled={!isEnabled}>
+                <SelectTrigger className="w-32" disabled={!isEnabled} aria-label={`${label} type`}>
                     <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -1489,12 +1414,15 @@ const FeeInput = ({ label, fee, onChange, isEnabled }: { label: string; fee: Fee
                     <SelectItem value="fixed">Fixed</SelectItem>
                 </SelectContent>
             </Select>
-            <div className="relative flex-1">
+            <div className="relative min-w-[8rem] flex-1">
                 <Input
                     type="number"
+                    min={0}
+                    step="any"
                     value={fee.value ?? ''}
                     onChange={(e) => onChange({ ...fee, value: e.target.value === '' ? '' : Number(e.target.value) })}
                     placeholder="Enter value"
+                    aria-label={`${label} value`}
                     className={cn(fee.type === 'percentage' ? "pr-8" : "")}
                     disabled={!isEnabled}
                 />
@@ -1507,34 +1435,21 @@ const FeeInput = ({ label, fee, onChange, isEnabled }: { label: string; fee: Fee
 const DailyFeeInput = ({ label, fee, onChange, isEnabled }: { label: string; fee: DailyFeeRule; onChange: (fee: DailyFeeRule) => void; isEnabled: boolean; }) => {
     return (
         <div className="flex flex-col gap-2">
-            <div className="flex items-center gap-2">
-                <Label className={cn("w-28", !isEnabled && "text-muted-foreground/50")}>{label}</Label>
-                <Select value={fee.type} onValueChange={(type: 'fixed' | 'percentage') => onChange({ ...fee, type, calculationBase: type === 'fixed' ? undefined : fee.calculationBase || 'principal' })} disabled={!isEnabled}>
-                    <SelectTrigger className="w-32" disabled={!isEnabled}>
-                        <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                        <SelectItem value="percentage">Percentage</SelectItem>
-                        <SelectItem value="fixed">Fixed</SelectItem>
-                    </SelectContent>
-                </Select>
-                <div className="relative flex-1">
-                    <Input
-                        type="number"
-                        value={fee.value ?? ''}
-                        onChange={(e) => onChange({ ...fee, value: e.target.value === '' ? '' : Number(e.target.value) })}
-                        placeholder="Enter value"
-                        className={cn(fee.type === 'percentage' ? "pr-8" : "")}
-                        disabled={!isEnabled}
-                    />
-                    {fee.type === 'percentage' && <span className={cn("absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground", !isEnabled && "text-muted-foreground/50")}>%</span>}
-                </div>
-            </div>
+            <FeeInput
+                label={label}
+                fee={fee}
+                isEnabled={isEnabled}
+                onChange={(next) => onChange({
+                    ...fee,
+                    ...next,
+                    calculationBase: next.type === 'fixed' ? undefined : fee.calculationBase || 'principal',
+                })}
+            />
             {isEnabled && fee.type === 'percentage' && (
-                <div className="flex items-center gap-2 pl-[124px]">
+                <div className="flex flex-wrap items-center gap-2 sm:pl-[120px]">
                     <Label className="w-32 text-sm text-muted-foreground">Calculation Base</Label>
                     <Select value={fee.calculationBase || 'principal'} onValueChange={(base: 'principal' | 'compound') => onChange({ ...fee, calculationBase: base })}>
-                        <SelectTrigger className="flex-1">
+                        <SelectTrigger className="min-w-[12rem] flex-1" aria-label="Daily fee calculation base">
                             <SelectValue />
                         </SelectTrigger>
                         <SelectContent>
@@ -1548,27 +1463,31 @@ const DailyFeeInput = ({ label, fee, onChange, isEnabled }: { label: string; fee
     );
 };
 
-const PenaltyRuleRow = ({ rule, onChange, onRemove, color, isEnabled }: { rule: PenaltyRule, onChange: (rule: PenaltyRule) => void, onRemove: () => void, color?: string, isEnabled: boolean }) => {
+const PENALTY_GRID = 'grid grid-cols-2 gap-2 md:grid-cols-[5rem_5rem_minmax(10rem,1fr)_8rem_minmax(6rem,1fr)_2.5rem] md:items-center';
+
+const PenaltyRuleRow = ({ rule, onChange, onRemove, isEnabled }: { rule: PenaltyRule, onChange: (rule: PenaltyRule) => void, onRemove: () => void, isEnabled: boolean }) => {
     return (
-        <div className="flex items-center gap-2">
-            <Input 
-                type="number" 
+        <div className={cn(PENALTY_GRID, 'rounded-md border bg-background p-2 md:border-0 md:bg-transparent md:p-0')}>
+            <Input
+                type="number"
+                min={0}
                 value={rule.fromDay ?? ''}
                 onChange={(e) => onChange({...rule, fromDay: e.target.value === '' ? '' : parseInt(e.target.value)})}
-                placeholder="From"
-                className="w-20"
+                placeholder="From day"
+                aria-label="From day"
                 disabled={!isEnabled}
             />
-            <Input 
-                type="number" 
+            <Input
+                type="number"
+                min={0}
                 value={rule.toDay === Infinity ? '' : (rule.toDay ?? '')}
                 onChange={(e) => onChange({...rule, toDay: e.target.value === '' ? null : parseInt(e.target.value)})}
-                placeholder="To"
-                className="w-20"
+                placeholder="To day (blank = no end)"
+                aria-label="To day"
                 disabled={!isEnabled}
             />
             <Select value={rule.type} onValueChange={(type: 'fixed' | 'percentageOfPrincipal' | 'percentageOfCompound') => onChange({ ...rule, type })} disabled={!isEnabled}>
-                <SelectTrigger className="w-48" disabled={!isEnabled}>
+                <SelectTrigger disabled={!isEnabled} aria-label="Penalty type">
                     <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -1578,7 +1497,7 @@ const PenaltyRuleRow = ({ rule, onChange, onRemove, color, isEnabled }: { rule: 
                 </SelectContent>
             </Select>
              <Select value={rule.frequency || 'daily'} onValueChange={(freq: 'daily' | 'one-time') => onChange({ ...rule, frequency: freq })} disabled={!isEnabled}>
-                <SelectTrigger className="w-36" disabled={!isEnabled}>
+                <SelectTrigger disabled={!isEnabled} aria-label="Penalty frequency">
                     <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -1586,62 +1505,49 @@ const PenaltyRuleRow = ({ rule, onChange, onRemove, color, isEnabled }: { rule: 
                     <SelectItem value="one-time">One Time</SelectItem>
                 </SelectContent>
             </Select>
-             <div className="relative flex-1">
+             <div className="relative">
                 <Input
                     type="number"
+                    min={0}
+                    step="any"
                     value={rule.value ?? ''}
                     onChange={(e) => onChange({ ...rule, value: e.target.value === '' ? '' : Number(e.target.value) })}
                     placeholder="Value"
+                    aria-label="Penalty value"
                     className={cn(rule.type !== 'fixed' ? "pr-8" : "")}
                     disabled={!isEnabled}
                 />
                  {rule.type !== 'fixed' && <span className={cn("absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground", !isEnabled && "text-muted-foreground/50")}>%</span>}
             </div>
-             <Button variant="ghost" size="icon" onClick={onRemove} className="text-destructive" disabled={!isEnabled}><Trash2 className="h-4 w-4" /></Button>
+             <Button type="button" variant="ghost" size="icon" onClick={onRemove} className="justify-self-end text-destructive" disabled={!isEnabled} aria-label="Remove penalty rule"><Trash2 className="h-4 w-4" /></Button>
         </div>
     );
 };
 
-function LoanTiersForm({ product, onUpdate, color }: {
+function LoanTiersForm({ product, onUpdate, locked }: {
     product: LoanProduct;
     onUpdate: (updatedProduct: Partial<LoanProduct>) => void;
-    color?: string;
+    locked: boolean;
 }) {
-    const { entityActions } = usePermissions();
-    const { toast } = useToast();
-    const [isLoading, setIsLoading] = useState(false);
     const [isOpen, setIsOpen] = useState(false);
     const tiers = product.loanAmountTiers || [];
 
-    const productActions = entityActions('LoanProduct');
-    const canEditProduct = !!(productActions.create || productActions.update);
-
     const handleTierChange = (index: number, field: keyof Omit<LoanAmountTier, 'id' | 'productId'>, value: string) => {
-        if (!canEditProduct) {
-            toast({ title: 'Not authorized', description: 'You only have read access for Products.', variant: 'destructive' });
-            return;
-        }
+        if (locked) return;
         const newTiers = produce(tiers, draft => {
-            const newTier = { ...draft[index], [field]: value === '' ? '' : value };
-            draft[index] = newTier;
-
+            draft[index] = { ...draft[index], [field]: value === '' ? '' : value } as any;
+            // Keep ranges contiguous: the next tier starts one above this one's end.
             if (field === 'toScore' && index < draft.length - 1) {
-                const nextTier = { ...draft[index + 1] };
-                nextTier.fromScore = (Number(value) || 0) + 1;
-                draft[index + 1] = nextTier;
+                draft[index + 1] = { ...draft[index + 1], fromScore: (Number(value) || 0) + 1 };
             }
         });
         onUpdate({ loanAmountTiers: newTiers });
     };
 
     const handleAddTier = () => {
-        if (!canEditProduct) {
-            toast({ title: 'Not authorized', description: 'You only have read access for Products.', variant: 'destructive' });
-            return;
-        }
+        if (locked) return;
         const lastTier = tiers[tiers.length - 1];
         const newFromScore = lastTier ? (Number(lastTier.toScore) || 0) + 1 : 0;
-        
         const newTier: LoanAmountTier = {
             id: `tier-${Date.now()}`,
             productId: product.id,
@@ -1649,122 +1555,69 @@ function LoanTiersForm({ product, onUpdate, color }: {
             toScore: newFromScore + 9,
             loanAmount: 0
         };
-
         onUpdate({ loanAmountTiers: [...tiers, newTier]});
     };
 
     const handleRemoveTier = (index: number) => {
-        if (!canEditProduct) {
-            toast({ title: 'Not authorized', description: 'You only have read access for Products.', variant: 'destructive' });
-            return;
-        }
-        const newTiers = tiers.filter((_, i) => i !== index);
-        onUpdate({ loanAmountTiers: newTiers });
+        if (locked) return;
+        onUpdate({ loanAmountTiers: tiers.filter((_, i) => i !== index) });
     };
-    
-    const handleSaveTiers = async () => {
-        setIsLoading(true);
-        try {
-            const tiersToSend = tiers.map((tier, i) => {
-                const fromScore = Number(tier.fromScore);
-                const toScore = Number(tier.toScore);
-                const loanAmount = Number(tier.loanAmount);
-
-                if (isNaN(fromScore) || isNaN(toScore) || isNaN(loanAmount)) {
-                    toast({ title: 'Invalid Tier', description: `In tier #${i + 1}, all fields must be valid numbers.`, variant: 'destructive'});
-                    throw new Error("Invalid tier data");
-                }
-                if (loanAmount <= 0) {
-                    toast({ title: 'Invalid Loan Amount', description: `In tier #${i + 1}, the loan amount must be positive.`, variant: 'destructive'});
-                    throw new Error("Invalid loan amount");
-                }
-                 if (product.maxLoan != null && loanAmount > product.maxLoan) {
-                    toast({ title: 'Invalid Loan Amount', description: `In tier #${i + 1}, the loan amount cannot exceed the product's maximum of ${product.maxLoan}.`, variant: 'destructive'});
-                    throw new Error("Invalid loan amount");
-                }
-                if (fromScore > toScore) {
-                    toast({ title: 'Invalid Tier', description: `In tier #${i + 1}, the "From Score" cannot be greater than the "To Score".`, variant: 'destructive'});
-                    throw new Error("Invalid tier data");
-                }
-                if (i > 0) {
-                    const prevToScore = Number(tiers[i-1].toScore);
-                    if (fromScore <= prevToScore) {
-                        toast({ title: 'Overlapping Tiers', description: `Tier #${i + 1} overlaps with the previous tier. "From Score" must be greater than the previous "To Score".`, variant: 'destructive'});
-                        throw new Error("Overlapping Tiers");
-                    }
-                }
-                return {
-                    ...tier,
-                    fromScore,
-                    toScore,
-                    loanAmount,
-                    id: String(tier.id).startsWith('tier-') ? undefined : tier.id
-                }
-            });
-
-            // This update is now part of the parent's save logic.
-            onUpdate({ loanAmountTiers: tiersToSend });
-            toast({ title: 'Tiers Updated', description: 'Tiers have been staged for approval. Submit the product changes to finalize.' });
-            
-        } catch (error: any) {
-            // Validation errors are already toasted.
-            if (!["Invalid tier data", "Invalid loan amount", "Overlapping Tiers"].includes(error.message)) {
-                toast({ title: 'Error Updating Tiers', description: error.message, variant: 'destructive' });
-            }
-        } finally {
-            setIsLoading(false);
-        }
-    };
-
 
     return (
          <Collapsible open={isOpen} onOpenChange={setIsOpen} className="space-y-2">
             <Card>
                 <CollapsibleTrigger asChild>
                     <CardHeader className="cursor-pointer">
-                        <div className="flex items-center justify-between">
+                        <div className="flex items-center justify-between gap-4">
                             <div>
                                 <CardTitle>Loan Amount Tiers</CardTitle>
-                                <CardDescription>Define loan amounts based on credit scores for this product.</CardDescription>
+                                <CardDescription>
+                                    Loan amount a borrower can get for each credit-score range. {tiers.length ? `${tiers.length} tier(s) defined.` : 'No tiers defined.'}
+                                </CardDescription>
                             </div>
-                            <ChevronDown className="h-4 w-4 transition-transform duration-200 data-[state=open]:rotate-180" />
+                            <ChevronDown className={cn('h-4 w-4 shrink-0 transition-transform duration-200', isOpen && 'rotate-180')} />
                         </div>
                     </CardHeader>
                 </CollapsibleTrigger>
                 <CollapsibleContent>
                     <CardContent className="space-y-4 pt-0">
                          {tiers.map((tier, index) => (
-                            <div key={tier.id} className="flex items-center gap-4 p-2 rounded-md bg-muted/50">
-                                <Label className="w-20">From Score</Label>
+                            <div key={tier.id} className="flex flex-wrap items-center gap-x-4 gap-y-2 p-2 rounded-md bg-muted/50">
+                                <Label htmlFor={`tier-from-${tier.id}`} className="w-20">From Score</Label>
                                 <Input
+                                    id={`tier-from-${tier.id}`}
                                     type="number"
                                     value={tier.fromScore ?? ''}
                                     onChange={(e) => handleTierChange(index, 'fromScore', e.target.value)}
                                     className="w-28"
-                                    disabled={index > 0 || !canEditProduct} // Only first "from" is editable
+                                    disabled={index > 0 || locked} // Only the first "from" is editable
                                 />
-                                <Label className="w-16">To Score</Label>
+                                <Label htmlFor={`tier-to-${tier.id}`} className="w-16">To Score</Label>
                                  <Input
+                                    id={`tier-to-${tier.id}`}
                                     type="number"
                                     value={tier.toScore ?? ''}
                                     onChange={(e) => handleTierChange(index, 'toScore', e.target.value)}
                                     className="w-28"
-                                                disabled={!canEditProduct}
+                                    disabled={locked}
                                 />
-                                <Label className="w-24">Loan Amount</Label>
+                                <Label htmlFor={`tier-amount-${tier.id}`} className="w-24">Loan Amount</Label>
                                  <Input
+                                    id={`tier-amount-${tier.id}`}
                                     type="number"
+                                    min={0}
+                                    step="any"
                                     value={tier.loanAmount ?? ''}
                                     onChange={(e) => handleTierChange(index, 'loanAmount', e.target.value)}
-                                    className="flex-1"
-                                    disabled={!canEditProduct}
+                                    className="min-w-[8rem] flex-1"
+                                    disabled={locked}
                                 />
-                                <Button variant="ghost" size="icon" onClick={() => handleRemoveTier(index)} className="text-destructive" disabled={!canEditProduct}>
+                                <Button type="button" variant="ghost" size="icon" onClick={() => handleRemoveTier(index)} className="text-destructive" disabled={locked} aria-label={`Remove tier ${index + 1}`}>
                                     <Trash2 className="h-4 w-4" />
                                 </Button>
                             </div>
                         ))}
-                         <Button variant="outline" onClick={handleAddTier} className="w-full" disabled={!canEditProduct}>
+                         <Button type="button" variant="outline" onClick={handleAddTier} className="w-full" disabled={locked}>
                             <PlusCircle className="mr-2 h-4 w-4" /> Add Tier
                         </Button>
                     </CardContent>
@@ -1774,52 +1627,136 @@ function LoanTiersForm({ product, onUpdate, color }: {
     );
 }
 
-function ProductConfiguration({ product, providerColor, onProductUpdate, taxConfig }: { 
-    product: LoanProduct; 
+// Fields the Fee & Tier tab submits.
+const FEE_FIELDS = [
+    'serviceFeeEnabled', 'serviceFee', 'dailyFeeEnabled', 'dailyFee',
+    'penaltyRulesEnabled', 'penaltyRules', 'penaltyPerInstallment', 'loanAmountTiers',
+] as const;
+
+// Same shape for the saved product and the form, so untouched fields compare
+// equal (e.g. a rule saved without `frequency` vs the form's 'daily' default).
+const normalizeFeeConfig = (p: any) => {
+    const fee = (f: any) => ({ type: f?.type || 'percentage', value: toNumberOrNull(f?.value) ?? 0 });
+    const daily = p.dailyFee || {};
+    return {
+        serviceFeeEnabled: !!p.serviceFeeEnabled,
+        serviceFee: fee(p.serviceFee),
+        dailyFeeEnabled: !!p.dailyFeeEnabled,
+        dailyFee: { ...fee(daily), calculationBase: (daily.type || 'percentage') === 'percentage' ? (daily.calculationBase || 'principal') : undefined },
+        penaltyRulesEnabled: !!p.penaltyRulesEnabled,
+        penaltyRules: (p.penaltyRules || []).map((r: any) => ({
+            id: r.id,
+            fromDay: toNumberOrNull(r.fromDay),
+            toDay: r.toDay === Infinity ? null : toNumberOrNull(r.toDay),
+            type: r.type,
+            value: toNumberOrNull(r.value),
+            frequency: r.frequency || 'daily',
+        })),
+        penaltyPerInstallment: p.isSalaryAdvance ? !!p.penaltyPerInstallment : undefined,
+        loanAmountTiers: (p.loanAmountTiers || []).map((t: any) => ({
+            fromScore: toNumberOrNull(t.fromScore),
+            toScore: toNumberOrNull(t.toScore),
+            loanAmount: toNumberOrNull(t.loanAmount),
+        })),
+    };
+};
+
+// Checks only the sections that changed, so a legacy value elsewhere doesn't
+// block an unrelated edit. `raw` is the form state, to spot emptied inputs.
+// Returns a message, or null when valid.
+const findFeeConfigProblem = (
+    c: ReturnType<typeof normalizeFeeConfig>,
+    raw: any,
+    changed: string[],
+    maxLoan: number | null,
+): string | null => {
+    const has = (...keys: string[]) => keys.some(k => changed.includes(k));
+    const checkFee = (label: string, enabled: boolean, fee: { type: string; value: number }, rawFee: any) => {
+        if (!enabled) return null;
+        if (rawFee?.value === '' || rawFee?.value === null || rawFee?.value === undefined) return `${label}: enter a value.`;
+        if (fee.value < 0) return `${label} cannot be negative.`;
+        if (fee.type === 'percentage' && fee.value > 100) return `${label} cannot be more than 100%.`;
+        return null;
+    };
+
+    if (has('serviceFee', 'serviceFeeEnabled')) {
+        const problem = checkFee('Service fee', c.serviceFeeEnabled, c.serviceFee, raw.serviceFee);
+        if (problem) return problem;
+    }
+    if (has('dailyFee', 'dailyFeeEnabled')) {
+        const problem = checkFee('Daily fee', c.dailyFeeEnabled, c.dailyFee, raw.dailyFee);
+        if (problem) return problem;
+    }
+    if (c.penaltyRulesEnabled && has('penaltyRules', 'penaltyRulesEnabled')) {
+        for (let i = 0; i < c.penaltyRules.length; i++) {
+            const r = c.penaltyRules[i];
+            const name = `Penalty rule ${i + 1}`;
+            if (r.fromDay === null || !Number.isInteger(r.fromDay) || r.fromDay < 0) return `${name}: "From day" must be a whole number, 0 or more.`;
+            if (r.toDay !== null && (!Number.isInteger(r.toDay) || r.toDay < r.fromDay)) return `${name}: "To day" must be blank or at least "From day".`;
+            if (r.value === null || r.value < 0) return `${name}: enter a value of 0 or more.`;
+            if (r.type !== 'fixed' && r.value > 100) return `${name}: a percentage cannot be more than 100.`;
+        }
+    }
+    if (has('loanAmountTiers')) {
+        for (let i = 0; i < c.loanAmountTiers.length; i++) {
+            const t = c.loanAmountTiers[i];
+            const name = `Tier ${i + 1}`;
+            if (t.fromScore === null || t.toScore === null || t.loanAmount === null) return `${name}: fill in every field.`;
+            if (!Number.isInteger(t.fromScore) || !Number.isInteger(t.toScore)) return `${name}: scores must be whole numbers.`;
+            if (t.fromScore > t.toScore) return `${name}: "From Score" cannot be greater than "To Score".`;
+            if (t.loanAmount <= 0) return `${name}: the loan amount must be greater than 0.`;
+            // Salary-advance products store maxLoan 0, so only check a real maximum.
+            if (maxLoan !== null && maxLoan > 0 && t.loanAmount > maxLoan) return `${name}: the loan amount cannot exceed the product maximum of ${maxLoan}.`;
+            const prevTo = i > 0 ? c.loanAmountTiers[i - 1].toScore : null;
+            if (prevTo !== null && t.fromScore <= prevTo) return `${name} overlaps the previous tier.`;
+        }
+    }
+    return null;
+};
+
+function ProductConfiguration({ product, providerColor, onProductUpdate, taxRates }: {
+    product: LoanProduct;
     providerColor?: string;
-    onProductUpdate: (updatedProduct: LoanProduct) => void;
-    taxConfig: Tax;
+    onProductUpdate: (update: Partial<LoanProduct>) => void;
+    taxRates: { serviceFee: number; interest: number };
 }) {
     const { entityActions } = usePermissions();
+    const { isPending, markPending } = usePending();
     const { toast } = useToast();
     const [isOpen, setIsOpen] = useState(false);
     const [isSaving, setIsSaving] = useState(false);
 
     const productActions = entityActions('LoanProduct');
-    const canEditProduct = !!(productActions.create || productActions.update);
-    
-    const taxAppliedTo = useMemo(() => safeParseJson({appliedTo: taxConfig.appliedTo}, 'appliedTo', []), [taxConfig.appliedTo]);
+    const canEditProduct = !!productActions.update;
+    const productPending = isPending('products', product.id);
+    const canEditFields = canEditProduct && !productPending;
 
     const parsedProduct = useMemo(() => {
         const serviceFee = safeParseJson(product, 'serviceFee', { type: 'percentage', value: 0 });
         const dailyFee = safeParseJson(product, 'dailyFee', { type: 'percentage', value: 0, calculationBase: 'principal' });
         const penaltyRules = safeParseJson(product, 'penaltyRules', []).map((r: any) => ({ ...r, frequency: r.frequency || 'daily' }));
-        const penaltyPerInstallment = (product as any).penaltyPerInstallment ?? false;
         return {
             ...product,
             serviceFee,
             dailyFee,
-            penaltyRules,
-            penaltyPerInstallment,
+            penaltyRules: penaltyRules as PenaltyRule[],
+            penaltyPerInstallment: (product as any).penaltyPerInstallment ?? false,
         };
     }, [product]);
-    
-    const [config, setConfig] = useState(parsedProduct);
 
-    useEffect(() => {
-        setConfig(parsedProduct);
-    }, [parsedProduct]);
+    // Local, unsubmitted edits. Kept apart from the product so a change made in
+    // another tab (e.g. the status switch) doesn't wipe them.
+    const [edits, setEdits] = useState<Record<string, any>>({});
+    const config = useMemo(() => ({ ...parsedProduct, ...edits }) as typeof parsedProduct, [parsedProduct, edits]);
+    const hasEdits = Object.keys(edits).length > 0;
 
     const handleUpdate = (update: Partial<LoanProduct>) => {
-        if (!canEditProduct) return;
-        setConfig(prev => ({...prev, ...update}));
+        if (!canEditFields) return;
+        setEdits(prev => ({ ...prev, ...update }));
     };
 
     const handleAddPenaltyRule = () => {
-        if (!canEditProduct) {
-            toast({ title: 'Not authorized', description: 'You only have read access for Products.', variant: 'destructive' });
-            return;
-        }
+        if (!canEditFields) return;
         const newRule: PenaltyRule = {
             id: `penalty-${Date.now()}`,
             fromDay: 1,
@@ -1828,72 +1765,44 @@ function ProductConfiguration({ product, providerColor, onProductUpdate, taxConf
             value: 0,
             frequency: 'daily'
         };
-        setConfig(prev => ({...prev, penaltyRules: [...prev.penaltyRules, newRule]}));
+        handleUpdate({ penaltyRules: [...config.penaltyRules, newRule] });
     };
 
     const handleRemovePenaltyRule = (ruleId: string) => {
-        if (!canEditProduct) return;
-        setConfig(prev => ({...prev, penaltyRules: prev.penaltyRules.filter(r => r.id !== ruleId)}));
+        handleUpdate({ penaltyRules: config.penaltyRules.filter(r => r.id !== ruleId) });
     };
-    
+
     const handleUpdatePenaltyRule = (ruleId: string, updatedRule: PenaltyRule) => {
-         if (!canEditProduct) return;
-         setConfig(prev => ({
-            ...prev,
-            penaltyRules: prev.penaltyRules.map(r => r.id === ruleId ? updatedRule : r)
-        }));
+        handleUpdate({ penaltyRules: config.penaltyRules.map(r => r.id === ruleId ? updatedRule : r) });
     };
 
     const handleSave = async () => {
-        if (!canEditProduct) {
+        if (!canEditFields) {
             toast({ title: 'Not authorized', description: 'You only have read access for Products.', variant: 'destructive' });
             return;
         }
+
+        const candidate = normalizeFeeConfig(config);
+        const { changedKeys, payload } = buildChangePayload(
+            { id: product.id, name: product.name, providerId: product.providerId },
+            product,
+            candidate,
+            FEE_FIELDS,
+            normalizeFeeConfig(parsedProduct),
+        );
+        if (changedKeys.length === 0) {
+            toast({ title: 'Nothing to submit', description: 'You have not changed any fees, penalties or tiers.' });
+            return;
+        }
+
+        const problem = findFeeConfigProblem(candidate, config, changedKeys, toNumberOrNull(product.maxLoan));
+        if (problem) {
+            toast({ title: 'Check the configuration', description: problem, variant: 'destructive' });
+            return;
+        }
+
         setIsSaving(true);
         try {
-            // Validate loan amount tiers before submitting, in case the user
-            // edited tiers but didn't click the dedicated "Update Tiers" button.
-            const tiersToValidate = (config.loanAmountTiers || []) as any[];
-            for (let i = 0; i < tiersToValidate.length; i++) {
-                const tier = tiersToValidate[i];
-                const fromScore = Number(tier.fromScore);
-                const toScore = Number(tier.toScore);
-                const loanAmount = Number(tier.loanAmount);
-
-                if (isNaN(fromScore) || isNaN(toScore) || isNaN(loanAmount)) {
-                    toast({ title: 'Invalid Tier', description: `In tier #${i + 1}, all fields must be valid numbers.`, variant: 'destructive'});
-                    throw new Error('Invalid tier data');
-                }
-                if (loanAmount <= 0) {
-                    toast({ title: 'Invalid Loan Amount', description: `In tier #${i + 1}, the loan amount must be positive.`, variant: 'destructive'});
-                    throw new Error('Invalid loan amount');
-                }
-                if (config.maxLoan != null && !isNaN(Number(config.maxLoan)) && loanAmount > Number(config.maxLoan)) {
-                    toast({ title: 'Invalid Loan Amount', description: `In tier #${i + 1}, the loan amount cannot exceed the product's maximum of ${config.maxLoan}.`, variant: 'destructive'});
-                    throw new Error('Invalid loan amount');
-                }
-                if (fromScore > toScore) {
-                    toast({ title: 'Invalid Tier', description: `In tier #${i + 1}, the "From Score" cannot be greater than the "To Score".`, variant: 'destructive'});
-                    throw new Error('Invalid tier data');
-                }
-                if (i > 0) {
-                    const prevToScore = Number(tiersToValidate[i-1].toScore);
-                    if (fromScore <= prevToScore) {
-                        toast({ title: 'Overlapping Tiers', description: `Tier #${i + 1} overlaps with the previous tier. "From Score" must be greater than the previous "To Score".`, variant: 'destructive'});
-                        throw new Error('Overlapping Tiers');
-                    }
-                }
-            }
-
-            // Only include original fields for keys that are present in the updated config
-            const updateKeys = Object.keys(config).filter(k => (config as any)[k] !== undefined);
-            const pick = (obj: any, keys: string[]) => keys.reduce((acc: any, k: string) => { if (obj && (k in obj)) acc[k] = (obj as any)[k]; return acc; }, {});
-            const originalSubset = pick(product, updateKeys);
-
-            const payload = {
-                original: sanitizeProductForPayload(originalSubset), // The original product state before edits (sanitized)
-                updated: sanitizeProductForPayload(config),   // The new state from the form (sanitized)
-            };
             await postPendingChange({
                 entityType: 'LoanProduct',
                 entityId: product.id,
@@ -1901,12 +1810,12 @@ function ProductConfiguration({ product, providerColor, onProductUpdate, taxConf
                 payload: JSON.stringify(payload)
             }, 'Failed to submit changes for approval.');
 
-            // Update the parent state to reflect pending status
-            onProductUpdate({ ...config, status: 'Disabled', _optimisticPending: true } as any);
-            
+            markPending('products', product.id);
+            if (!isSafeOnlyProductUpdate(payload)) onProductUpdate({ status: 'Disabled' });
+
             toast({
                 title: 'Submitted for Approval',
-                description: `Changes for ${config.name} have been submitted successfully.`,
+                description: `Changes for ${product.name} are waiting for a checker. The product is disabled until then.`,
             });
         } catch (error: any) {
             toast({ title: 'Error', description: error.message, variant: 'destructive' });
@@ -1915,129 +1824,146 @@ function ProductConfiguration({ product, providerColor, onProductUpdate, taxConf
         }
     };
 
+    const switchStyle = { '--provider-color': providerColor } as React.CSSProperties;
+
     return (
         <Collapsible open={isOpen} onOpenChange={setIsOpen} className="space-y-2">
             <CollapsibleTrigger asChild>
-                 <button className="flex items-center justify-between w-full space-x-4 px-4 py-2 border rounded-lg bg-background hover:bg-muted/50 transition-colors">
-                    <h4 className="text-sm font-semibold">{product.name}</h4>
-                    {(config as any)._optimisticPending || config.status === 'PENDING_APPROVAL' ? (
-                        <Badge variant="outline">Pending Approval</Badge>
-                    ) : (
-                        <ChevronDown className="h-4 w-4 transition-transform duration-200 data-[state=open]:rotate-180" />
-                    )}
+                 <button type="button" className="flex items-center justify-between w-full gap-4 px-4 py-2 border rounded-lg bg-background hover:bg-muted/50 transition-colors">
+                    <div className="flex flex-wrap items-center gap-2 text-left">
+                        <h4 className="text-sm font-semibold">{product.name}</h4>
+                        {productPending && <PendingBadge />}
+                        {hasEdits && !productPending && <Badge variant="secondary">Unsaved changes</Badge>}
+                    </div>
+                    <ChevronDown className={cn('h-4 w-4 shrink-0 transition-transform duration-200', isOpen && 'rotate-180')} />
                 </button>
             </CollapsibleTrigger>
             <CollapsibleContent>
                  <Card className="border-t-0 rounded-t-none">
                     <CardContent className="space-y-4 pt-6">
+                        {productPending && (
+                            <p className="flex items-start gap-2 rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-200">
+                                <Clock className="mt-0.5 h-4 w-4 shrink-0" />
+                                A change to this product is waiting for approval. Fees and tiers are locked until a checker approves or rejects it.
+                            </p>
+                        )}
                         <div className="flex items-center justify-between border-b pb-4">
                             <div className="flex items-center gap-2">
                                 <Label htmlFor={`serviceFeeEnabled-${config.id}`} className="font-medium">Service Fee</Label>
-                                {taxAppliedTo.includes('serviceFee') && <Badge variant="outline" className="text-xs">Taxable ({taxConfig.rate}%)</Badge>}
+                                {taxRates.serviceFee > 0 && <Badge variant="outline" className="text-xs">Taxable ({taxRates.serviceFee}%)</Badge>}
                             </div>
                             <Switch
                                 id={`serviceFeeEnabled-${config.id}`}
-                                checked={config.serviceFeeEnabled}
+                                checked={!!config.serviceFeeEnabled}
                                 onCheckedChange={(checked) => handleUpdate({ serviceFeeEnabled: checked })}
-                                disabled={!canEditProduct}
+                                disabled={!canEditFields}
                                 className="data-[state=checked]:bg-[--provider-color]"
-                                style={{'--provider-color': providerColor} as React.CSSProperties}
+                                style={switchStyle}
                             />
                         </div>
-                    <FeeInput 
+                        <FeeInput
                             label="Fee Details"
                             fee={config.serviceFee}
                             onChange={(fee) => handleUpdate({ serviceFee: fee })}
-                            isEnabled={!!config.serviceFeeEnabled && canEditProduct}
+                            isEnabled={!!config.serviceFeeEnabled && canEditFields}
                         />
-                        
+
                         <div className="flex items-center justify-between border-b pb-4 pt-4">
                              <div className="flex items-center gap-2">
                                 <Label htmlFor={`dailyFeeEnabled-${config.id}`} className="font-medium">Daily Fee</Label>
-                                {taxAppliedTo.includes('interest') && <Badge variant="outline" className="text-xs">Taxable ({taxConfig.rate}%)</Badge>}
+                                {taxRates.interest > 0 && <Badge variant="outline" className="text-xs">Taxable ({taxRates.interest}%)</Badge>}
                             </div>
                             <Switch
                                 id={`dailyFeeEnabled-${config.id}`}
-                                checked={config.dailyFeeEnabled}
+                                checked={!!config.dailyFeeEnabled}
                                 onCheckedChange={(checked) => handleUpdate({ dailyFeeEnabled: checked })}
-                                disabled={!canEditProduct}
+                                disabled={!canEditFields}
                                 className="data-[state=checked]:bg-[--provider-color]"
-                                style={{'--provider-color': providerColor} as React.CSSProperties}
+                                style={switchStyle}
                             />
                         </div>
-                        <DailyFeeInput 
+                        <DailyFeeInput
                             label="Fee Details"
                             fee={config.dailyFee}
                             onChange={(fee) => handleUpdate({ dailyFee: fee })}
-                            isEnabled={!!config.dailyFeeEnabled && canEditProduct}
+                            isEnabled={!!config.dailyFeeEnabled && canEditFields}
                         />
-                        
+
                         <div className="flex items-center justify-between border-b pb-4 pt-4">
-                             <div className="flex items-center gap-2">
-                                <Label htmlFor={`penaltyRulesEnabled-${config.id}`} className="font-medium">Penalty Rules</Label>
-                            </div>
+                            <Label htmlFor={`penaltyRulesEnabled-${config.id}`} className="font-medium">Penalty Rules</Label>
                             <Switch
                                 id={`penaltyRulesEnabled-${config.id}`}
-                                checked={config.penaltyRulesEnabled}
+                                checked={!!config.penaltyRulesEnabled}
                                 onCheckedChange={(checked) => handleUpdate({ penaltyRulesEnabled: checked })}
-                                disabled={!canEditProduct}
+                                disabled={!canEditFields}
                                 className="data-[state=checked]:bg-[--provider-color]"
-                                style={{'--provider-color': providerColor} as React.CSSProperties}
+                                style={switchStyle}
                             />
                         </div>
-                            {config.isSalaryAdvance && (
-                                <div className="flex items-center justify-between mt-3">
-                                    <div className="flex items-center gap-2">
-                                        <Label htmlFor={`penaltyPerInstallment-${config.id}`} className="font-medium">Apply Penalty Per Installment</Label>
-                                        <div className="text-sm text-muted-foreground">(Each installment uses its own due date)</div>
-                                    </div>
-                                    <Switch
-                                        id={`penaltyPerInstallment-${config.id}`}
-                                        checked={!!config.penaltyPerInstallment}
-                                        onCheckedChange={(checked) => handleUpdate({ penaltyPerInstallment: checked })}
-                                        disabled={!canEditProduct}
-                                        className="data-[state=checked]:bg-[--provider-color]"
-                                        style={{'--provider-color': providerColor} as React.CSSProperties}
-                                    />
+                        {config.isSalaryAdvance && (
+                            <div className="flex items-center justify-between gap-4">
+                                <div>
+                                    <Label htmlFor={`penaltyPerInstallment-${config.id}`} className="font-medium">Apply Penalty Per Installment</Label>
+                                    <p className="text-sm text-muted-foreground">Each installment uses its own due date.</p>
+                                </div>
+                                <Switch
+                                    id={`penaltyPerInstallment-${config.id}`}
+                                    checked={!!config.penaltyPerInstallment}
+                                    onCheckedChange={(checked) => handleUpdate({ penaltyPerInstallment: checked })}
+                                    disabled={!canEditFields}
+                                    className="data-[state=checked]:bg-[--provider-color]"
+                                    style={switchStyle}
+                                />
+                            </div>
+                        )}
+                        <div className="space-y-2 p-4 border rounded-md bg-muted/50">
+                            {config.penaltyRules.length > 0 && (
+                                <div className={cn(PENALTY_GRID, 'hidden text-xs font-medium text-muted-foreground md:grid')}>
+                                    <span>From day</span><span>To day</span><span>Type</span><span>Frequency</span><span>Value</span><span />
                                 </div>
                             )}
-                        <div>
-                            <div className="space-y-2 p-4 border rounded-md bg-muted/50">
-                                {config.penaltyRules.map((rule) => (
-                                    <PenaltyRuleRow
-                                        key={rule.id}
-                                        rule={rule}
-                                        onChange={(updatedRule) => handleUpdatePenaltyRule(rule.id, updatedRule)}
-                                        onRemove={() => handleRemovePenaltyRule(rule.id)}
-                                        color={providerColor}
-                                        isEnabled={!!config.penaltyRulesEnabled && canEditProduct}
-                                    />
-                                ))}
-                                <Button variant="outline" size="sm" onClick={handleAddPenaltyRule} disabled={!config.penaltyRulesEnabled || !canEditProduct}>
-                                    <PlusCircle className="h-4 w-4 mr-2" /> Add Penalty Rule
-                                </Button>
-                            </div>
+                            {config.penaltyRules.length === 0 && (
+                                <p className="text-sm text-muted-foreground">No penalty rules. Days count from the due date; leave &ldquo;To day&rdquo; blank for no end.</p>
+                            )}
+                            {config.penaltyRules.map((rule) => (
+                                <PenaltyRuleRow
+                                    key={rule.id}
+                                    rule={rule}
+                                    onChange={(updatedRule) => handleUpdatePenaltyRule(rule.id, updatedRule)}
+                                    onRemove={() => handleRemovePenaltyRule(rule.id)}
+                                    isEnabled={!!config.penaltyRulesEnabled && canEditFields}
+                                />
+                            ))}
+                            <Button type="button" variant="outline" size="sm" onClick={handleAddPenaltyRule} disabled={!config.penaltyRulesEnabled || !canEditFields}>
+                                <PlusCircle className="h-4 w-4 mr-2" /> Add Penalty Rule
+                            </Button>
                         </div>
-                        
+
                         <div className="pt-4">
                             <LoanTiersForm
                                 product={config}
-                                onUpdate={(updatedProductData) => handleUpdate(updatedProductData)}
-                                color={providerColor}
+                                onUpdate={handleUpdate}
+                                locked={!canEditFields}
                             />
                         </div>
 
                 </CardContent>
-                <CardFooter>
-                        <Button 
-                            onClick={handleSave} 
+                <CardFooter className="flex flex-wrap justify-end gap-2">
+                        {hasEdits && !productPending && (
+                            <Button type="button" variant="outline" size="sm" onClick={() => setEdits({})} disabled={isSaving}>
+                                <Undo2 className="h-4 w-4 mr-2" /> Discard changes
+                            </Button>
+                        )}
+                        <Button
+                            type="button"
+                            onClick={handleSave}
                             size="sm"
                             style={{ backgroundColor: providerColor }}
-                            className="text-white ml-auto"
-                            disabled={!canEditProduct || isSaving || ((config as any)._optimisticPending || config.status === 'PENDING_APPROVAL')}
+                            className="text-white"
+                            disabled={!canEditFields || isSaving || !hasEdits}
                         >
                             {isSaving && <Loader2 className="mr-2 h-4 w-4 animate-spin"/>}
-                            {(config as any)._optimisticPending || config.status === 'PENDING_APPROVAL' ? 'Pending Approval' : 'Submit for Approval'}
+                            {productPending ? 'Pending Approval' : 'Submit for Approval'}
                         </Button>
                 </CardFooter>
             </Card>
@@ -2046,11 +1972,23 @@ function ProductConfiguration({ product, providerColor, onProductUpdate, taxConf
     );
 }
 
-function ConfigurationTab({ providers, onProductUpdate, taxConfig }: { 
+// Sums every active tax that applies to a component (fees are taxed by all of them).
+const activeTaxRate = (taxes: Tax[], component: 'serviceFee' | 'interest') =>
+    taxes
+        .filter(t => (t.status ?? 'ACTIVE').toUpperCase() === 'ACTIVE')
+        .filter(t => (safeParseJson({ appliedTo: t.appliedTo }, 'appliedTo', []) as string[]).includes(component))
+        .reduce((sum, t) => sum + (Number(t.rate) || 0), 0);
+
+function ConfigurationTab({ providers, onProductUpdate, taxConfigs }: {
     providers: LoanProvider[],
-    onProductUpdate: (providerId: string, updatedProduct: LoanProduct) => void;
-    taxConfig: Tax;
+    onProductUpdate: (providerId: string, productId: string, update: Partial<LoanProduct>) => void;
+    taxConfigs: Tax[];
 }) {
+    const taxRates = useMemo(() => ({
+        serviceFee: activeTaxRate(taxConfigs, 'serviceFee'),
+        interest: activeTaxRate(taxConfigs, 'interest'),
+    }), [taxConfigs]);
+
     if (providers.length === 0) {
         return (
             <Card>
@@ -2063,16 +2001,15 @@ function ConfigurationTab({ providers, onProductUpdate, taxConfig }: {
             </Card>
         );
     }
-    
+
     return (
-        <>
-        <Accordion type="multiple" className="w-full space-y-4">
+        <Accordion type="multiple" defaultValue={defaultOpenProviders(providers)} className="w-full space-y-4">
             {providers.map((provider) => (
                 <AccordionItem value={provider.id} key={provider.id} className="border rounded-lg bg-card">
                     <AccordionTrigger className="flex w-full items-center justify-between p-4 hover:no-underline">
                         <div className="flex items-center gap-4">
                             <IconDisplay iconName={provider.icon} className="h-6 w-6" />
-                            <div>
+                            <div className="text-left">
                                 <div className="text-lg font-semibold">{provider.name}</div>
                                 <p className="text-sm text-muted-foreground">{(provider.products || []).length} products to configure</p>
                             </div>
@@ -2084,15 +2021,14 @@ function ConfigurationTab({ providers, onProductUpdate, taxConfig }: {
                                 key={product.id}
                                 product={product}
                                 providerColor={provider.colorHex}
-                                onProductUpdate={(updatedProduct) => onProductUpdate(provider.id, updatedProduct)}
-                                taxConfig={taxConfig}
+                                onProductUpdate={(update) => onProductUpdate(provider.id, product.id, update)}
+                                taxRates={taxRates}
                             />
                        ))}
                     </AccordionContent>
                 </AccordionItem>
             ))}
         </Accordion>
-        </>
     );
 }
 
@@ -2101,297 +2037,110 @@ const TAX_COMPONENTS = [
     { id: 'interest', label: 'Daily Fee (Interest)' },
 ];
 
-function TaxTab({ initialTaxConfig }: { initialTaxConfig: Tax }) {
-    const [taxConfig, setTaxConfig] = useState(initialTaxConfig);
-
-    useEffect(() => {
-        setTaxConfig(initialTaxConfig);
-    }, [initialTaxConfig]);
-    
-    const appliedTo = useMemo(() => safeParseJson({appliedTo: taxConfig.appliedTo}, 'appliedTo', []), [taxConfig.appliedTo]);
+// Read-only summary. The calculations apply every active tax row, so list
+// them all (this used to show only the first row).
+function TaxTab({ taxConfigs }: { taxConfigs: Tax[] }) {
+    const { canModule } = usePermissions();
+    const canOpenTaxPage = canModule('tax', 'read');
 
     return (
         <Card>
-            <CardHeader className='flex-row items-start justify-between'>
-                <div>
-                    <CardTitle>Global Tax Configuration</CardTitle>
-                    <CardDescription>This is a read-only view of the current system-wide tax settings.</CardDescription>
+            <CardHeader className="flex flex-col gap-3 space-y-0 sm:flex-row sm:items-start sm:justify-between">
+                <div className="space-y-1.5">
+                    <CardTitle>Tax</CardTitle>
+                    <CardDescription>Read-only summary. Each active tax is added on top of the fee types it applies to.</CardDescription>
                 </div>
-                <Button asChild variant="outline" size="sm">
-                    <Link href="/admin/tax">
-                        <Pencil className="mr-2 h-4 w-4" />
-                        Edit Configuration
-                    </Link>
-                </Button>
+                {canOpenTaxPage && (
+                    <Button asChild variant="outline" size="sm">
+                        <Link href="/admin/tax">
+                            <Pencil className="mr-2 h-4 w-4" />
+                            Manage taxes
+                        </Link>
+                    </Button>
+                )}
             </CardHeader>
-            <CardContent className="space-y-6">
-                <div className="space-y-2">
-                    <Label>Tax Rate (%)</Label>
-                    <Input 
-                        value={`${taxConfig.rate}%`}
-                        readOnly
-                        className="max-w-xs bg-muted"
-                    />
-                </div>
-                <div className="space-y-4">
-                    <Label>Tax is Applied On</Label>
-                    <div className="space-y-2 rounded-md border p-4 bg-muted">
-                        {TAX_COMPONENTS.map(component => (
-                            <div key={component.id} className="flex items-center space-x-2">
-                                <Checkbox
-                                    id={`tax-on-${component.id}-readonly`}
-                                    checked={appliedTo.includes(component.id)}
-                                    disabled
-                                />
-                                <Label htmlFor={`tax-on-${component.id}-readonly`} className="font-normal">{component.label}</Label>
-                            </div>
-                        ))}
+            <CardContent>
+                {taxConfigs.length === 0 ? (
+                    <p className="text-sm text-muted-foreground">No tax is configured, so fees are not taxed.</p>
+                ) : (
+                    <div className="overflow-x-auto rounded-md border">
+                        <Table>
+                            <TableHeader>
+                                <TableRow>
+                                    <TableHead>Name</TableHead>
+                                    <TableHead className="text-right">Rate</TableHead>
+                                    <TableHead>Applied to</TableHead>
+                                    <TableHead>Type</TableHead>
+                                    <TableHead>Status</TableHead>
+                                </TableRow>
+                            </TableHeader>
+                            <TableBody>
+                                {taxConfigs.map(tax => {
+                                    const appliedTo = safeParseJson({ appliedTo: tax.appliedTo }, 'appliedTo', []) as string[];
+                                    const status = tax.status ?? 'ACTIVE';
+                                    const isActive = status.toUpperCase() === 'ACTIVE';
+                                    return (
+                                        <TableRow key={tax.id}>
+                                            <TableCell className="font-medium">{tax.name || 'Unnamed tax'}</TableCell>
+                                            <TableCell className="text-right tabular-nums">{tax.rate}%</TableCell>
+                                            <TableCell>
+                                                {appliedTo.length > 0 ? (
+                                                    <div className="flex flex-wrap gap-1">
+                                                        {appliedTo.map(id => (
+                                                            <Badge key={id} variant="outline">{TAX_COMPONENTS.find(c => c.id === id)?.label ?? id}</Badge>
+                                                        ))}
+                                                    </div>
+                                                ) : (
+                                                    <span className="text-sm text-muted-foreground">Nothing (has no effect)</span>
+                                                )}
+                                            </TableCell>
+                                            <TableCell className="text-sm">{tax.isInclusive ? 'Inclusive (deducted from principal)' : 'Exclusive'}</TableCell>
+                                            <TableCell>
+                                                <Badge variant={isActive ? 'default' : 'secondary'} className={cn(isActive && 'bg-green-600')}>
+                                                    {isActive ? 'Active' : status.replace(/_/g, ' ').toLowerCase()}
+                                                </Badge>
+                                            </TableCell>
+                                        </TableRow>
+                                    );
+                                })}
+                            </TableBody>
+                        </Table>
                     </div>
-                </div>
+                )}
             </CardContent>
         </Card>
     )
 }
 
-function EligibilityTab({ providers, onProvidersChange }: { 
+const readFileAsBase64 = (file: File) => new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+        const base64 = String(reader.result || '').split(',')[1];
+        if (base64) resolve(base64); else reject(new Error('Could not read the file.'));
+    };
+    reader.onerror = () => reject(reader.error ?? new Error('Could not read the file.'));
+    reader.readAsDataURL(file);
+});
+
+function EligibilityTab({ providers, onProductUpdate }: {
     providers: LoanProvider[],
-    onProvidersChange: (updater: React.SetStateAction<LoanProvider[]>) => void;
+    onProductUpdate: (providerId: string, productId: string, update: Partial<LoanProduct>) => void;
 }) {
-    const { entityActions } = usePermissions();
-    const { toast } = useToast();
-    const [isSaving, setIsSaving] = useState(false);
     const [viewingUpload, setViewingUpload] = useState<DataProvisioningUpload | null>(null);
 
-    const productActions = entityActions('LoanProduct');
-    const eligibilityActions = entityActions('EligibilityList');
-    const canUpdateProduct = !!(productActions.create || productActions.update);
-    const canCreateEligibilityList = !!eligibilityActions.create;
-    const canDeleteEligibilityList = !!eligibilityActions.delete;
-
-    const handleUpdateProduct = async (providerId: string, updatedProduct: Partial<LoanProduct>) => {
-        if (!canUpdateProduct) {
-            toast({ title: 'Not authorized', description: 'You only have read access for Products.', variant: 'destructive' });
-            return;
-        }
-        // Optimistically update UI
-        const previousState = JSON.parse(JSON.stringify(providers));
-        onProvidersChange(produce(draft => {
-            const provider = draft.find(p => p.id === providerId);
-            if (provider) {
-                const productIndex = provider.products.findIndex(p => p.id === updatedProduct.id);
-                if (productIndex !== -1) {
-                    provider.products[productIndex] = { ...provider.products[productIndex], ...updatedProduct };
-                }
-            }
-        }));
-
-        // Previously we auto-submitted changes to eligibility configuration (enable/link data source).
-        // New behaviour:
-        // - Selecting a data source or enabling eligibility does NOT auto-submit — admin can finish
-        //   the workflow (upload list, review) and then click "Submit for Approval".
-        // - Disabling eligibility (turning `dataProvisioningEnabled` from true -> false) *does*
-        //   require approval, so create a pending-change when the user disables it.
-
-        const originalProduct = previousState.find((p: LoanProvider) => p.id === providerId)?.products.find((p: LoanProduct) => p.id === updatedProduct.id);
-
-        // If we don't have the original product context, just return (no auto-persist).
-        if (!originalProduct) return;
-
-        const isDisablingEligibility = typeof (updatedProduct as any).dataProvisioningEnabled !== 'undefined'
-            && originalProduct.dataProvisioningEnabled === true
-            && (updatedProduct as any).dataProvisioningEnabled === false;
-
-        if (!isDisablingEligibility) {
-            // No automatic persistence for other eligibility edits — user must explicitly submit.
-            return;
-        }
-
-        // Create a pending change for disabling eligibility
-        setIsSaving(true);
-        try {
-            const body: any = { id: updatedProduct.id, dataProvisioningEnabled: false };
-            const payload = { original: originalProduct, updated: { ...originalProduct, ...body } };
-
-            await postPendingChange({
-                entityType: 'LoanProduct',
-                entityId: updatedProduct.id,
-                changeType: 'UPDATE',
-                payload: JSON.stringify(payload)
-            }, 'Failed to submit changes for approval');
-
-            toast({ title: 'Submitted for Approval', description: 'Disabling eligibility has been submitted for review.' });
-
-            // Mark product as pending in the UI
-            onProvidersChange(produce(draft => {
-                const provider = draft.find(p => p.id === providerId);
-                if (provider) {
-                    const product = provider.products.find(p => p.id === updatedProduct.id);
-                    if (product) { (product as any).status = 'Disabled'; (product as any)._optimisticPending = true; }
-                }
-            }));
-
-        } catch (error: any) {
-            // Revert optimistic change
-            onProvidersChange(previousState as any);
-            toast({ title: 'Error', description: error.message || 'Failed to update product', variant: 'destructive' });
-        } finally {
-            setIsSaving(false);
-        }
-    };
-    
-    const handleFilterFileUpload = async (event: React.ChangeEvent<HTMLInputElement>, product: LoanProduct) => {
-        const file = event.target.files?.[0];
-        if (!file || !product.dataProvisioningConfigId) return;
-
-        if (!canCreateEligibilityList) {
-            toast({ title: 'Not authorized', description: 'You only have read access for Eligibility.', variant: 'destructive' });
-            if (event.target) event.target.value = '';
-            return;
-        }
-
-        // Client-side validation: reject unsupported file types and oversized files early
-        const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB
-        const allowedTypes = ['application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'];
-        const allowedExtensions = ['xlsx'];
-        
-        const fileName = file.name || '';
-        const ext = fileName.split('.').pop()?.toLowerCase();
-        
-        // Validate file extension
-        if (!ext || !allowedExtensions.includes(ext)) {
-            toast({ 
-                title: 'Invalid file type', 
-                description: 'Only .xlsx files are allowed.', 
-                variant: 'destructive' 
-            });
-            if (event.target) event.target.value = '';
-            return;
-        }
-        
-        // Validate file type (MIME type)
-        if (file.type && !allowedTypes.includes(file.type) && !file.type.includes('sheet')) {
-            toast({ 
-                title: 'Invalid file type', 
-                description: 'Only .xlsx files are allowed.', 
-                variant: 'destructive' 
-            });
-            if (event.target) event.target.value = '';
-            return;
-        }
-        
-        // Validate file size
-        if (file.size > MAX_FILE_SIZE) {
-            toast({ 
-                title: 'File too large', 
-                description: 'Maximum file size is 10MB.', 
-                variant: 'destructive' 
-            });
-            if (event.target) event.target.value = '';
-            return;
-        }
-
-        setIsSaving(true);
-        try {
-            const fileReader = new FileReader();
-            fileReader.readAsDataURL(file);
-            fileReader.onload = async (e) => {
-                const fileContentBase64 = (e.target?.result as string)?.split(',')[1];
-                if (!fileContentBase64) {
-                    throw new Error("Could not read file content.");
-                }
-                 const tempUpload: DataProvisioningUpload = {
-                    id: `temp-${Date.now()}`,
-                    configId: product.dataProvisioningConfigId!,
-                    fileName: file.name,
-                    rowCount: 0, 
-                    uploadedAt: new Date().toISOString(),
-                    uploadedBy: 'you (unsaved)',
-                    status: 'PENDING_APPROVAL',
-                    fileContent: fileContentBase64,
-                } as any;
-                handleUpdateProduct(product.providerId, { id: product.id, eligibilityUpload: tempUpload });
-            };
-        } catch (error: any) {
-            toast({ title: "Error reading file", description: error.message, variant: 'destructive'});
-        } finally {
-            setIsSaving(false);
-            if (event.target) event.target.value = '';
-        }
-    };
-    
-    const handleEligibilitySubmitForApproval = async (product: LoanProduct) => {
-        if (!canCreateEligibilityList) {
-            toast({ title: 'Not authorized', description: 'You only have read access for Eligibility.', variant: 'destructive' });
-            return;
-        }
-        if (!product.eligibilityUpload || !(product.eligibilityUpload as any).fileContent) {
-            toast({ title: "No file to submit", description: "Please upload a file first.", variant: "destructive"});
-            return;
-        }
-
-        setIsSaving(true);
-        try {
-            const { eligibilityUpload } = product;
-            const payload = {
-                created: {
-                    configId: eligibilityUpload.configId,
-                    fileName: eligibilityUpload.fileName,
-                    fileContent: (eligibilityUpload as any).fileContent,
-                    productId: product.id,
-                }
-            };
-             await postPendingChange({
-                entityType: 'EligibilityList',
-                entityId: product.id,
-                changeType: 'CREATE',
-                payload: JSON.stringify(payload),
-            }, 'Failed to submit eligibility list for approval.');
-            toast({ title: "Submitted for Approval", description: `The new eligibility list for "${product.name}" is pending review.` });
-            
-            const finalUploadState = { ...product.eligibilityUpload, id: 'pending-approval', status: 'PENDING_APPROVAL', fileContent: undefined };
-            handleUpdateProduct(product.providerId, { id: product.id, eligibilityUpload: finalUploadState as any });
-
-        } catch (error: any) {
-            toast({ title: "Error", description: error.message, variant: "destructive" });
-        } finally {
-            setIsSaving(false);
-        }
-    };
-    
-    const handleDeleteFilter = async (product: LoanProduct) => {
-        if (!product.eligibilityUploadId) return;
-
-        if (!canDeleteEligibilityList) {
-            toast({ title: 'Not authorized', description: 'You only have read access for Eligibility.', variant: 'destructive' });
-            return;
-        }
-        setIsSaving(true);
-        try {
-            const response = await fetch(`/api/settings/products/eligibility-filter?productId=${product.id}`, {
-                method: 'DELETE',
-            });
-            if (!response.ok) {
-                const errorData = await response.json();
-                throw new Error(errorData.error || 'Failed to delete filter.');
-            }
-            handleUpdateProduct(product.providerId, { id: product.id, eligibilityFilter: null, eligibilityUploadId: null, eligibilityUpload: undefined });
-            toast({ title: "Filter Deleted", description: "Eligibility list has been removed." });
-        } catch (error: any) {
-             toast({ title: "Error", description: error.message, variant: "destructive" });
-        } finally {
-            setIsSaving(false);
-        }
-    };
+    if (providers.length === 0) {
+        return <Card><CardHeader><CardTitle>Eligibility</CardTitle><CardDescription>No providers available.</CardDescription></CardHeader></Card>;
+    }
 
     return (
         <>
-            <Accordion type="multiple" className="w-full space-y-4">
+            <Accordion type="multiple" defaultValue={defaultOpenProviders(providers)} className="w-full space-y-4">
                 {providers.map((provider) => (
                     <AccordionItem value={provider.id} key={provider.id} className="border rounded-lg bg-card">
                         <AccordionTrigger className="flex w-full items-center justify-between p-4 hover:no-underline">
                             <div className="flex items-center gap-4">
                                 <IconDisplay iconName={provider.icon} className="h-6 w-6" />
-                                <div>
+                                <div className="text-left">
                                     <div className="text-lg font-semibold">{provider.name}</div>
                                     <p className="text-sm text-muted-foreground">Managing {(provider.products || []).length} products</p>
                                 </div>
@@ -2399,111 +2148,21 @@ function EligibilityTab({ providers, onProvidersChange }: {
                         </AccordionTrigger>
                         <AccordionContent className="p-4 border-t space-y-6">
                             {(provider.products || []).map(product => (
-                                <Card key={product.id}>
-                                    <CardHeader>
-                                        <CardTitle className="text-base">{product.name}</CardTitle>
-                                    </CardHeader>
-                                    <CardContent className="space-y-4">
-                                        <div className="flex items-center space-x-2">
-                                            <Switch
-                                                id={`dataProvisioningEnabled-${product.id}`}
-                                                checked={!!product.dataProvisioningEnabled}
-                                                onCheckedChange={(checked) => handleUpdateProduct(provider.id, { id: product.id, dataProvisioningEnabled: checked })}
-                                                className="data-[state=checked]:bg-[--provider-color]"
-                                                style={{ '--provider-color': provider.colorHex } as React.CSSProperties}
-                                                disabled={!canUpdateProduct || ((product as any)._optimisticPending || product.status === 'PENDING_APPROVAL')}
-                                            />
-                                            <Label htmlFor={`dataProvisioningEnabled-${product.id}`}>Enable Eligibility Allow-List</Label>
-                                        </div>
-
-                                        {product.dataProvisioningEnabled && (
-                                            <div className="pl-8 space-y-4">
-                                                <div className="space-y-2">
-                                                    <Label>Link Data Source</Label>
-                                                    <Select
-                                                        value={product.dataProvisioningConfigId || ''}
-                                                        onValueChange={(value) => handleUpdateProduct(provider.id, { id: product.id, dataProvisioningConfigId: value })}
-                                                        disabled={!canUpdateProduct || ((product as any)._optimisticPending || product.status === 'PENDING_APPROVAL')}
-                                                    >
-                                                        <SelectTrigger className="w-full">
-                                                            <SelectValue placeholder="Select a data source..." />
-                                                        </SelectTrigger>
-                                                        <SelectContent>
-                                                            {(provider.dataProvisioningConfigs || []).map(config => (
-                                                                <SelectItem key={config.id} value={config.id}>{config.name}</SelectItem>
-                                                            ))}
-                                                        </SelectContent>
-                                                    </Select>
-                                                </div>
-                                                <div className="space-y-2">
-                                                    <Label>Upload List</Label>
-                                                    <div className="flex items-center gap-4">
-                                                        <Button asChild variant="outline" size="sm">
-                                                            <label
-                                                                htmlFor={`filter-upload-${product.id}`}
-                                                                className={cn(
-                                                                    "cursor-pointer",
-                                                                    (!product.dataProvisioningConfigId || !canCreateEligibilityList) && 'cursor-not-allowed opacity-50',
-                                                                )}
-                                                            >
-                                                                <Upload className="h-4 w-4 mr-2" />
-                                                                {isSaving ? "Uploading..." : "Upload Excel File"}
-                                                                <input
-                                                                    id={`filter-upload-${product.id}`}
-                                                                    type="file"
-                                                                    accept=".xlsx, .xls"
-                                                                    onChange={(e) => handleFilterFileUpload(e, product)}
-                                                                    className="hidden"
-                                                                    disabled={isSaving || !product.dataProvisioningConfigId || !canCreateEligibilityList}
-                                                                />
-                                                            </label>
-                                                        </Button>
-                                                        <p className="text-xs text-muted-foreground">The headers must match the linked data source.</p>
-                                                    </div>
-                                                </div>
-                                                <div className="space-y-2">
-                                                    <Label>Uploaded List</Label>
-                                                    {product.eligibilityUpload ? (
-                                                        <div className="border rounded-lg p-3">
-                                                            <div className="flex justify-between items-start">
-                                                                <div>
-                                                                    <p className="font-medium">{product.eligibilityUpload.fileName}</p>
-                                                                    <p className="text-sm text-muted-foreground">
-                                                                        {product.eligibilityUpload.status === 'PENDING_APPROVAL' ? 'Pending Approval' : `By ${product.eligibilityUpload.uploadedBy} on ${format(new Date(product.eligibilityUpload.uploadedAt), "MMM d, yyyy 'at' h:mm a")}`}
-                                                                    </p>
-                                                                </div>
-                                                                <div className="flex gap-2 items-center">
-                                                                    <Button variant="outline" size="sm" onClick={() => setViewingUpload(product.eligibilityUpload ?? null)}>View</Button>
-                                                                    {canDeleteEligibilityList && (
-                                                                        <Button variant="destructive" size="sm" onClick={() => handleDeleteFilter(product)}>
-                                                                            Delete List
-                                                                        </Button>
-                                                                    )}
-                                                                </div>
-                                                            </div>
-                                                            {(product.eligibilityUpload as any).fileContent && (
-                                                                <div className="mt-2 text-right">
-                                                                     <Button size="sm" onClick={() => handleEligibilitySubmitForApproval(product)} disabled={!canCreateEligibilityList || isSaving}>
-                                                                        Submit Eligibility for Approval
-                                                                     </Button>
-                                                                </div>
-                                                            )}
-                                                        </div>
-                                                    ) : (
-                                                        <p className="text-sm text-muted-foreground">No eligibility list has been uploaded for this product.</p>
-                                                    )}
-                                                </div>
-                                            </div>
-                                        )}
-                                    </CardContent>
-                                </Card>
+                                <EligibilityProductCard
+                                    key={product.id}
+                                    provider={provider}
+                                    product={product}
+                                    onProductUpdate={(update) => onProductUpdate(provider.id, product.id, update)}
+                                    onView={setViewingUpload}
+                                />
                             ))}
                         </AccordionContent>
                     </AccordionItem>
                 ))}
             </Accordion>
-             {viewingUpload && (
-                 <UploadDataViewerDialog
+            {viewingUpload && (
+                <UploadDataViewerDialog
+                    key={viewingUpload.id}
                     upload={viewingUpload}
                     onClose={() => setViewingUpload(null)}
                 />
@@ -2512,97 +2171,448 @@ function EligibilityTab({ providers, onProvidersChange }: {
     );
 }
 
-function LoanCycleTab({ providers, onProviderUpdate }: {
-    providers: LoanProvider[],
-    onProviderUpdate: (providerId: string, productId: string, update: Partial<LoanProduct>) => void;
+function EligibilityProductCard({ provider, product, onProductUpdate, onView }: {
+    provider: LoanProvider;
+    product: LoanProduct;
+    onProductUpdate: (update: Partial<LoanProduct>) => void;
+    onView: (upload: DataProvisioningUpload) => void;
 }) {
+    const { entityActions } = usePermissions();
+    const { isPending, markPending } = usePending();
+    const { toast } = useToast();
+
+    const canUpdateProduct = !!entityActions('LoanProduct').update;
+    const eligibilityActions = entityActions('EligibilityList');
+    const canCreateList = !!eligibilityActions.create;
+    const canDeleteList = !!eligibilityActions.delete;
+
+    const productPending = isPending('products', product.id);
+    const listPending = isPending('eligibility', product.id);
+
+    // Switching on and picking a data source are staged here and take effect
+    // when the uploaded list is approved (approval enables the allow-list).
+    const [enabled, setEnabled] = useState(!!product.dataProvisioningEnabled);
+    const [configId, setConfigId] = useState<string>(product.dataProvisioningConfigId || '');
+    const [staged, setStaged] = useState<(DataProvisioningUpload & { fileContent: string }) | null>(null);
+    const [busy, setBusy] = useState<null | 'reading' | 'submitting' | 'disabling' | 'deleting'>(null);
+    const [confirmDelete, setConfirmDelete] = useState(false);
+
+    const configs = provider.dataProvisioningConfigs || [];
+    const selectedConfig = configs.find(c => c.id === configId);
+    const identifierColumn = selectedConfig?.columns?.find(c => c.isIdentifier)?.name;
+    const currentList = product.eligibilityUpload && product.eligibilityUploadId ? product.eligibilityUpload : null;
+
+    const handleToggle = async (checked: boolean) => {
+        if (!canUpdateProduct) {
+            toast({ title: 'Not authorized', description: 'You only have read access for Products.', variant: 'destructive' });
+            return;
+        }
+        if (checked || !product.dataProvisioningEnabled) {
+            // Staged until a list is approved.
+            setEnabled(checked);
+            if (!checked) setStaged(null);
+            return;
+        }
+        // Turning off a live allow-list opens the product to everyone, so it
+        // goes to a checker.
+        setBusy('disabling');
+        try {
+            const { payload } = buildChangePayload(
+                { id: product.id, name: product.name, providerId: product.providerId },
+                product,
+                { dataProvisioningEnabled: false },
+                ['dataProvisioningEnabled'],
+            );
+            await postPendingChange({
+                entityType: 'LoanProduct',
+                entityId: product.id,
+                changeType: 'UPDATE',
+                payload: JSON.stringify(payload)
+            }, 'Failed to submit changes for approval');
+            markPending('products', product.id);
+            toast({ title: 'Submitted for Approval', description: 'Turning off the allow-list is waiting for a checker. Until then the list still applies.' });
+        } catch (error: any) {
+            toast({ title: 'Error', description: error.message || 'Failed to submit the change.', variant: 'destructive' });
+        } finally {
+            setBusy(null);
+        }
+    };
+
+    const handleFile = async (input: HTMLInputElement) => {
+        const file = input.files?.[0];
+        input.value = '';
+        if (!file || !selectedConfig) return;
+        if (!canCreateList) {
+            toast({ title: 'Not authorized', description: 'You only have read access for Eligibility.', variant: 'destructive' });
+            return;
+        }
+        if (!/\.xlsx$/i.test(file.name)) {
+            toast({ title: 'Invalid file type', description: 'Use an .xlsx file.', variant: 'destructive' });
+            return;
+        }
+        if (file.size > 10 * 1024 * 1024) {
+            toast({ title: 'File too large', description: 'Maximum file size is 10MB.', variant: 'destructive' });
+            return;
+        }
+
+        setBusy('reading');
+        try {
+            // Same check the approval runs, so a wrong file fails now rather
+            // than when the checker approves it.
+            const workbook = new ExcelJS.Workbook();
+            await workbook.xlsx.load(await file.arrayBuffer());
+            const sheet = workbook.worksheets[0];
+            const headers: string[] = [];
+            sheet?.getRow(1).eachCell(cell => { headers.push(cellToText(cell.value).trim()); });
+            if (identifierColumn && !headers.includes(identifierColumn)) {
+                throw new Error(`The first row must contain the identifier column "${identifierColumn}". Found: ${headers.join(', ') || 'no headers'}.`);
+            }
+            if (!sheet || sheet.rowCount < 2) throw new Error('The file has no data rows.');
+
+            setStaged({
+                id: `temp-${file.lastModified}-${file.size}`,
+                configId: selectedConfig.id,
+                fileName: file.name,
+                rowCount: sheet.rowCount - 1,
+                uploadedAt: new Date().toISOString(),
+                uploadedBy: 'you (not submitted)',
+                fileContent: await readFileAsBase64(file),
+            } as DataProvisioningUpload & { fileContent: string });
+        } catch (error: any) {
+            toast({ title: 'Could not use this file', description: error.message, variant: 'destructive' });
+        } finally {
+            setBusy(null);
+        }
+    };
+
+    const handleSubmitList = async () => {
+        if (!staged) return;
+        setBusy('submitting');
+        try {
+            await postPendingChange({
+                entityType: 'EligibilityList',
+                entityId: product.id,
+                changeType: 'CREATE',
+                payload: JSON.stringify({
+                    created: { configId: staged.configId, fileName: staged.fileName, fileContent: staged.fileContent, productId: product.id },
+                }),
+            }, 'Failed to submit eligibility list for approval.');
+            markPending('eligibility', product.id);
+            setStaged(null);
+            toast({ title: 'Submitted for Approval', description: `Once approved, only borrowers on this list can apply for ${product.name}.` });
+        } catch (error: any) {
+            toast({ title: 'Error', description: error.message, variant: 'destructive' });
+        } finally {
+            setBusy(null);
+        }
+    };
+
+    const handleDeleteList = async () => {
+        setConfirmDelete(false);
+        setBusy('deleting');
+        try {
+            const response = await fetch(`/api/settings/products/eligibility-filter?productId=${product.id}`, { method: 'DELETE' });
+            if (!response.ok) {
+                const errorData = await response.json().catch(() => ({}));
+                throw new Error(errorData.error || 'Failed to delete the list.');
+            }
+            onProductUpdate({ eligibilityFilter: null, eligibilityUploadId: null, eligibilityUpload: undefined });
+            toast({ title: 'List deleted', description: `${product.name} is no longer restricted to an allow-list.` });
+        } catch (error: any) {
+            toast({ title: 'Error', description: error.message, variant: 'destructive' });
+        } finally {
+            setBusy(null);
+        }
+    };
+
+    const switchLocked = !canUpdateProduct || productPending || busy !== null;
+    const uploadLocked = !canCreateList || listPending || !selectedConfig || busy !== null;
+
+    return (
+        <Card>
+            <CardHeader className="pb-3">
+                <div className="flex flex-wrap items-center gap-2">
+                    <CardTitle className="text-base">{product.name}</CardTitle>
+                    {product.dataProvisioningEnabled && currentList
+                        ? <Badge className="bg-green-600">Allow-list on</Badge>
+                        : <Badge variant="secondary">Open to all eligible borrowers</Badge>}
+                    {listPending && <PendingBadge />}
+                </div>
+            </CardHeader>
+            <CardContent className="space-y-4">
+                <div className="flex items-start space-x-2">
+                    <Switch
+                        id={`dataProvisioningEnabled-${product.id}`}
+                        checked={enabled}
+                        onCheckedChange={handleToggle}
+                        className="data-[state=checked]:bg-[--provider-color]"
+                        style={{ '--provider-color': provider.colorHex } as React.CSSProperties}
+                        disabled={switchLocked}
+                    />
+                    <div>
+                        <Label htmlFor={`dataProvisioningEnabled-${product.id}`}>Restrict to an eligibility allow-list</Label>
+                        <p className="text-xs text-muted-foreground">
+                            {product.dataProvisioningEnabled
+                                ? 'Turning this off needs approval.'
+                                : 'Takes effect when a checker approves the list you upload.'}
+                        </p>
+                    </div>
+                </div>
+
+                {enabled && (
+                    <div className="space-y-4 sm:pl-8">
+                        <div className="space-y-2">
+                            <Label>Data source</Label>
+                            {configs.length === 0 ? (
+                                <p className="text-sm text-muted-foreground">
+                                    This provider has no data sources yet. Create one on the{' '}
+                                    <Link href="/admin/credit-score-engine" className="underline">Credit Score Engine</Link> page.
+                                </p>
+                            ) : (
+                                <Select
+                                    value={configId || undefined}
+                                    onValueChange={setConfigId}
+                                    disabled={listPending || busy !== null}
+                                >
+                                    <SelectTrigger className="w-full sm:max-w-sm">
+                                        <SelectValue placeholder="Select a data source..." />
+                                    </SelectTrigger>
+                                    <SelectContent>
+                                        {configs.map(config => (
+                                            <SelectItem key={config.id} value={config.id}>{config.name}</SelectItem>
+                                        ))}
+                                    </SelectContent>
+                                </Select>
+                            )}
+                            {selectedConfig && (
+                                <p className="text-xs text-muted-foreground">
+                                    Expected columns: {(selectedConfig.columns || []).map(c => c.name).join(', ') || 'none defined'}
+                                    {identifierColumn && <> · borrowers are matched on <span className="font-medium">{identifierColumn}</span></>}
+                                </p>
+                            )}
+                        </div>
+
+                        <div className="space-y-2">
+                            <Label htmlFor={`filter-upload-${product.id}`}>Upload list (.xlsx)</Label>
+                            <Input
+                                id={`filter-upload-${product.id}`}
+                                type="file"
+                                accept=".xlsx"
+                                onChange={(e) => handleFile(e.currentTarget)}
+                                disabled={uploadLocked}
+                                className="max-w-sm cursor-pointer"
+                            />
+                            {listPending && <p className="text-xs text-muted-foreground">A list for this product is already waiting for approval.</p>}
+                        </div>
+
+                        {staged && (
+                            <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-dashed p-3">
+                                <div>
+                                    <p className="font-medium">{staged.fileName}</p>
+                                    <p className="text-sm text-muted-foreground">{staged.rowCount} rows · not submitted yet</p>
+                                </div>
+                                <div className="flex flex-wrap gap-2">
+                                    <Button type="button" variant="outline" size="sm" onClick={() => onView(staged)}>Preview</Button>
+                                    <Button type="button" variant="ghost" size="sm" onClick={() => setStaged(null)} disabled={busy !== null}>Remove</Button>
+                                    <Button type="button" size="sm" onClick={handleSubmitList} disabled={busy !== null}>
+                                        {busy === 'submitting' && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+                                        Submit for Approval
+                                    </Button>
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                )}
+
+                <div className="space-y-2">
+                    <Label>Approved list</Label>
+                    {currentList ? (
+                        <div className="flex flex-wrap items-start justify-between gap-3 rounded-lg border p-3">
+                            <div>
+                                <p className="font-medium">{currentList.fileName}</p>
+                                <p className="text-sm text-muted-foreground">
+                                    {currentList.rowCount} rows · uploaded {format(new Date(currentList.uploadedAt), "MMM d, yyyy 'at' h:mm a")}
+                                </p>
+                            </div>
+                            <div className="flex gap-2">
+                                <Button type="button" variant="outline" size="sm" onClick={() => onView(currentList)}>View</Button>
+                                {canDeleteList && (
+                                    <Button type="button" variant="destructive" size="sm" onClick={() => setConfirmDelete(true)} disabled={busy !== null}>
+                                        {busy === 'deleting' && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+                                        Delete List
+                                    </Button>
+                                )}
+                            </div>
+                        </div>
+                    ) : (
+                        <p className="text-sm text-muted-foreground">No eligibility list has been approved for this product.</p>
+                    )}
+                </div>
+            </CardContent>
+
+            <AlertDialog open={confirmDelete} onOpenChange={setConfirmDelete}>
+                <AlertDialogContent>
+                    <AlertDialogHeader>
+                        <AlertDialogTitle className="flex items-center gap-2">
+                            <AlertTriangle className="h-5 w-5 text-destructive" /> Delete the eligibility list for {product.name}?
+                        </AlertDialogTitle>
+                        <AlertDialogDescription>
+                            This takes effect immediately, without approval. With no list, the product is no longer restricted:
+                            every borrower who passes the other checks can apply.
+                        </AlertDialogDescription>
+                    </AlertDialogHeader>
+                    <AlertDialogFooter>
+                        <AlertDialogCancel>Cancel</AlertDialogCancel>
+                        <AlertDialogAction className={buttonVariants({ variant: 'destructive' })} onClick={handleDeleteList}>Delete list</AlertDialogAction>
+                    </AlertDialogFooter>
+                </AlertDialogContent>
+            </AlertDialog>
+        </Card>
+    );
+}
+
+function LoanCycleTab({ providers }: { providers: LoanProvider[] }) {
     if (providers.length === 0) {
         return <Card><CardHeader><CardTitle>Loan Cycle Configuration</CardTitle><CardDescription>No providers available.</CardDescription></CardHeader></Card>;
     }
     return (
-        <Accordion type="multiple" className="w-full space-y-4">
-            {providers.map((provider) => (
-                 <AccordionItem value={provider.id} key={provider.id} className="border rounded-lg bg-card">
-                     <AccordionTrigger className="flex w-full items-center justify-between p-4 hover:no-underline">
-                        <div className="flex items-center gap-4">
-                            <IconDisplay iconName={provider.icon} className="h-6 w-6" />
-                            <div>
-                                <div className="text-lg font-semibold">{provider.name}</div>
-                                <p className="text-sm text-muted-foreground">Configuring {(provider.products || []).length} products</p>
+        <div className="space-y-4">
+            <p className="text-sm text-muted-foreground">
+                Limits how much of their scored loan amount a borrower can take, based on their credit-score grade (rows)
+                and how many qualifying loans they have had (columns). A borrower whose score is below every grade is not limited.
+            </p>
+            <Accordion type="multiple" defaultValue={defaultOpenProviders(providers)} className="w-full space-y-4">
+                {providers.map((provider) => (
+                     <AccordionItem value={provider.id} key={provider.id} className="border rounded-lg bg-card">
+                         <AccordionTrigger className="flex w-full items-center justify-between p-4 hover:no-underline">
+                            <div className="flex items-center gap-4">
+                                <IconDisplay iconName={provider.icon} className="h-6 w-6" />
+                                <div className="text-left">
+                                    <div className="text-lg font-semibold">{provider.name}</div>
+                                    <p className="text-sm text-muted-foreground">Configuring {(provider.products || []).length} products</p>
+                                </div>
                             </div>
-                        </div>
-                    </AccordionTrigger>
-                    <AccordionContent className="p-4 border-t space-y-6">
-                        {(provider.products || []).map(product => (
-                             <LoanCycleForm 
-                                key={product.id}
-                                product={product} 
-                                onUpdate={(update) => onProviderUpdate(provider.id, product.id, update)}
-                                providerColor={provider.colorHex}
-                            />
-                        ))}
-                    </AccordionContent>
-                 </AccordionItem>
-            ))}
-        </Accordion>
+                        </AccordionTrigger>
+                        <AccordionContent className="p-4 border-t space-y-6">
+                            {(provider.products || []).map(product => (
+                                 <LoanCycleForm
+                                    key={product.id}
+                                    product={product}
+                                    providerColor={provider.colorHex}
+                                />
+                            ))}
+                        </AccordionContent>
+                     </AccordionItem>
+                ))}
+            </Accordion>
+        </div>
     )
 }
 
-function LoanCycleForm({ product, onUpdate, providerColor }: {
+type CycleRangeDraft = { label: string; min: number | ''; max: number | '' };
+type CycleGradeDraft = { label: string; minScore: number | ''; percentages: Array<number | ''> };
+
+const LOAN_CYCLE_METRICS: Array<{ value: LoanCycleConfig['metric']; label: string }> = [
+    { value: 'TOTAL_COUNT', label: 'Total loans count' },
+    { value: 'PAID_ON_TIME', label: 'On-time repayments' },
+    { value: 'PAID_EARLY', label: 'Early repayments' },
+    { value: 'PAID_LATE', label: 'Late repayments' },
+];
+
+const toRangeDrafts = (ranges: any): CycleRangeDraft[] =>
+    Array.isArray(ranges) ? ranges.map((r: any) => ({ label: r.label ?? `${r.min}-${r.max}`, min: r.min ?? '', max: r.max ?? '' })) : [];
+const toGradeDrafts = (grades: any): CycleGradeDraft[] =>
+    Array.isArray(grades) ? grades.map((g: any) => ({ label: g.label ?? '', minScore: g.minScore ?? '', percentages: Array.isArray(g.percentages) ? g.percentages : [] })) : [];
+
+// Returns a message for the first problem, or null when the grid is usable.
+const findLoanCycleProblem = (metric: string | null, ranges: CycleRangeDraft[], grades: CycleGradeDraft[]): string | null => {
+    if (!metric) return 'Choose a progression metric.';
+    if (ranges.length === 0) return 'Add at least one cycle range.';
+    for (let i = 0; i < ranges.length; i++) {
+        const r = ranges[i];
+        const name = `Range ${i + 1}`;
+        if (!r.label.trim()) return `${name}: enter a label.`;
+        if (r.min === '' || r.max === '' || !Number.isInteger(r.min) || !Number.isInteger(r.max) || r.min < 0) return `${name}: min and max must be whole numbers, 0 or more.`;
+        if (r.min > r.max) return `${name}: min cannot be greater than max.`;
+        const prev = ranges[i - 1];
+        if (prev && prev.max !== '' && r.min <= prev.max) return `${name} overlaps the range before it. List ranges from lowest to highest.`;
+    }
+    if (grades.length === 0) return 'Add at least one grade.';
+    const scores = new Set<number>();
+    for (let i = 0; i < grades.length; i++) {
+        const g = grades[i];
+        const name = g.label.trim() || `Grade ${i + 1}`;
+        if (!g.label.trim()) return `Grade ${i + 1}: enter a label.`;
+        if (g.minScore === '' || !Number.isFinite(g.minScore)) return `${name}: enter a minimum score.`;
+        if (scores.has(g.minScore)) return `${name}: another grade already uses minimum score ${g.minScore}.`;
+        scores.add(g.minScore);
+        for (let c = 0; c < ranges.length; c++) {
+            const p = g.percentages[c];
+            if (p === '' || p === undefined || !Number.isFinite(p) || p < 0 || p > 100) return `${name}, ${ranges[c].label || `range ${c + 1}`}: enter a percentage from 0 to 100.`;
+        }
+    }
+    return null;
+};
+
+function LoanCycleForm({ product, providerColor }: {
     product: LoanProduct,
-    onUpdate: (update: Partial<LoanProduct>) => void,
     providerColor?: string;
 }) {
     const { toast } = useToast();
     const { entityActions } = usePermissions();
+    const { isPending, markPending } = usePending();
     const loanCycleActions = entityActions('LoanCycleConfig');
     const [loanCycleConfig, setLoanCycleConfig] = useState<LoanCycleConfig | null>(null);
+    const [loadState, setLoadState] = useState<'loading' | 'ready' | 'error'>('loading');
+    const [reloadKey, setReloadKey] = useState(0);
     const [editingMetric, setEditingMetric] = useState<LoanCycleConfig['metric'] | null>(null);
     const [editingEnabled, setEditingEnabled] = useState<boolean>(true);
-    const [editingCycleRanges, setEditingCycleRanges] = useState<Array<{ label: string; min: number | ''; max: number | '' }>>([]);
-    const [editingGrades, setEditingGrades] = useState<Array<{ label: string; minScore: number | ''; percentages: number[] }>>([]);
-    const [newCycleLabel, setNewCycleLabel] = useState<string>('');
+    const [editingCycleRanges, setEditingCycleRanges] = useState<CycleRangeDraft[]>([]);
+    const [editingGrades, setEditingGrades] = useState<CycleGradeDraft[]>([]);
     const [isSavingLoanCycle, setIsSavingLoanCycle] = useState(false);
     const [isOpen, setIsOpen] = useState(false);
 
+    const pending = isPending('loanCycles', product.id);
     const canEditLoanCycle = loanCycleConfig ? loanCycleActions.update : loanCycleActions.create;
-    const loanCycleReadOnly = !canEditLoanCycle;
+    // Saving before the current config loads could submit a CREATE over an
+    // existing one, so the form stays locked until it has loaded.
+    const loanCycleReadOnly = !canEditLoanCycle || pending || loadState !== 'ready';
+
+    const resetDrafts = useCallback((config: LoanCycleConfig | null) => {
+        setEditingMetric(config?.metric ?? null);
+        setEditingEnabled(typeof config?.enabled === 'boolean' ? config.enabled : true);
+        setEditingCycleRanges(toRangeDrafts(config?.cycleRanges));
+        setEditingGrades(toGradeDrafts(config?.grades));
+    }, []);
 
     useEffect(() => {
-        let mounted = true;
-        async function load() {
+        let cancelled = false;
+        (async () => {
             try {
                 const res = await fetch(`/api/settings/products/loan-cycle?productId=${product.id}`);
-                if (!res.ok) return;
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
                 const data = await res.json();
-                if (!mounted) return;
-                if (!data) {
-                    setLoanCycleConfig(null);
-                    setEditingMetric(null);
-                    setEditingCycleRanges([]);
-                    setEditingGrades([]);
-                    return;
-                }
-                const rangesParsed = typeof data.cycleRanges === 'string' ? JSON.parse(data.cycleRanges) : data.cycleRanges;
-                const gradesParsed = typeof data.grades === 'string' ? JSON.parse(data.grades) : data.grades;
-                setLoanCycleConfig({ ...data, cycleRanges: rangesParsed, grades: gradesParsed });
-                setEditingMetric(data.metric);
-                setEditingEnabled(typeof data.enabled === 'boolean' ? data.enabled : true);
-                setEditingCycleRanges(Array.isArray(rangesParsed) ? rangesParsed.map((r: any) => ({ label: r.label ?? `${r.min}-${r.max}`, min: r.min ?? '', max: r.max ?? '' })) : []);
-                setEditingGrades(Array.isArray(gradesParsed) ? gradesParsed.map((g: any) => ({ label: g.label ?? '', minScore: g.minScore ?? '', percentages: Array.isArray(g.percentages) ? g.percentages : [] })) : []);
-            } catch (err) {
-                // ignore errors for now
+                if (cancelled) return;
+                const config = data
+                    ? {
+                        ...data,
+                        cycleRanges: typeof data.cycleRanges === 'string' ? JSON.parse(data.cycleRanges) : data.cycleRanges,
+                        grades: typeof data.grades === 'string' ? JSON.parse(data.grades) : data.grades,
+                    }
+                    : null;
+                setLoanCycleConfig(config);
+                resetDrafts(config);
+                setLoadState('ready');
+            } catch {
+                if (!cancelled) setLoadState('error');
             }
-        }
-        load();
-        return () => { mounted = false; };
-    }, [product.id]);
+        })();
+        return () => { cancelled = true; };
+    }, [product.id, reloadKey, resetDrafts]);
 
     const addCycleRange = () => {
-        const label = newCycleLabel.trim() || `r${editingCycleRanges.length + 1}`;
-        setEditingCycleRanges(prev => [...prev, { label, min: '', max: '' }]);
-        setNewCycleLabel('');
-        setEditingGrades(prev => prev.map(g => ({ ...g, percentages: [...g.percentages, 0] })));
+        setEditingCycleRanges(prev => [...prev, { label: `Range ${prev.length + 1}`, min: '', max: '' }]);
+        setEditingGrades(prev => prev.map(g => ({ ...g, percentages: [...g.percentages, ''] })));
     };
 
     const removeCycleRange = (idx: number) => {
@@ -2621,43 +2631,59 @@ function LoanCycleForm({ product, onUpdate, providerColor }: {
     const updateGradePercentage = (gradeIdx: number, colIdx: number, value: string) => {
         setEditingGrades(prev => prev.map((g, i) => {
             if (i !== gradeIdx) return g;
-            const newPercentages = g.percentages.slice();
-            newPercentages[colIdx] = Number(value || 0);
-            return { ...g, percentages: newPercentages };
+            const percentages = g.percentages.slice();
+            percentages[colIdx] = value === '' ? '' : Number(value);
+            return { ...g, percentages };
         }));
     };
 
     const addGrade = () => {
-        const cols = editingCycleRanges.length || 1;
-        setEditingGrades(prev => [...prev, { label: `Grade ${prev.length + 1}`, minScore: '', percentages: Array.from({ length: cols }, () => 0) }]);
+        setEditingGrades(prev => [...prev, { label: `Grade ${prev.length + 1}`, minScore: '', percentages: editingCycleRanges.map(() => '' as const) }]);
     };
 
     const removeGrade = (idx: number) => {
         setEditingGrades(prev => prev.filter((_, i) => i !== idx));
     };
-    
+
     const handleSaveLoanCycle = async () => {
-        if (loanCycleReadOnly) {
-            toast({ title: 'Not authorized', description: 'You are not authorized to update loan-cycle configuration.', variant: 'destructive' });
+        if (loanCycleReadOnly) return;
+        const problem = findLoanCycleProblem(editingMetric, editingCycleRanges, editingGrades);
+        if (problem) {
+            toast({ title: 'Check the loan cycle', description: problem, variant: 'destructive' });
             return;
         }
-        if (!product.id || !editingMetric) {
-            toast({ title: 'Error', description: 'Product and metric are required', variant: 'destructive' });
-            return;
+        const updated = {
+            productId: product.id,
+            metric: editingMetric,
+            enabled: editingEnabled,
+            cycleRanges: editingCycleRanges.map(r => ({ label: r.label.trim(), min: Number(r.min), max: Number(r.max) })),
+            grades: editingGrades.map(g => ({ label: g.label.trim(), minScore: Number(g.minScore), percentages: g.percentages.map(p => Number(p)) })),
+        };
+        if (loanCycleConfig) {
+            const saved = {
+                productId: product.id,
+                metric: loanCycleConfig.metric,
+                enabled: typeof loanCycleConfig.enabled === 'boolean' ? loanCycleConfig.enabled : true,
+                cycleRanges: loanCycleConfig.cycleRanges ?? [],
+                grades: loanCycleConfig.grades ?? [],
+            };
+            if (JSON.stringify(saved) === JSON.stringify(updated)) {
+                toast({ title: 'Nothing to submit', description: 'The loan cycle is unchanged.' });
+                return;
+            }
         }
+
         setIsSavingLoanCycle(true);
         try {
-            const updated = { productId: product.id, metric: editingMetric, enabled: editingEnabled, cycleRanges: editingCycleRanges.map(r => ({ label: r.label, min: Number(r.min), max: Number(r.max) })), grades: editingGrades.map(g => ({ label: g.label, minScore: Number(g.minScore), percentages: g.percentages.map(p => Number(p)) })) };
-
             const changeType = loanCycleConfig ? 'UPDATE' : 'CREATE';
-            const payload = loanCycleConfig ? { original: loanCycleConfig, updated } : { created: updated };
+            const payload = loanCycleConfig
+                ? { original: { ...loanCycleConfig, name: product.name, providerId: product.providerId }, updated: { ...updated, name: product.name, providerId: product.providerId } }
+                : { created: { ...updated, name: product.name, providerId: product.providerId } };
 
             await postPendingChange({ entityType: 'LoanCycleConfig', entityId: product.id, changeType, payload: JSON.stringify(payload) }, 'Failed to submit loan-cycle config for approval');
 
-            // Mark locally as pending (so UI reflects that change was submitted)
-            toast({ title: 'Submitted', description: 'Loan cycle configuration has been submitted for approval.' });
-            // Optionally mark product as pending approval similar to other product updates
-            onUpdate({ loanCycleConfigId: loanCycleConfig?.id || null });
+            markPending('loanCycles', product.id);
+            toast({ title: 'Submitted for Approval', description: `The loan cycle for ${product.name} is waiting for a checker.` });
         } catch (err: any) {
             toast({ title: 'Error', description: err.message || String(err), variant: 'destructive' });
         } finally {
@@ -2665,115 +2691,191 @@ function LoanCycleForm({ product, onUpdate, providerColor }: {
         }
     }
 
+    const statusBadge = loadState === 'loading'
+        ? <Badge variant="secondary">Loading…</Badge>
+        : loadState === 'error'
+            ? <Badge variant="outline" className="border-destructive text-destructive">Couldn&apos;t load</Badge>
+            : loanCycleConfig
+                ? <Badge variant={loanCycleConfig.enabled === false ? 'secondary' : 'default'}>{loanCycleConfig.enabled === false ? 'Configured · off' : 'Configured'}</Badge>
+                : <Badge variant="secondary">Not configured</Badge>;
 
     return (
          <Collapsible open={isOpen} onOpenChange={setIsOpen}>
             <CollapsibleTrigger asChild>
-                 <button className="flex items-center justify-between w-full space-x-4 px-4 py-2 border rounded-lg bg-background hover:bg-muted/50 transition-colors">
-                    <h4 className="text-sm font-semibold">{product.name}</h4>
-                     <Badge variant={loanCycleConfig ? 'default' : 'secondary'}>{loanCycleConfig ? 'Configured' : 'Not configured'}</Badge>
+                 <button type="button" className="flex items-center justify-between w-full gap-4 px-4 py-2 border rounded-lg bg-background hover:bg-muted/50 transition-colors">
+                    <div className="flex flex-wrap items-center gap-2 text-left">
+                        <h4 className="text-sm font-semibold">{product.name}</h4>
+                        {statusBadge}
+                        {pending && <PendingBadge />}
+                    </div>
+                    <ChevronDown className={cn('h-4 w-4 shrink-0 transition-transform duration-200', isOpen && 'rotate-180')} />
                 </button>
             </CollapsibleTrigger>
-            <CollapsibleContent className="p-4 border rounded-lg bg-background mt-2">
-                <div className="flex items-center justify-end">
-                    <div className="flex items-center gap-2">
-                        <Label>Enabled</Label>
-                        <Switch checked={editingEnabled} onCheckedChange={(c) => setEditingEnabled(Boolean(c))} disabled={loanCycleReadOnly} />
+            <CollapsibleContent className="p-4 border rounded-lg bg-background mt-2 space-y-4">
+                {loadState === 'error' && (
+                    <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-destructive/50 p-3 text-sm">
+                        <span>The current loan cycle couldn&apos;t be loaded, so editing is locked.</span>
+                        <Button type="button" variant="outline" size="sm" onClick={() => { setLoadState('loading'); setReloadKey(k => k + 1); }}>Try again</Button>
                     </div>
-                </div>
+                )}
+                {pending && (
+                    <p className="flex items-start gap-2 rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-200">
+                        <Clock className="mt-0.5 h-4 w-4 shrink-0" />
+                        A loan-cycle change for this product is waiting for approval.
+                    </p>
+                )}
 
-                 <div className="mt-3 grid grid-cols-1 md:grid-cols-4 gap-4 items-end">
+                <div className="flex flex-wrap items-end justify-between gap-4">
                     <div className="space-y-2">
-                        <Label>Progression Metric</Label>
-                        <Select onValueChange={(v) => setEditingMetric(v as LoanCycleConfig['metric'])} value={editingMetric || undefined}>
-                            <SelectTrigger disabled={loanCycleReadOnly}>
+                        <Label>Progression metric</Label>
+                        <Select onValueChange={(v) => setEditingMetric(v as LoanCycleConfig['metric'])} value={editingMetric ?? ''}>
+                            <SelectTrigger className="w-56" disabled={loanCycleReadOnly}>
                                 <SelectValue placeholder="Select metric" />
                             </SelectTrigger>
                             <SelectContent>
-                                <SelectItem value="TOTAL_COUNT">Total Loans Count</SelectItem>
-                                <SelectItem value="PAID_ON_TIME">On-time Repayments</SelectItem>
-                                <SelectItem value="PAID_EARLY">Early Repayments</SelectItem>
-                                <SelectItem value="PAID_LATE">Late Repayments</SelectItem>
+                                {LOAN_CYCLE_METRICS.map(m => <SelectItem key={m.value} value={m.value}>{m.label}</SelectItem>)}
                             </SelectContent>
                         </Select>
+                        <p className="text-xs text-muted-foreground">What a borrower&apos;s loan count is based on.</p>
+                    </div>
+                    <div className="flex items-center gap-2">
+                        <Switch id={`cycle-enabled-${product.id}`} checked={editingEnabled} onCheckedChange={(c) => setEditingEnabled(Boolean(c))} disabled={loanCycleReadOnly} />
+                        <Label htmlFor={`cycle-enabled-${product.id}`}>Apply loan cycle limits</Label>
                     </div>
                 </div>
 
-                <div className="mt-4">
-                    <Label>Cycle Ranges</Label>
+                <div>
+                    <Label>Cycle ranges</Label>
+                    <p className="text-xs text-muted-foreground">Loan-count bands, lowest first. Counts above the last band use the last band.</p>
                     <div className="space-y-2 mt-2">
                         {editingCycleRanges.length === 0 && <div className="text-xs text-muted-foreground">No cycle ranges defined.</div>}
                         {editingCycleRanges.map((r, idx) => (
-                            <div key={idx} className="flex items-center gap-2">
-                                <Input placeholder="Label" value={r.label} onChange={(e) => updateCycleRangeField(idx, 'label', e.target.value)} className="w-32" disabled={loanCycleReadOnly} />
-                                <Input placeholder="min" type="number" value={String(r.min)} onChange={(e) => updateCycleRangeField(idx, 'min', e.target.value)} className="w-20" disabled={loanCycleReadOnly} />
-                                <div className="text-sm">-</div>
-                                <Input placeholder="max" type="number" value={String(r.max)} onChange={(e) => updateCycleRangeField(idx, 'max', e.target.value)} className="w-20" disabled={loanCycleReadOnly} />
-                                <Button variant="ghost" size="sm" onClick={() => removeCycleRange(idx)} disabled={loanCycleReadOnly}><Trash2 className="h-3 w-3"/></Button>
+                            <div key={idx} className="flex flex-wrap items-center gap-2">
+                                <Input placeholder="Label" aria-label={`Range ${idx + 1} label`} value={r.label} onChange={(e) => updateCycleRangeField(idx, 'label', e.target.value)} className="w-32" disabled={loanCycleReadOnly} />
+                                <Input placeholder="Min" aria-label={`Range ${idx + 1} minimum`} type="number" min={0} value={String(r.min)} onChange={(e) => updateCycleRangeField(idx, 'min', e.target.value)} className="w-20" disabled={loanCycleReadOnly} />
+                                <span className="text-sm text-muted-foreground">to</span>
+                                <Input placeholder="Max" aria-label={`Range ${idx + 1} maximum`} type="number" min={0} value={String(r.max)} onChange={(e) => updateCycleRangeField(idx, 'max', e.target.value)} className="w-20" disabled={loanCycleReadOnly} />
+                                <span className="text-sm text-muted-foreground">loans</span>
+                                <Button type="button" variant="ghost" size="icon" aria-label={`Remove range ${idx + 1}`} onClick={() => removeCycleRange(idx)} disabled={loanCycleReadOnly}><Trash2 className="h-4 w-4"/></Button>
                             </div>
                         ))}
-                        <div className="flex items-center gap-2 mt-1">
-                            <Input placeholder="New range label" value={newCycleLabel} onChange={(e) => setNewCycleLabel(e.target.value)} className="w-32" disabled={loanCycleReadOnly} />
-                            <Button type="button" onClick={addCycleRange} size="sm" disabled={loanCycleReadOnly}><PlusCircle className="h-4 w-4"/></Button>
-                        </div>
-                    </div>
-
-                    <div className="mt-4">
-                        <Label className="mb-2">Grades & Percentages</Label>
-                        <div className="overflow-auto border rounded">
-                            <table className="min-w-full bg-background text-sm">
-                                <thead>
-                                    <tr className="text-left">
-                                        <th className="px-2 py-2">Grade</th>
-                                        <th className="px-2 py-2">Min Score</th>
-                                        {editingCycleRanges.map((r, idx) => (
-                                            <th key={idx} className="px-2 py-2">{r.label || `${r.min}-${r.max}`}</th>
-                                        ))}
-                                        <th className="px-2 py-2">Actions</th>
-                                    </tr>
-                                </thead>
-                                <tbody>
-                                    {editingGrades.map((g, gIdx) => (
-                                        <tr key={gIdx} className="border-t">
-                                            <td className="px-2 py-2"><Input value={g.label} onChange={(e) => updateGradeField(gIdx, 'label', e.target.value)} className="w-28 h-8" disabled={loanCycleReadOnly} /></td>
-                                            <td className="px-2 py-2"><Input type="number" value={String(g.minScore)} onChange={(e) => updateGradeField(gIdx, 'minScore', e.target.value)} className="w-24 h-8" disabled={loanCycleReadOnly} /></td>
-                                            {editingCycleRanges.map((r, cIdx) => (
-                                                <td key={cIdx} className="px-2 py-2"><Input type="number" value={String(g.percentages[cIdx] ?? 0)} onChange={(e) => updateGradePercentage(gIdx, cIdx, e.target.value)} className="w-20 h-8" disabled={loanCycleReadOnly} /></td>
-                                            ))}
-                                            <td className="px-2 py-2"><Button variant="ghost" size="sm" onClick={() => removeGrade(gIdx)} disabled={loanCycleReadOnly}><Trash2 className="h-4 w-4"/></Button></td>
-                                        </tr>
-                                    ))}
-                                </tbody>
-                            </table>
-                        </div>
-                        <div className="mt-2 flex items-center gap-2">
-                            <Button type="button" onClick={addGrade} size="sm" disabled={loanCycleReadOnly}><PlusCircle className="h-4 w-4"/> Add Grade</Button>
-                        </div>
+                        <Button type="button" variant="outline" size="sm" onClick={addCycleRange} disabled={loanCycleReadOnly}>
+                            <PlusCircle className="h-4 w-4 mr-2"/> Add range
+                        </Button>
                     </div>
                 </div>
 
-                <div className="mt-4 flex justify-end space-x-2">
-                    <Button variant="outline" type="button" onClick={() => {
-                        setEditingMetric(loanCycleConfig?.metric ?? null);
-                        setEditingEnabled(typeof loanCycleConfig?.enabled === 'boolean' ? loanCycleConfig?.enabled : true);
-                        setEditingCycleRanges(Array.isArray(loanCycleConfig?.cycleRanges) ? loanCycleConfig!.cycleRanges.map((r: any) => ({ label: r.label ?? `${r.min}-${r.max}`, min: r.min ?? '', max: r.max ?? '' })) : []);
-                        setEditingGrades(Array.isArray(loanCycleConfig?.grades) ? loanCycleConfig!.grades.map((g: any) => ({ label: g.label ?? '', minScore: g.minScore ?? '', percentages: Array.isArray(g.percentages) ? g.percentages : [] })) : []);
-                    }}>Reset</Button>
-                    <Button type="button" onClick={handleSaveLoanCycle} disabled={isSavingLoanCycle || !editingMetric || loanCycleReadOnly} style={{ backgroundColor: providerColor }} className="text-white">{isSavingLoanCycle ? 'Saving...' : 'Save Loan Cycle'}</Button>
+                <div>
+                    <Label>Grades and percentages</Label>
+                    <p className="text-xs text-muted-foreground">
+                        Each cell is the % of the scored loan amount the borrower can take. A borrower gets the grade with the highest minimum score at or below their score.
+                    </p>
+                    <div className="mt-2 overflow-x-auto rounded border">
+                        <table className="min-w-full bg-background text-sm">
+                            <thead>
+                                <tr className="text-left">
+                                    <th className="px-2 py-2 font-medium">Grade</th>
+                                    <th className="px-2 py-2 font-medium">Min score</th>
+                                    {editingCycleRanges.map((r, idx) => (
+                                        <th key={idx} className="px-2 py-2 font-medium whitespace-nowrap">{r.label || `${r.min}-${r.max}`} (%)</th>
+                                    ))}
+                                    <th className="px-2 py-2"><span className="sr-only">Actions</span></th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {editingGrades.length === 0 && (
+                                    <tr className="border-t"><td colSpan={editingCycleRanges.length + 3} className="px-2 py-4 text-center text-xs text-muted-foreground">No grades defined.</td></tr>
+                                )}
+                                {editingGrades.map((g, gIdx) => (
+                                    <tr key={gIdx} className="border-t">
+                                        <td className="px-2 py-2"><Input aria-label={`Grade ${gIdx + 1} label`} value={g.label} onChange={(e) => updateGradeField(gIdx, 'label', e.target.value)} className="w-28 h-8" disabled={loanCycleReadOnly} /></td>
+                                        <td className="px-2 py-2"><Input aria-label={`Grade ${gIdx + 1} minimum score`} type="number" value={String(g.minScore)} onChange={(e) => updateGradeField(gIdx, 'minScore', e.target.value)} className="w-24 h-8" disabled={loanCycleReadOnly} /></td>
+                                        {editingCycleRanges.map((r, cIdx) => (
+                                            <td key={cIdx} className="px-2 py-2">
+                                                <Input
+                                                    aria-label={`${g.label || `Grade ${gIdx + 1}`} percentage for ${r.label || `range ${cIdx + 1}`}`}
+                                                    type="number" min={0} max={100}
+                                                    value={g.percentages[cIdx] === undefined ? '' : String(g.percentages[cIdx])}
+                                                    onChange={(e) => updateGradePercentage(gIdx, cIdx, e.target.value)}
+                                                    className="w-20 h-8"
+                                                    disabled={loanCycleReadOnly}
+                                                />
+                                            </td>
+                                        ))}
+                                        <td className="px-2 py-2"><Button type="button" variant="ghost" size="icon" aria-label={`Remove ${g.label || `grade ${gIdx + 1}`}`} onClick={() => removeGrade(gIdx)} disabled={loanCycleReadOnly}><Trash2 className="h-4 w-4"/></Button></td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
+                    <Button type="button" variant="outline" size="sm" onClick={addGrade} disabled={loanCycleReadOnly} className="mt-2">
+                        <PlusCircle className="h-4 w-4 mr-2"/> Add grade
+                    </Button>
+                </div>
+
+                <div className="flex flex-wrap justify-end gap-2">
+                    <Button variant="outline" type="button" onClick={() => resetDrafts(loanCycleConfig)} disabled={loanCycleReadOnly}>Reset</Button>
+                    <Button type="button" onClick={handleSaveLoanCycle} disabled={isSavingLoanCycle || loanCycleReadOnly} style={{ backgroundColor: providerColor }} className="text-white">
+                        {isSavingLoanCycle && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+                        {pending ? 'Pending Approval' : 'Submit for Approval'}
+                    </Button>
                 </div>
             </CollapsibleContent>
         </Collapsible>
     )
 }
 
+const SETTINGS_TABS = [
+    { value: 'providers', label: 'Providers & Products' },
+    { value: 'configuration', label: 'Fee & Tier Configuration' },
+    { value: 'loanCycles', label: 'Loan Cycle' },
+    { value: 'eligibility', label: 'Eligibility' },
+    { value: 'agreement', label: 'Borrower Agreement' },
+    { value: 'tax', label: 'Tax' },
+] as const;
+type SettingsTab = (typeof SETTINGS_TABS)[number]['value'];
 
-export function SettingsClient({ initialProviders, initialTaxConfig }: { initialProviders: LoanProvider[], initialTaxConfig: Tax }) {
+export function SettingsClient({ initialProviders, initialTaxConfigs, initialPending }: {
+    initialProviders: LoanProvider[];
+    initialTaxConfigs: Tax[];
+    initialPending: SettingsPendingState;
+}) {
     const [providers, setProviders] = useState(initialProviders);
     const [mounted, setMounted] = useState(false);
+    const [tab, setTab] = useState<SettingsTab>('providers');
+    const [pending, setPending] = useState(() => ({
+        products: new Set(initialPending.products),
+        eligibility: new Set(initialPending.eligibility),
+        loanCycles: new Set(initialPending.loanCycles),
+        terms: new Set(initialPending.terms),
+        providers: new Set(initialPending.providers),
+    }));
 
     useEffect(() => {
         setMounted(true);
+        // ?tab= keeps the open tab across reloads and makes it linkable.
+        const fromUrl = new URLSearchParams(window.location.search).get('tab');
+        if (SETTINGS_TABS.some(t => t.value === fromUrl)) setTab(fromUrl as SettingsTab);
     }, []);
+
+    const handleTabChange = (value: string) => {
+        setTab(value as SettingsTab);
+        // History API rather than router.replace: no server round trip, which
+        // would re-run the page's provider query on every tab click.
+        const url = new URL(window.location.href);
+        url.searchParams.set('tab', value);
+        window.history.replaceState(window.history.state, '', url);
+    };
+
+    const pendingApi = useMemo<PendingApi>(() => ({
+        isPending: (kind, id) => !!id && pending[kind].has(id),
+        markPending: (kind, id) => setPending(prev => {
+            if (prev[kind].has(id)) return prev;
+            const next = new Set(prev[kind]);
+            next.add(id);
+            return { ...prev, [kind]: next };
+        }),
+    }), [pending]);
 
     const onProductUpdate = useCallback((providerId: string, productId: string, updatedProduct: Partial<LoanProduct>) => {
         setProviders(produce(draft => {
@@ -2791,137 +2893,146 @@ export function SettingsClient({ initialProviders, initialTaxConfig }: { initial
     const handleProvidersChange = useCallback((updater: React.SetStateAction<LoanProvider[]>) => {
         setProviders(updater);
     }, []);
-    
-    const handleProviderUpdate = useCallback((update: Partial<LoanProvider>) => {
-        setProviders(produce(draft => {
-            const provider = draft.find(p => p.id === update.id);
-            if (provider) {
-                Object.assign(provider, update);
-            }
-        }));
-    }, []);
 
-        return (
-                <div className="flex-1 space-y-4 p-8 pt-6">
-                        <h2 className="text-3xl font-bold tracking-tight">Settings</h2>
-                        {/* Render Tabs only after client mount to avoid Radix/React hydration id mismatches */}
-                        {mounted ? (
-                            <Tabs defaultValue="providers" className="space-y-4">
-                                <TabsList>
-                                    <TabsTrigger value="providers">Providers & Products</TabsTrigger>
-                                    <TabsTrigger value="configuration">Fee & Tier Configuration</TabsTrigger>
-                                    <TabsTrigger value="loanCycles">Loan Cycle</TabsTrigger>
-                                    <TabsTrigger value="eligibility">Eligibility</TabsTrigger>
-                                    <TabsTrigger value="agreement">Borrower Agreement</TabsTrigger>
-                                    <TabsTrigger value="tax">Tax</TabsTrigger>
-                                </TabsList>
-                                <TabsContent value="providers">
-                                    <ProvidersTab providers={providers} onProvidersChange={handleProvidersChange} />
-                                </TabsContent>
-                                <TabsContent value="configuration">
-                                    <ConfigurationTab providers={providers} onProductUpdate={(providerId, product) => onProductUpdate(providerId, product.id, product)} taxConfig={initialTaxConfig} />
-                                </TabsContent>
-                                <TabsContent value="loanCycles">
-                                    <LoanCycleTab providers={providers} onProviderUpdate={onProductUpdate} />
-                                </TabsContent>
-                                <TabsContent value="eligibility">
-                                    <EligibilityTab providers={providers} onProvidersChange={handleProvidersChange} />
-                                </TabsContent>
-                                <TabsContent value="agreement">
-                                    <Accordion type="multiple" className="w-full space-y-4">
-                                        {providers.map((provider) => (
-                                            <AccordionItem value={provider.id} key={provider.id} className="border rounded-lg bg-card">
-                                                <AccordionTrigger className="flex w-full items-center justify-between p-4 hover:no-underline">
-                                                    <div className="flex items-center gap-4">
-                                                        <IconDisplay iconName={provider.icon} className="h-6 w-6" />
-                                                        <div className="text-lg font-semibold">{provider.name}</div>
-                                                    </div>
-                                                </AccordionTrigger>
-                                                <AccordionContent className="p-4 border-t">
-                                                    <AgreementTab provider={provider} onProviderUpdate={handleProviderUpdate} />
-                                                </AccordionContent>
-                                            </AccordionItem>
-                                        ))}
-                                    </Accordion>
-                                </TabsContent>
-                                <TabsContent value="tax">
-                                    <TaxTab initialTaxConfig={initialTaxConfig} />
-                                </TabsContent>
-                            </Tabs>
-                        ) : (
-                            <div className="space-y-4">
-                                {/* Server-rendered fallback: simple headings to match layout */}
-                                <div className="inline-flex items-center gap-4">
-                                    <div className="font-medium">Providers & Products</div>
-                                    <div className="font-medium">Fee & Tier Configuration</div>
-                                </div>
-                            </div>
-                        )}
-        </div>
+    return (
+        <PendingContext.Provider value={pendingApi}>
+            <div className="flex-1 space-y-4 p-4 pt-6 md:p-8">
+                <div className="space-y-1">
+                    <h2 className="text-3xl font-bold tracking-tight">Settings</h2>
+                    <p className="text-sm text-muted-foreground">
+                        Providers, products, fees, eligibility and borrower terms. Changes go to a checker for approval unless a control says it applies immediately.
+                    </p>
+                </div>
+                {/* Render Tabs only after client mount to avoid Radix/React hydration id mismatches */}
+                {mounted ? (
+                    <Tabs value={tab} onValueChange={handleTabChange} className="space-y-4">
+                        <TabsList className="h-auto flex-wrap justify-start">
+                            {SETTINGS_TABS.map(t => <TabsTrigger key={t.value} value={t.value}>{t.label}</TabsTrigger>)}
+                        </TabsList>
+                        <TabsContent value="providers">
+                            <ProvidersTab providers={providers} onProvidersChange={handleProvidersChange} />
+                        </TabsContent>
+                        <TabsContent value="configuration">
+                            <ConfigurationTab providers={providers} onProductUpdate={onProductUpdate} taxConfigs={initialTaxConfigs} />
+                        </TabsContent>
+                        <TabsContent value="loanCycles">
+                            <LoanCycleTab providers={providers} />
+                        </TabsContent>
+                        <TabsContent value="eligibility">
+                            <EligibilityTab providers={providers} onProductUpdate={onProductUpdate} />
+                        </TabsContent>
+                        <TabsContent value="agreement">
+                            <AgreementsTab providers={providers} />
+                        </TabsContent>
+                        <TabsContent value="tax">
+                            <TaxTab taxConfigs={initialTaxConfigs} />
+                        </TabsContent>
+                    </Tabs>
+                ) : (
+                    <div className="space-y-4" aria-hidden>
+                        <Skeleton className="h-10 w-full max-w-3xl" />
+                        <Skeleton className="h-24 w-full" />
+                    </div>
+                )}
+            </div>
+        </PendingContext.Provider>
     );
 }
 
-function AgreementTab({ provider, onProviderUpdate }: { provider: LoanProvider, onProviderUpdate: (update: Partial<LoanProvider>) => void }) {
+function AgreementsTab({ providers }: { providers: LoanProvider[] }) {
+    if (providers.length === 0) {
+        return <Card><CardHeader><CardTitle>Borrower Agreement</CardTitle><CardDescription>No providers available.</CardDescription></CardHeader></Card>;
+    }
+    return (
+        <Accordion type="multiple" defaultValue={defaultOpenProviders(providers)} className="w-full space-y-4">
+            {providers.map((provider) => (
+                <AccordionItem value={provider.id} key={provider.id} className="border rounded-lg bg-card">
+                    <AccordionTrigger className="flex w-full items-center justify-between p-4 hover:no-underline">
+                        <div className="flex items-center gap-4">
+                            <IconDisplay iconName={provider.icon} className="h-6 w-6" />
+                            <div className="text-lg font-semibold">{provider.name}</div>
+                        </div>
+                    </AccordionTrigger>
+                    <AccordionContent className="p-4 border-t">
+                        <AgreementTab provider={provider} />
+                    </AccordionContent>
+                </AccordionItem>
+            ))}
+        </Accordion>
+    );
+}
+
+function AgreementTab({ provider }: { provider: LoanProvider }) {
     const { toast } = useToast();
     const { entityActions } = usePermissions();
+    const { isPending, markPending } = usePending();
     const termsActions = entityActions('TermsAndConditions');
-    const canEditTerms = termsActions.create || termsActions.update;
-    const [terms, setTerms] = useState<TermsAndConditions | null>(null);
-    const [isLoading, setIsLoading] = useState(true);
-    
+    const canEditTerms = !!(termsActions.create || termsActions.update);
+    const [activeTerms, setActiveTerms] = useState<TermsAndConditions | null>(null);
+    const [draft, setDraft] = useState('');
+    const [loadState, setLoadState] = useState<'loading' | 'ready' | 'error'>('loading');
+    const [reloadKey, setReloadKey] = useState(0);
+    const [isSaving, setIsSaving] = useState(false);
+    const pending = isPending('terms', provider.id);
+
     useEffect(() => {
-        const fetchTerms = async () => {
-            setIsLoading(true);
+        let cancelled = false;
+        (async () => {
             try {
                 const response = await fetch(`/api/settings/terms?providerId=${provider.id}`);
-                if (response.ok) {
-                    const data = await response.json();
-                    setTerms(data);
-                }
-            } catch (error) {
-                 toast({ title: "Error", description: "Failed to load terms and conditions.", variant: "destructive"});
-            } finally {
-                setIsLoading(false);
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                const data = await response.json();
+                if (cancelled) return;
+                setActiveTerms(data);
+                setDraft(data?.content ?? '');
+                setLoadState('ready');
+            } catch {
+                // An empty editor here would look like "no terms yet" and invite
+                // a submit that replaces the real ones, so show the failure.
+                if (!cancelled) setLoadState('error');
             }
-        };
-        fetchTerms();
-    }, [provider.id, toast]);
-    
+        })();
+        return () => { cancelled = true; };
+    }, [provider.id, reloadKey]);
+
+    const savedContent = activeTerms?.content ?? '';
+    const isDirty = draft !== savedContent;
+    const locked = !canEditTerms || pending || isSaving;
+
     const handleSave = async () => {
         if (!canEditTerms) {
             toast({ title: 'Not authorized', description: 'You are not authorized to update terms and conditions.', variant: 'destructive' });
             return;
         }
-        if (!terms || !terms.content.trim()) {
-            toast({ title: "Error", description: "Terms and conditions content cannot be empty.", variant: "destructive" });
+        if (!draft.trim()) {
+            toast({ title: 'Error', description: 'Terms and conditions content cannot be empty.', variant: 'destructive' });
             return;
         }
-        setIsLoading(true);
+        if (!isDirty) {
+            toast({ title: 'Nothing to submit', description: 'The text matches the current version.' });
+            return;
+        }
+        setIsSaving(true);
         try {
-            const originalTerms = provider.termsAndConditions?.find(t => t.isActive);
-            const payload = {
-                original: originalTerms,
-                updated: { providerId: provider.id, content: terms.content }
-            }
-
             await postPendingChange({
                 entityType: 'TermsAndConditions',
-                entityId: originalTerms?.id || provider.id, // Use provider ID for new terms
-                changeType: 'UPDATE', // Always an update/new version
-                payload: JSON.stringify(payload)
+                entityId: activeTerms?.id || provider.id, // provider id for a first version
+                changeType: 'UPDATE', // Always a new version
+                payload: JSON.stringify({
+                    original: activeTerms ? { id: activeTerms.id, providerId: provider.id, name: provider.name, version: activeTerms.version, content: activeTerms.content } : null,
+                    updated: { providerId: provider.id, name: provider.name, content: draft },
+                }),
             }, 'Failed to submit new terms for approval.');
-            
-            toast({ title: "Submitted for Approval", description: `A new version of the terms has been submitted for review.` });
-
+            markPending('terms', provider.id);
+            toast({ title: 'Submitted for Approval', description: 'The new version goes live once a checker approves it.' });
         } catch (error: any) {
-             toast({ title: "Error", description: error.message, variant: "destructive" });
+            toast({ title: 'Error', description: error.message, variant: 'destructive' });
         } finally {
-            setIsLoading(false);
+            setIsSaving(false);
         }
     };
 
-
-    if (isLoading) {
+    if (loadState === 'loading') {
         return <div className="space-y-4">
             <Skeleton className="h-8 w-1/4" />
             <Skeleton className="h-40 w-full" />
@@ -2929,630 +3040,160 @@ function AgreementTab({ provider, onProviderUpdate }: { provider: LoanProvider, 
         </div>
     }
 
+    if (loadState === 'error') {
+        return (
+            <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-destructive/50 p-3 text-sm">
+                <span>The current terms couldn&apos;t be loaded.</span>
+                <Button type="button" variant="outline" size="sm" onClick={() => { setLoadState('loading'); setReloadKey(k => k + 1); }}>Try again</Button>
+            </div>
+        );
+    }
+
     return (
         <div className="space-y-4">
-            <Label htmlFor={`terms-content-${provider.id}`}>Terms and Conditions Content</Label>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+                <Label htmlFor={`terms-content-${provider.id}`}>Terms and conditions</Label>
+                <div className="flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
+                    {activeTerms
+                        ? <span>Version {activeTerms.version}{(activeTerms as any).publishedAt ? ` · published ${format(new Date((activeTerms as any).publishedAt), 'MMM d, yyyy')}` : ''}</span>
+                        : <span>No version published yet</span>}
+                    {pending && <PendingBadge />}
+                    {isDirty && !pending && <Badge variant="secondary">Unsaved changes</Badge>}
+                </div>
+            </div>
+            {pending && (
+                <p className="flex items-start gap-2 rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-200">
+                    <Clock className="mt-0.5 h-4 w-4 shrink-0" />
+                    A new version is waiting for approval. Borrowers still see the version shown here.
+                </p>
+            )}
              <Textarea
                 id={`terms-content-${provider.id}`}
-                value={terms?.content || ''}
-                onChange={(e) => setTerms(prev => ({ ...(prev || { version: 0, content: '' }), content: e.target.value }) as TermsAndConditions)}
+                value={draft}
+                onChange={(e) => setDraft(e.target.value)}
                 placeholder="Enter the terms and conditions for your loan products here."
                 rows={15}
-                     disabled={!canEditTerms}
+                disabled={locked}
             />
-            <div className="flex justify-between items-center">
-                <p className="text-sm text-muted-foreground">
-                    Current Version: {terms?.version || 0}
-                </p>
-                <Button onClick={handleSave} disabled={isLoading || !canEditTerms}>
-                    {isLoading ? <Loader2 className="h-4 w-4 mr-2 animate-spin"/> : <Save className="h-4 w-4 mr-2" />}
-                    Submit New Version for Approval
-                </Button>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+                <p className="text-xs text-muted-foreground">{draft.length.toLocaleString()} characters</p>
+                <div className="flex flex-wrap gap-2">
+                    {isDirty && !pending && (
+                        <Button type="button" variant="outline" onClick={() => setDraft(savedContent)} disabled={isSaving}>
+                            <Undo2 className="h-4 w-4 mr-2" /> Discard changes
+                        </Button>
+                    )}
+                    <Button type="button" onClick={handleSave} disabled={locked || !isDirty}>
+                        {isSaving ? <Loader2 className="h-4 w-4 mr-2 animate-spin"/> : <Save className="h-4 w-4 mr-2" />}
+                        {pending ? 'Pending Approval' : 'Submit New Version for Approval'}
+                    </Button>
+                </div>
             </div>
         </div>
     );
 }
 
-// --------------------------------------------------
-// DATA PROVISIONING MANAGER (NEW COMPONENT)
-// --------------------------------------------------
-function DataProvisioningManager({ providerId, config, onConfigChange, allProviderProducts }: {
-    providerId: string;
-    config: DataProvisioningConfig | undefined;
-    onConfigChange: (newConfig: DataProvisioningConfig) => void;
-    allProviderProducts: LoanProduct[];
-}) {
-    const { toast } = useToast();
-    const { entityActions } = usePermissions();
-    const dataConfigActions = entityActions('DataProvisioningConfig');
-    const uploadActions = entityActions('DataProvisioningUpload');
-    const [isConfigDialogOpen, setIsConfigDialogOpen] = useState(false);
-    const [isUploading, setIsUploading] = useState(false);
-    const fileInputRef = React.useRef<HTMLInputElement>(null);
-    const [viewingUpload, setViewingUpload] = useState<DataProvisioningUpload | null>(null);
-
-    const handleSaveConfig = async (newConfigData: Omit<DataProvisioningConfig, 'providerId' | 'id' | 'uploads'> & { id?: string }) => {
-        const isEditing = !!newConfigData.id;
-        if (isEditing ? !dataConfigActions.update : !dataConfigActions.create) {
-            toast({ title: 'Not authorized', description: 'You are not authorized to modify data provisioning settings.', variant: 'destructive' });
-            return;
-        }
-        const method = isEditing ? 'PUT' : 'POST';
-        const endpoint = '/api/settings/data-provisioning';
-        const body = { ...newConfigData, providerId: providerId };
-
-        try {
-            const response = await fetch(endpoint, {
-                method,
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(body),
-            });
-             if (!response.ok) {
-                const errorData = await response.json();
-                throw new Error(errorData.error || 'Failed to save config.');
-            }
-            const savedConfig = await response.json();
-            
-            onConfigChange(savedConfig);
-            toast({ title: "Success", description: `Data type "${savedConfig.name}" saved successfully.` });
-        } catch(error: any) {
-            toast({ title: "Error", description: error.message, variant: 'destructive' });
-        }
-    };
-    
-    const handleExcelUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
-        if (!config) return;
-        if (!uploadActions.create) {
-            toast({ title: 'Not authorized', description: 'You are not authorized to upload data provisioning files.', variant: 'destructive' });
-            if (event.target) event.target.value = '';
-            return;
-        }
-
-        const file = event.target.files?.[0];
-        if (!file) return;
-
-        // Client-side validation: reject unsupported file types and oversized files early
-        const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB
-        const allowedTypes = ['application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'];
-        const allowedExtensions = ['xlsx'];
-        
-        const fileName = file.name || '';
-        const ext = fileName.split('.').pop()?.toLowerCase();
-        
-        // Validate file extension
-        if (!ext || !allowedExtensions.includes(ext)) {
-            toast({ 
-                title: 'Invalid file type', 
-                description: 'Only .xlsx files are allowed.', 
-                variant: 'destructive' 
-            });
-            if (event.target) event.target.value = '';
-            return;
-        }
-        
-        // Validate file type (MIME type)
-        if (file.type && !allowedTypes.includes(file.type) && !file.type.includes('sheet')) {
-            toast({ 
-                title: 'Invalid file type', 
-                description: 'Only .xlsx files are allowed.', 
-                variant: 'destructive' 
-            });
-            if (event.target) event.target.value = '';
-            return;
-        }
-        
-        // Validate file size
-        if (file.size > MAX_FILE_SIZE) {
-            toast({ 
-                title: 'File too large', 
-                description: 'Maximum file size is 10MB.', 
-                variant: 'destructive' 
-            });
-            if (event.target) event.target.value = '';
-            return;
-        }
-
-        setIsUploading(true);
-        try {
-            const formData = new FormData();
-            formData.append('file', file);
-            formData.append('configId', config.id);
-
-            const response = await fetch('/api/settings/data-provisioning-uploads', {
-                method: 'POST',
-                body: formData,
-            });
-
-            if (!response.ok) {
-                const errorData = await response.json();
-                throw new Error(errorData.error || 'Failed to upload file.');
-            }
-            
-            const newUpload = await response.json();
-            
-            const updatedConfig = produce(config, draft => {
-                if (!draft.uploads) draft.uploads = [];
-                draft.uploads.unshift(newUpload);
-            });
-            onConfigChange(updatedConfig);
-
-            toast({
-                title: 'Upload Successful',
-                description: `File "${file.name}" uploaded and recorded successfully.`,
-            });
-
-        } catch (error: any) {
-             toast({
-                title: 'Upload Failed',
-                description: error.message,
-                variant: 'destructive',
-            });
-        } finally {
-            setIsUploading(false);
-            if (event.target) event.target.value = '';
-        }
-    };
-
-    if (!config) {
-        if (!dataConfigActions.create) {
-            return null;
-        }
-        return (
-            <>
-                <Button onClick={() => setIsConfigDialogOpen(true)}>
-                    <FilePlus2 className="h-4 w-4 mr-2" /> Create Data Source
-                </Button>
-                <DataProvisioningDialog
-                    isOpen={isConfigDialogOpen}
-                    onClose={() => setIsConfigDialogOpen(false)}
-                    onSave={handleSaveConfig}
-                    config={null}
-                    readOnly={!dataConfigActions.create}
-                />
-            </>
-        )
-    }
-
-    const generalUploads = useMemo(() => {
-        const eligibilityUploadIds = new Set(allProviderProducts.map(p => p.eligibilityUploadId).filter(Boolean));
-        return (config.uploads || []).filter(upload => !eligibilityUploadIds.has(upload.id));
-    }, [config.uploads, allProviderProducts]);
-
-
-    return (
-        <>
-            <Card className="bg-muted/50">
-                <CardHeader className="flex flex-row justify-between items-center">
-                     <div>
-                        <CardTitle className="text-lg">{config.name}</CardTitle>
-                    </div>
-                    <div className="flex items-center gap-2">
-                        {dataConfigActions.update && (
-                            <Button variant="ghost" size="icon" className="h-8 w-8" onClick={() => setIsConfigDialogOpen(true)}><Edit className="h-4 w-4" /></Button>
-                        )}
-                    </div>
-                </CardHeader>
-                <CardContent>
-                   <h4 className="font-medium mb-2">Columns</h4>
-                   <ul className="list-disc pl-5 text-sm text-muted-foreground mb-4">
-                        {(config.columns || []).map(col => <li key={col.id}>{col.name} <span className="text-xs opacity-70">({col.type})</span> {col.isIdentifier && <Badge variant="outline" className="ml-2">ID</Badge>}</li>)}
-                   </ul>
-                   <Separator />
-                   <div className="mt-4">
-                       <div className="flex justify-between items-center mb-2">
-                            <h4 className="font-medium">Upload History</h4>
-                            <Button
-                                type="button"
-                                variant="outline"
-                                size="sm"
-                                disabled={isUploading || !uploadActions.create}
-                                onClick={() => fileInputRef.current?.click()}
-                            >
-                                {isUploading ? <Loader2 className="h-4 w-4 mr-2 animate-spin"/> : <Upload className="h-4 w-4 mr-2"/>}
-                                Upload File
-                            </Button>
-                            <input
-                                type="file"
-                                ref={fileInputRef}
-                                className="hidden"
-                                accept=".xlsx, .xls"
-                                onChange={handleExcelUpload}
-                            />
-                       </div>
-                       <div className="border rounded-md">
-                           <Table>
-                               <TableHeader>
-                                   <TableRow>
-                                       <TableHead>File Name</TableHead>
-                                       <TableHead>Rows</TableHead>
-                                       <TableHead>Uploaded By</TableHead>
-                                       <TableHead>Date</TableHead>
-                                   </TableRow>
-                               </TableHeader>
-                               <TableBody>
-                                   {generalUploads.length > 0 ? (
-                                       generalUploads.map(upload => (
-                                            <TableRow key={upload.id} onClick={() => setViewingUpload(upload)} className="cursor-pointer hover:bg-muted">
-                                                <TableCell className="font-medium flex items-center gap-2"><FileClock className="h-4 w-4 text-muted-foreground"/>{upload.fileName}</TableCell>
-                                                <TableCell>{upload.rowCount}</TableCell>
-                                                <TableCell>{upload.uploadedBy}</TableCell>
-                                                <TableCell>{format(new Date(upload.uploadedAt), "yyyy-MM-dd HH:mm")}</TableCell>
-                                            </TableRow>
-                                       ))
-                                   ) : (
-                                        <TableRow>
-                                            <TableCell colSpan={4} className="text-center text-muted-foreground h-24">No files uploaded yet.</TableCell>
-                                        </TableRow>
-                                   )}
-                               </TableBody>
-                           </Table>
-                       </div>
-                   </div>
-                </CardContent>
-            </Card>
-
-             <DataProvisioningDialog
-                isOpen={isConfigDialogOpen}
-                onClose={() => setIsConfigDialogOpen(false)}
-                onSave={handleSaveConfig}
-                config={config}
-                     readOnly={!dataConfigActions.update}
-            />
-            <UploadDataViewerDialog
-                upload={viewingUpload}
-                onClose={() => setViewingUpload(null)}
-            />
-        </>
-    );
-}
-
-// --------------------------------------------------
-// DATA PROVISIONING DIALOG (NEW COMPONENT)
-// --------------------------------------------------
-type EditableDataColumn = DataColumn & { optionsString?: string };
-
-function DataProvisioningDialog({ isOpen, onClose, onSave, config, readOnly }: {
-    isOpen: boolean;
-    onClose: () => void;
-    onSave: (config: Omit<DataProvisioningConfig, 'providerId' | 'id' | 'uploads'> & { id?: string }) => void;
-    config: DataProvisioningConfig | null;
-    readOnly?: boolean;
-}) {
-    const { toast } = useToast();
-    const [name, setName] = useState('');
-    const [columns, setColumns] = useState<EditableDataColumn[]>([]);
-
-    useEffect(() => {
-        if (isOpen) {
-            if (config) {
-                setName(config.name);
-                setColumns(config.columns.map(c => ({...c, optionsString: (c.options || []).join(', ') })) || []);
-            } else {
-                setName('');
-                setColumns([]);
-            }
-        }
-    }, [config, isOpen]);
-
-    const handleFileUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
-        if (readOnly) {
-            toast({ title: 'Not authorized', description: 'You are not authorized to modify this configuration.', variant: 'destructive' });
-            if (event.target) event.target.value = '';
-            return;
-        }
-        const file = event.target.files?.[0];
-        if (!file) return;
-
-        const reader = new FileReader();
-        reader.onload = async (e) => {
-            const arrayBuffer = e.target?.result as ArrayBuffer;
-            try {
-                const workbook = new ExcelJS.Workbook();
-                await workbook.xlsx.load(arrayBuffer);
-                const worksheet = workbook.worksheets[0];
-                const headers: string[] = [];
-                const headerRow = worksheet.getRow(1);
-                headerRow.eachCell((cell) => {
-                    const text = (cell.text ?? cell.value) as any;
-                    headers.push(text?.toString?.() || '');
-                });
-
-                setColumns(headers.map((header, index) => ({
-                    id: `col-${Date.now()}-${index}`,
-                    name: header,
-                    type: 'string', // default type
-                    isIdentifier: index === 0, // default first column as identifier
-                    options: [],
-                    optionsString: '',
-                })));
-            } catch (err) {
-                console.error('Failed to parse Excel file', err);
-                toast({ title: 'Error', description: 'Could not parse the uploaded file.', variant: 'destructive' });
-            }
-        };
-        reader.readAsArrayBuffer(file);
-    };
-
-    const handleColumnChange = (index: number, field: keyof EditableDataColumn, value: string | boolean) => {
-        if (readOnly) return;
-        setColumns(produce(draft => {
-            if (field === 'isIdentifier' && typeof value === 'boolean') {
-                // Ensure only one column can be the identifier
-                draft.forEach((col, i) => {
-                    col.isIdentifier = i === index ? value : false;
-                });
-            } else {
-                 (draft[index] as any)[field] = value;
-            }
-        }));
-    };
-
-    const handleSubmit = (e: React.FormEvent) => {
-        e.preventDefault();
-        if (readOnly) {
-            toast({ title: 'Not authorized', description: 'You are not authorized to save this configuration.', variant: 'destructive' });
-            return;
-        }
-        if (!columns.some(c => c.isIdentifier)) {
-            toast({ title: 'Error', description: 'Please mark one column as the customer identifier.', variant: 'destructive' });
-            return;
-        }
-
-        // Process the final columns array before saving
-        const finalColumns = columns.map(col => {
-            const { optionsString, ...rest } = col;
-            const finalOptions = optionsString ? optionsString.split(',').map(s => s.trim()).filter(Boolean) : [];
-            return { ...rest, options: finalOptions };
-        });
-
-        onSave({ id: config?.id, name, columns: finalColumns });
-        onClose();
-    };
-
-    return (
-         <UIDialog open={isOpen} onOpenChange={onClose}>
-            <UIDialogContent className="sm:max-w-2xl">
-                <UIDialogHeader>
-                    <UIDialogTitle>{config ? 'Edit' : 'Create'} Data Type</UIDialogTitle>
-                     <UIDialogDescription>Define a new data schema by uploading a sample file.</UIDialogDescription>
-                </UIDialogHeader>
-                <form onSubmit={handleSubmit} className="space-y-4 py-4">
-                    <div>
-                        <Label htmlFor="data-type-name">Data Type Name</Label>
-                        <Input id="data-type-name" value={name} onChange={e => setName(e.target.value)} placeholder="e.g., Credit Bureau Data" required disabled={!!readOnly} />
-                    </div>
-
-                    <div>
-                        <Label htmlFor="file-upload">Upload Sample File (.xlsx, .xls)</Label>
-                        <Input id="file-upload" type="file" accept=".xlsx, .xls" onChange={handleFileUpload} disabled={!!readOnly} />
-                         <p className="text-xs text-muted-foreground mt-1">Upload a file to automatically detect columns.</p>
-                    </div>
-
-                    {columns.length > 0 && (
-                        <div>
-                            <Label>Configure Columns</Label>
-                            <div className="space-y-4 mt-2 border p-4 rounded-md max-h-[50vh] overflow-y-auto">
-                                {columns.map((col, index) => (
-                                    <div key={col.id} className="space-y-2 p-2 rounded-md bg-muted/50">
-                                        <div className="grid grid-cols-12 items-center gap-2">
-                                            <Input
-                                                className="col-span-5"
-                                                value={col.name}
-                                                onChange={e => handleColumnChange(index, 'name', e.target.value)}
-                                                required
-                                                disabled={!!readOnly}
-                                            />
-                                            <Select value={col.type} onValueChange={(value: 'string' | 'number' | 'date') => handleColumnChange(index, 'type', value)}>
-                                                <SelectTrigger className="col-span-3" disabled={!!readOnly}>
-                                                    <SelectValue />
-                                                </SelectTrigger>
-                                                <SelectContent>
-                                                    <SelectItem value="string">Text</SelectItem>
-                                                    <SelectItem value="number">Number</SelectItem>
-                                                    <SelectItem value="date">Date</SelectItem>
-                                                </SelectContent>
-                                            </Select>
-                                             <div className="col-span-4 flex items-center justify-end space-x-2">
-                                                <Checkbox
-                                                    id={`is-identifier-${col.id}`}
-                                                    checked={col.isIdentifier}
-                                                    onCheckedChange={(checked) => handleColumnChange(index, 'isIdentifier', !!checked)}
-                                                    disabled={!!readOnly}
-                                                />
-                                                <Label htmlFor={`is-identifier-${col.id}`} className="text-sm text-muted-foreground whitespace-nowrap">Is Identifier?</Label>
-                                            </div>
-                                        </div>
-                                         {col.type === 'string' && (
-                                            <div className="space-y-1">
-                                                <Label htmlFor={`options-${col.id}`} className="text-xs text-muted-foreground">Dropdown Options (optional)</Label>
-                                                <Textarea
-                                                    id={`options-${col.id}`}
-                                                    placeholder="e.g., Male, Female, Other"
-                                                    className="text-xs"
-                                                    value={col.optionsString || ''}
-                                                    onChange={e => handleColumnChange(index, 'optionsString', e.target.value)}
-                                                    disabled={!!readOnly}
-                                                />
-                                                <p className="text-xs text-muted-foreground">Comma-separated values for dropdown select.</p>
-                                            </div>
-                                        )}
-                                    </div>
-                                ))}
-                            </div>
-                        </div>
-                    )}
-                    
-                    <UIDialogFooter>
-                        <UIDialogClose asChild><Button type="button" variant="outline">Cancel</Button></UIDialogClose>
-                        <Button type="submit" disabled={!!readOnly}>Save</Button>
-                    </UIDialogFooter>
-                </form>
-            </UIDialogContent>
-        </UIDialog>
-    )
-}
+const VIEWER_PAGE_SIZE = 100;
 
 function UploadDataViewerDialog({ upload, onClose }: {
     upload: DataProvisioningUpload | null;
     onClose: () => void;
 }) {
-    const [data, setData] = useState<any[]>([]);
-    const [isLoading, setIsLoading] = useState(false);
+    // A staged file (id "temp-…") is previewed from its content; a saved
+    // upload is fetched page by page from the server.
+    const isTemp = !!upload?.id.startsWith('temp-');
     const [page, setPage] = useState(1);
-    const [totalPages, setTotalPages] = useState(1);
-    const [totalRows, setTotalRows] = useState(0);
-    const rowsPerPage = 100;
-    const [tempPreview, setTempPreview] = useState<any[] | null>(null);
+    const [isLoading, setIsLoading] = useState(false);
+    const [error, setError] = useState<string | null>(null);
+    const [serverRows, setServerRows] = useState<any[]>([]);
+    const [serverTotalPages, setServerTotalPages] = useState(1);
+    const [serverTotalRows, setServerTotalRows] = useState(0);
     const [tempHeaders, setTempHeaders] = useState<string[]>([]);
-    const [tempLoading, setTempLoading] = useState(false);
+    const [tempRows, setTempRows] = useState<string[][]>([]);
 
+    // All hooks run before any early return (this used to return before its
+    // second effect, which breaks React's hook order). Callers key the dialog
+    // by upload id, so the page resets for each file.
     useEffect(() => {
-        if (upload && !upload.id.startsWith('temp-')) {
-            const fetchData = async () => {
-                setIsLoading(true);
-                try {
-                    const response = await fetch(`/api/settings/data-provisioning-uploads/view?uploadId=${upload.id}&page=${page}&limit=${rowsPerPage}`);
-                    if (!response.ok) {
-                        throw new Error('Failed to fetch uploaded data');
-                    }
-                    const result = await response.json();
-                    setData(result.data);
-                    setTotalPages(result.totalPages);
-                    setTotalRows(result.totalRows);
-                } catch (error) {
-                    console.error(error);
-                } finally {
-                    setIsLoading(false);
-                }
-            };
-            fetchData();
-        }
-    }, [upload, page]);
-
-    if (!upload) return null;
-    
-    // Special handling for temporary filter preview (async parse)
-    useEffect(() => {
+        if (!upload || isTemp) return;
         let cancelled = false;
-        const parseTemp = async () => {
-            if (!upload || !upload.id.startsWith('temp-')) return;
-            const fileContent = (upload as any).fileContent;
-            if (!fileContent) return;
-            setTempLoading(true);
+        setIsLoading(true);
+        setError(null);
+        (async () => {
             try {
-                const base64ToArrayBuffer = (base64: string) => {
-                    const binaryString = atob(base64);
-                    const len = binaryString.length;
-                    const bytes = new Uint8Array(len);
-                    for (let i = 0; i < len; i++) {
-                        bytes[i] = binaryString.charCodeAt(i);
-                    }
-                    return bytes.buffer;
-                };
+                const response = await fetch(`/api/settings/data-provisioning-uploads/view?uploadId=${upload.id}&page=${page}&limit=${VIEWER_PAGE_SIZE}`);
+                if (!response.ok) throw new Error('Failed to fetch uploaded data');
+                const result = await response.json();
+                if (cancelled) return;
+                setServerRows(result.data || []);
+                setServerTotalPages(Math.max(1, result.totalPages || 1));
+                setServerTotalRows(result.totalRows || 0);
+            } catch (err: any) {
+                if (!cancelled) setError(err.message || 'Failed to fetch uploaded data');
+            } finally {
+                if (!cancelled) setIsLoading(false);
+            }
+        })();
+        return () => { cancelled = true; };
+    }, [upload, isTemp, page]);
 
-                const arrayBuffer = base64ToArrayBuffer(fileContent);
+    useEffect(() => {
+        if (!upload || !isTemp) return;
+        const fileContent = (upload as any).fileContent as string | undefined;
+        if (!fileContent) return;
+        let cancelled = false;
+        setIsLoading(true);
+        setError(null);
+        (async () => {
+            try {
+                const binary = atob(fileContent);
+                const bytes = new Uint8Array(binary.length);
+                for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
                 const workbook = new ExcelJS.Workbook();
-                await workbook.xlsx.load(arrayBuffer as any);
+                await workbook.xlsx.load(bytes.buffer as ArrayBuffer);
                 const worksheet = workbook.worksheets[0];
-                const columnCount = worksheet.columnCount || 0;
-                const headers: string[] = [];
-                const headerRow = worksheet.getRow(1);
-                for (let i = 1; i <= columnCount; i++) {
-                    const cell = headerRow.getCell(i);
-                    const text = (cell.text ?? cell.value) as any;
-                    headers.push(text?.toString?.() || '');
-                }
-
-                const rows: any[] = [];
-                for (let r = 2; r <= worksheet.rowCount; r++) {
+                const columnCount = worksheet?.columnCount || 0;
+                const headerRow = worksheet?.getRow(1);
+                const headers = Array.from({ length: columnCount }, (_, i) => cellToText(headerRow?.getCell(i + 1).value) || `Column ${i + 1}`);
+                const rows: string[][] = [];
+                for (let r = 2; r <= (worksheet?.rowCount || 0); r++) {
                     const row = worksheet.getRow(r);
-                    const obj: any = {};
-                    let empty = true;
-                    for (let c = 1; c <= columnCount; c++) {
-                        const cell = row.getCell(c);
-                        const val = cell.value;
-                        if (val !== null && val !== undefined && String(val).trim() !== '') empty = false;
-                        obj[headers[c - 1] || `Column${c}`] = val;
-                    }
-                    if (!empty) rows.push(obj);
+                    const values = Array.from({ length: columnCount }, (_, c) => cellToText(row.getCell(c + 1).value));
+                    if (values.some(v => v.trim() !== '')) rows.push(values);
                 }
-
                 if (!cancelled) {
                     setTempHeaders(headers);
-                    setTempPreview(rows);
+                    setTempRows(rows);
                 }
             } catch (err) {
                 console.error('Error parsing preview file:', err);
-                setTempPreview(null);
+                if (!cancelled) setError('Could not read this file for preview.');
             } finally {
-                setTempLoading(false);
+                if (!cancelled) setIsLoading(false);
             }
-        };
-
-        parseTemp();
+        })();
         return () => { cancelled = true; };
-    }, [upload]);
+    }, [upload, isTemp]);
 
+    if (!upload) return null;
 
-    // If this is a temporary upload preview, show parsed tempPreview
-    if (upload.id.startsWith('temp-')) {
-        if (tempLoading) {
-            return (
-                <UIDialog open={!!upload} onOpenChange={onClose}>
-                    <UIDialogContent className="max-w-4xl h-[90vh] flex items-center justify-center">
-                        <div>Loading preview...</div>
-                    </UIDialogContent>
-                </UIDialog>
-            );
-        }
-
-        const headersPreview = tempHeaders || [];
-        const rowsPreview = tempPreview || [];
-
-        return (
-            <UIDialog open={!!upload} onOpenChange={onClose}>
-                <UIDialogContent className="max-w-4xl h-[90vh] flex flex-col">
-                    <UIDialogHeader>
-                        <UIDialogTitle>Viewing Upload: {upload.fileName}</UIDialogTitle>
-                        <UIDialogDescription>
-                            This is a preview of the file you uploaded.
-                        </UIDialogDescription>
-                    </UIDialogHeader>
-                    <div className="flex-grow overflow-auto border rounded-md">
-                        <Table>
-                            <TableHeader className="sticky top-0 bg-background">
-                                <TableRow>
-                                    {headersPreview.map(header => <TableHead key={header}>{header}</TableHead>)}
-                                </TableRow>
-                            </TableHeader>
-                            <TableBody>
-                                {rowsPreview.map((row: any, rowIndex) => (
-                                    <TableRow key={rowIndex}>
-                                        {headersPreview.map((header) => (
-                                            <TableCell key={`${rowIndex}-${header}`}>{row[header]}</TableCell>
-                                        ))}
-                                    </TableRow>
-                                ))}
-                            </TableBody>
-                        </Table>
-                    </div>
-                    <UIDialogFooter className="pt-4">
-                        <UIDialogClose asChild><Button type="button">Close</Button></UIDialogClose>
-                    </UIDialogFooter>
-                </UIDialogContent>
-            </UIDialog>
-        );
-    }
-
-    const headers = data.length > 0 ? Object.keys(data[0]) : [];
+    const totalPages = isTemp ? Math.max(1, Math.ceil(tempRows.length / VIEWER_PAGE_SIZE)) : serverTotalPages;
+    const totalRows = isTemp ? tempRows.length : serverTotalRows;
+    const headers = isTemp ? tempHeaders : (serverRows.length > 0 ? Object.keys(serverRows[0]) : []);
+    const rows: string[][] = isTemp
+        ? tempRows.slice((page - 1) * VIEWER_PAGE_SIZE, page * VIEWER_PAGE_SIZE)
+        : serverRows.map(row => headers.map(h => cellToText(row[h])));
+    const firstRow = totalRows === 0 ? 0 : (page - 1) * VIEWER_PAGE_SIZE + 1;
+    const lastRow = Math.min(page * VIEWER_PAGE_SIZE, totalRows);
 
     return (
-        <UIDialog open={!!upload} onOpenChange={onClose}>
+        <UIDialog open={!!upload} onOpenChange={(open) => { if (!open) onClose(); }}>
             <UIDialogContent className="max-w-4xl h-[90vh] flex flex-col">
                 <UIDialogHeader>
-                    <UIDialogTitle>Viewing Upload: {upload.fileName}</UIDialogTitle>
+                    <UIDialogTitle className="break-all">{isTemp ? 'Preview' : 'Viewing upload'}: {upload.fileName}</UIDialogTitle>
                     <UIDialogDescription>
-                        Displaying {data.length} of {totalRows} rows from the uploaded file.
+                        {isTemp ? 'The file you selected. Nothing is saved until a checker approves it. ' : ''}
+                        {totalRows > 0 ? `Rows ${firstRow}–${lastRow} of ${totalRows.toLocaleString()}.` : ''}
                     </UIDialogDescription>
                 </UIDialogHeader>
                 <div className="flex-grow overflow-auto border rounded-md">
@@ -3560,30 +3201,38 @@ function UploadDataViewerDialog({ upload, onClose }: {
                         <div className="flex items-center justify-center h-full">
                             <Loader2 className="h-8 w-8 animate-spin" />
                         </div>
+                    ) : error ? (
+                        <div className="flex items-center justify-center h-full p-6 text-sm text-destructive">{error}</div>
+                    ) : rows.length === 0 ? (
+                        <div className="flex items-center justify-center h-full p-6 text-sm text-muted-foreground">No rows to show.</div>
                     ) : (
                         <Table>
                             <TableHeader className="sticky top-0 bg-background">
                                 <TableRow>
-                                    {headers.map(header => <TableHead key={header} className="capitalize">{header.replace(/([A-Z])/g, ' $1')}</TableHead>)}
+                                    {headers.map((header, i) => (
+                                        <TableHead key={i} className={cn(!isTemp && 'capitalize')}>
+                                            {isTemp ? header : header.replace(/([A-Z])/g, ' $1')}
+                                        </TableHead>
+                                    ))}
                                 </TableRow>
                             </TableHeader>
                             <TableBody>
-                                {data.map((row, rowIndex) => (
+                                {rows.map((row, rowIndex) => (
                                     <TableRow key={rowIndex}>
-                                        {headers.map(header => <TableCell key={`${rowIndex}-${header}`}>{row[header]}</TableCell>)}
+                                        {row.map((value, i) => <TableCell key={i}>{value}</TableCell>)}
                                     </TableRow>
                                 ))}
                             </TableBody>
                         </Table>
                     )}
                 </div>
-                <UIDialogFooter className="justify-between items-center pt-4">
+                <UIDialogFooter className="flex-row flex-wrap items-center justify-between gap-2 pt-4 sm:justify-between">
                     <span className="text-sm text-muted-foreground">Page {page} of {totalPages}</span>
                     <div className="flex gap-2">
-                        <Button variant="outline" onClick={() => setPage(p => p - 1)} disabled={page === 1}>
+                        <Button variant="outline" onClick={() => setPage(p => Math.max(1, p - 1))} disabled={page <= 1 || isLoading}>
                             <ChevronLeft className="h-4 w-4 mr-2" /> Previous
                         </Button>
-                        <Button variant="outline" onClick={() => setPage(p => p + 1)} disabled={page === totalPages}>
+                        <Button variant="outline" onClick={() => setPage(p => Math.min(totalPages, p + 1))} disabled={page >= totalPages || isLoading}>
                             Next <ChevronRight className="h-4 w-4 ml-2" />
                         </Button>
                     </div>
@@ -3592,19 +3241,3 @@ function UploadDataViewerDialog({ upload, onClose }: {
         </UIDialog>
     );
 }
-    
-
-    
-
-
-
-
-
-
-
-
-
-
-
-
-

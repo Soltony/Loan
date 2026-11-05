@@ -506,6 +506,7 @@ export interface Tax {
   rate: number;
   appliedTo: string; // JSON array
   isInclusive?: boolean; // If true, tax is deducted from principal before disbursement
+  status?: string;
 }
 
 // --------------------------------------

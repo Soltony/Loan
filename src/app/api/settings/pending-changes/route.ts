@@ -9,6 +9,7 @@ import { z } from 'zod';
 import { createAuditLog } from '@/lib/audit-log';
 import { isSafeOnlyProductUpdate } from '@/lib/loan-product-changes';
 import { checkStatementParameterChange } from '@/lib/statement-parameters';
+import { ONE_PENDING_CHANGE_PER_ENTITY } from '@/lib/settings-pending';
 
 export async function GET(req: NextRequest) {
   const user = await getUserFromSession();
@@ -154,6 +155,23 @@ export async function POST(req: NextRequest) {
       if (!allowed) {
         return NextResponse.json({ error: 'Not authorized to perform this action' }, { status: 403 });
       }
+
+    // One open request per Settings item. Two pending edits of the same product
+    // are each built from the same "original", so approving one silently undoes
+    // or mixes with the other. Checked before any status change below, so a
+    // refused request leaves the item untouched.
+    if (entityId && ONE_PENDING_CHANGE_PER_ENTITY.has(entityType)) {
+      const open = await prisma.pendingChange.findFirst({
+        where: { entityType, entityId, status: 'PENDING' },
+        select: { id: true },
+      });
+      if (open) {
+        return NextResponse.json(
+          { error: 'This item already has a change waiting for approval. It must be approved or rejected before you submit another.' },
+          { status: 409 },
+        );
+      }
+    }
 
     // For update/delete requests we change the original entity state to prevent
     // it from being used while the change is pending. For products we disable

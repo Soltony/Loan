@@ -273,12 +273,18 @@ async function applyEligibilityList(change: any, data: any) {
     );
   }
 
-  // Update product with eligibility info (separate transaction)
+  // Update product with eligibility info (separate transaction). Approving a
+  // list also switches the allow-list on and links its data source: the
+  // Eligibility tab's switch and data-source picker are only staged in the
+  // browser, and loan checks ignore the list unless dataProvisioningEnabled is
+  // true (actions/eligibility.ts).
   await prisma.loanProduct.update({
     where: { id: productId },
     data: {
       eligibilityUploadId: newUpload.id,
       eligibilityFilter: filterObject,
+      dataProvisioningEnabled: true,
+      dataProvisioningConfigId: configId,
     },
   });
 }
@@ -1349,22 +1355,24 @@ async function applyChange(
             data: finalUpdateData,
           });
 
-          await tx.loanAmountTier.deleteMany({
-            where: { productId: entityId },
-          });
-          if (
-            loanAmountTiers &&
-            Array.isArray(loanAmountTiers) &&
-            loanAmountTiers.length > 0
-          ) {
-            await tx.loanAmountTier.createMany({
-              data: loanAmountTiers.map((tier: any) => ({
-                productId: entityId,
-                fromScore: parseInt(String(tier.fromScore), 10),
-                toScore: parseInt(String(tier.toScore), 10),
-                loanAmount: parseInt(String(tier.loanAmount), 10),
-              })),
+          // Replace the tiers only when the change carries them. Settings now
+          // sends just the fields an admin edited, so a missing list means
+          // "unchanged", not "delete every tier".
+          if (Array.isArray(loanAmountTiers)) {
+            await tx.loanAmountTier.deleteMany({
+              where: { productId: entityId },
             });
+            if (loanAmountTiers.length > 0) {
+              await tx.loanAmountTier.createMany({
+                data: loanAmountTiers.map((tier: any) => ({
+                  productId: entityId,
+                  fromScore: parseInt(String(tier.fromScore), 10),
+                  toScore: parseInt(String(tier.toScore), 10),
+                  // Float column: keep decimals (parseInt dropped them).
+                  loanAmount: Number(tier.loanAmount),
+                })),
+              });
+            }
           }
         });
       } else if (changeType === "CREATE") {
@@ -1472,15 +1480,13 @@ async function applyChange(
       break;
     case "TermsAndConditions":
       await prisma.$transaction(async (tx) => {
-        const {
-          providerId,
-          content,
-          contentAm,
-          contentOm,
-          contentTi,
-          contentSo,
-          contentSid,
-        } = data.updated;
+        // TermsAndConditions stores one `content` column. Passing the
+        // translation fields (contentAm, contentOm, …) that a June change added
+        // here made Prisma reject every terms approval ("Unknown argument").
+        const { providerId, content } = data.updated;
+        if (!providerId || typeof content !== "string" || !content.trim()) {
+          throw new Error("Terms change is missing the provider or the content.");
+        }
         await tx.termsAndConditions.updateMany({
           where: { providerId },
           data: { isActive: false },
@@ -1496,11 +1502,6 @@ async function applyChange(
           data: {
             providerId,
             content,
-            contentAm: contentAm ?? null,
-            contentOm: contentOm ?? null,
-            contentTi: contentTi ?? null,
-            contentSo: contentSo ?? null,
-            contentSid: contentSid ?? null,
             version: newVersionNumber,
             isActive: true,
             publishedAt: new Date(),

@@ -1,158 +1,67 @@
 import { NextRequest, NextResponse } from 'next/server';
-import prisma from '@/lib/prisma';
-import { getSession } from '@/lib/session';
-import { createProductSchema, updateProductSchema } from '@/lib/schemas';
 import { z } from 'zod';
-import { createAuditLog } from '@/lib/audit-log';
+import prisma from '@/lib/prisma';
+import { getUserFromSession } from '@/lib/user';
+import { hasPermissionForEntity } from '@/lib/permissions';
+import { auditRequestContext, createAuditLog } from '@/lib/audit-log';
 
+// Product create, edit and delete go through maker-checker
+// (/api/settings/pending-changes → /api/approvals). The only direct write left
+// here is the Settings page's Active/Disabled switch, which by design takes
+// effect immediately (see SAFE_LOAN_PRODUCT_FIELDS in lib/loan-product-changes).
+// POST and DELETE used to create and delete products directly for any signed-in
+// user; nothing called them, so they are gone (Next.js answers 405).
 
-// POST a new product - This route is no longer used for direct creation.
-// All creations go through the pending changes API.
-// This is kept for potential future direct admin actions but should not be used in the maker-checker flow.
-export async function POST(req: NextRequest) {
-    const session = await getSession();
-    if (!session?.userId) {
-      return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
-    }
-    const ipAddress = req.ip || req.headers.get('x-forwarded-for') || 'N/A';
-    const userAgent = req.headers.get('user-agent') || 'N/A';
+const statusSchema = z.object({
+    id: z.string().min(1),
+    status: z.enum(['Active', 'Disabled']),
+}).strict();
 
-    try {
-        const body = await req.json();
-        const { providerId, ...productData } = createProductSchema.parse(body);
-
-        const logDetails = { productName: productData.name, providerId: providerId };
-        await createAuditLog({ actorId: session.userId, action: 'PRODUCT_CREATE_INITIATED', entity: 'PRODUCT', details: logDetails, ipAddress, userAgent });
-
-        const newProduct = await prisma.loanProduct.create({
-            data: {
-                providerId: providerId,
-                name: productData.name,
-                description: productData.description || '',
-                icon: productData.icon,
-                minLoan: productData.minLoan,
-                maxLoan: productData.maxLoan,
-                duration: productData.duration,
-                status: 'Disabled',
-                // Default fee structures
-                serviceFee: JSON.stringify({ type: 'percentage', value: 0 }),
-                dailyFee: JSON.stringify({ type: 'percentage', value: 0 }),
-                penaltyRules: JSON.stringify([]),
-                serviceFeeEnabled: false,
-                dailyFeeEnabled: false,
-                penaltyRulesEnabled: false,
-                dataProvisioningEnabled: false,
-            }
-        });
-        
-        const successLogDetails = { productId: newProduct.id, productName: newProduct.name, providerId: newProduct.providerId };
-        await createAuditLog({ actorId: session.userId, action: 'PRODUCT_CREATE_SUCCESS', entity: 'PRODUCT', entityId: newProduct.id, details: successLogDetails, ipAddress, userAgent });
-
-        return NextResponse.json(newProduct, { status: 201 });
-
-    } catch (error) {
-        const errorMessage = (error instanceof z.ZodError) ? error.errors : (error as Error).message;
-        const failureLogDetails = { error: errorMessage };
-        await createAuditLog({ actorId: session.userId, action: 'PRODUCT_CREATE_FAILED', entity: 'PRODUCT', details: failureLogDetails, ipAddress, userAgent });
-        if (error instanceof z.ZodError) {
-            return NextResponse.json({ error: error.errors }, { status: 400 });
-        }
-        return NextResponse.json({ error: 'Internal Server Error' }, { status: 500 });
-    }
-}
-
-// PUT to update a product - This route is no longer used for direct updates.
-// All updates go through the pending changes API.
 export async function PUT(req: NextRequest) {
-    const session = await getSession();
-    if (!session?.userId) {
-      return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
+    const user = await getUserFromSession();
+    if (!user?.id) {
+        return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
     }
-    const ipAddress = req.ip || req.headers.get('x-forwarded-for') || 'N/A';
-    const userAgent = req.headers.get('user-agent') || 'N/A';
-    
+    if (!hasPermissionForEntity(user, 'LoanProduct', 'update')) {
+        return NextResponse.json({ error: 'Not authorized' }, { status: 403 });
+    }
+
+    let body: z.infer<typeof statusSchema>;
     try {
-        const body = await req.json();
-        const parsedData = updateProductSchema.parse(body);
-        const { id, ...updateData } = parsedData;
-
-        const logDetails = { productId: id, updatedFields: Object.keys(updateData) };
-        await createAuditLog({ actorId: session.userId, action: 'PRODUCT_UPDATE_INITIATED', entity: 'PRODUCT', entityId: id, details: logDetails, ipAddress, userAgent });
-        
-        const dataToUpdate: any = { ...updateData };
-
-        // Stringify JSON fields if they are present and are objects/arrays
-        if (updateData.serviceFee && typeof updateData.serviceFee === 'object') {
-            dataToUpdate.serviceFee = JSON.stringify(updateData.serviceFee);
-        }
-        if (updateData.dailyFee && typeof updateData.dailyFee === 'object') {
-            dataToUpdate.dailyFee = JSON.stringify(updateData.dailyFee);
-        }
-        if (updateData.penaltyRules && Array.isArray(updateData.penaltyRules)) {
-            dataToUpdate.penaltyRules = JSON.stringify(updateData.penaltyRules);
-        }
-        
-        const updatedProduct = await prisma.loanProduct.update({
-            where: { id },
-            data: dataToUpdate,
-            include: {
-                eligibilityUpload: true, // Include the linked upload data
-            }
-        });
-
-        const successLogDetails = { productId: updatedProduct.id, updatedFields: Object.keys(dataToUpdate) };
-        await createAuditLog({ actorId: session.userId, action: 'PRODUCT_UPDATE_SUCCESS', entity: 'PRODUCT', entityId: updatedProduct.id, details: successLogDetails, ipAddress, userAgent });
-
-        return NextResponse.json(updatedProduct);
-
-    } catch (error: any) {
-        const errorMessage = (error as Error).message;
-        const failureLogDetails = { error: errorMessage };
-        await createAuditLog({ actorId: session.userId, action: 'PRODUCT_UPDATE_FAILED', entity: 'PRODUCT', details: failureLogDetails, ipAddress, userAgent });
-        return NextResponse.json({ error: 'Internal Server Error', 'details': errorMessage }, { status: 500 });
+        body = statusSchema.parse(await req.json());
+    } catch {
+        return NextResponse.json(
+            { error: 'Only the product status (Active or Disabled) can be changed here. Other edits need approval.' },
+            { status: 400 },
+        );
     }
-}
 
-// DELETE a product - This route is no longer used for direct deletions.
-// All deletions go through the pending changes API.
-export async function DELETE(req: NextRequest) {
-    const session = await getSession();
-    if (!session?.userId) {
-      return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
+    const product = await prisma.loanProduct.findUnique({
+        where: { id: body.id },
+        select: { id: true, name: true, status: true, providerId: true },
+    });
+    // Staff tied to a provider may only switch that provider's products.
+    if (!product || (user.loanProviderId && product.providerId !== user.loanProviderId)) {
+        return NextResponse.json({ error: 'Product not found' }, { status: 404 });
     }
-    const ipAddress = req.ip || req.headers.get('x-forwarded-for') || 'N/A';
-    const userAgent = req.headers.get('user-agent') || 'N/A';
-    
-    let productId = '';
-    try {
-        const { id } = await req.json();
-        productId = id;
-        if (!id) {
-            return NextResponse.json({ error: 'Product ID is required' }, { status: 400 });
-        }
-        
-        const logDetails = { productId: id };
-        await createAuditLog({ actorId: session.userId, action: 'PRODUCT_DELETE_INITIATED', entity: 'PRODUCT', entityId: id, details: logDetails, ipAddress, userAgent });
-        
-        // Add check if product has associated loans
-        const loanCount = await prisma.loan.count({ where: { productId: id } });
-        if (loanCount > 0) {
-            throw new Error('Cannot delete product. It has associated loans.');
-        }
-        
-        const productToDelete = await prisma.loanProduct.findUnique({ where: { id }});
-
-        await prisma.loanProduct.delete({ where: { id } });
-
-        const successLogDetails = { deletedProductId: id, deletedProductName: productToDelete?.name, providerId: productToDelete?.providerId };
-        await createAuditLog({ actorId: session.userId, action: 'PRODUCT_DELETE_SUCCESS', entity: 'PRODUCT', entityId: id, details: successLogDetails, ipAddress, userAgent });
-
-        return NextResponse.json({ message: 'Product deleted successfully' });
-
-    } catch (error) {
-        const errorMessage = (error as Error).message;
-        const failureLogDetails = { productId: productId, error: errorMessage };
-        await createAuditLog({ actorId: session.userId, action: 'PRODUCT_DELETE_FAILED', entity: 'PRODUCT', entityId: productId, details: failureLogDetails, ipAddress, userAgent });
-        return NextResponse.json({ error: errorMessage || 'Internal Server Error' }, { status: 500 });
+    if (product.status === body.status) {
+        return NextResponse.json(product);
     }
+
+    const updated = await prisma.loanProduct.update({
+        where: { id: product.id },
+        data: { status: body.status },
+        select: { id: true, name: true, status: true, providerId: true },
+    });
+
+    await createAuditLog({
+        actorId: user.id,
+        action: 'PRODUCT_STATUS_UPDATED',
+        entity: 'LoanProduct',
+        entityId: product.id,
+        details: { productName: product.name, before: { status: product.status }, after: { status: updated.status } },
+        ...auditRequestContext(req),
+    });
+
+    return NextResponse.json(updated);
 }

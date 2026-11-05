@@ -1,80 +1,69 @@
-
-
 import { SettingsClient } from '@/components/admin/settings-client';
 import { requireServerPermission } from '@/lib/require-permission';
 import type { LoanProvider as LoanProviderType, Tax } from '@/lib/types';
 import prisma from '@/lib/prisma';
 import { getUserFromSession } from '@/lib/user';
+import { getSettingsPendingState } from '@/lib/settings-pending';
 
-async function getProviders(userId: string): Promise<LoanProviderType[]> {
-    const user = await prisma.user.findUnique({
-        where: { id: userId },
-        include: { loanProvider: true }
-    });
+const safeJsonParse = (jsonString: string | null | undefined, defaultValue: any) => {
+    if (!jsonString) return defaultValue;
+    try {
+        return JSON.parse(jsonString);
+    } catch {
+        return defaultValue;
+    }
+};
 
-    const whereClause = (user?.role === 'Super Admin' || user?.role === 'Admin')
-        ? {}
-        : { id: user?.loanProvider?.id };
-
+// Staff tied to a provider see only that provider. Bank-level staff (no
+// provider link, e.g. Super Admin and the Maker role) see every provider.
+async function getProviders(loanProviderId: string | null | undefined): Promise<LoanProviderType[]> {
     const providers = await prisma.loanProvider.findMany({
-        where: whereClause,
+        where: loanProviderId ? { id: loanProviderId } : {},
         include: {
             products: {
                 include: {
                     loanAmountTiers: true,
-                    eligibilityUpload: true, // <-- This is the critical addition
+                    // Metadata only: the tab shows who uploaded the list and when.
+                    eligibilityUpload: {
+                        select: { id: true, configId: true, fileName: true, rowCount: true, uploadedBy: true, uploadedAt: true },
+                    },
                 },
                 orderBy: { name: 'asc' }
             },
+            // The Eligibility tab only needs each data source's name and columns,
+            // not its upload history.
             dataProvisioningConfigs: {
-                include: {
-                    uploads: {
-                        orderBy: { uploadedAt: 'desc' }
-                    }
-                }
+                select: { id: true, providerId: true, name: true, columns: true },
             },
-            termsAndConditions: {
-                orderBy: { version: 'desc' }
-            }
         },
         orderBy: {
             displayOrder: 'asc'
         }
     });
 
-    const safeJsonParse = (jsonString: string | null | undefined, defaultValue: any) => {
-        if (!jsonString) return defaultValue;
-        try {
-            return JSON.parse(jsonString);
-        } catch (e) {
-            return defaultValue;
-        }
-    };
-    
     return providers.map(p => ({
         ...p,
+        dataProvisioningConfigs: p.dataProvisioningConfigs.map(c => ({
+            ...c,
+            columns: safeJsonParse(c.columns, []),
+        })),
+        // Settings never shows product icons, and a custom icon is a ~300 KB
+        // data URL per product, so leave it out of the page payload.
         products: p.products.map(prod => ({
             ...prod,
+            icon: '',
             serviceFee: safeJsonParse(prod.serviceFee, { type: 'percentage', value: 0 }),
             dailyFee: safeJsonParse(prod.dailyFee, { type: 'percentage', value: 0 }),
             penaltyRules: safeJsonParse(prod.penaltyRules, []),
         }))
-    })) as LoanProviderType[];
+    })) as unknown as LoanProviderType[];
 }
 
-async function getTaxConfig(): Promise<Tax> {
-    let config = await prisma.tax.findFirst();
-    if (!config) {
-        // Provide a default structure if no tax config is found
-        config = { id: 'default', name: 'Default Tax', rate: 0, appliedTo: '[]', status: 'Active' };
-    }
-    return {
-        ...config,
-        appliedTo: config.appliedTo || '[]',
-        name: config.name || 'Default'
-    } as Tax;
+// Every fee calculation applies all tax rows, so show all of them.
+async function getTaxConfigs(): Promise<Tax[]> {
+    const taxes = await prisma.tax.findMany({ orderBy: { name: 'asc' } });
+    return taxes.map(t => ({ ...t, appliedTo: t.appliedTo || '[]' }));
 }
-
 
 export default async function AdminSettingsPage() {
     await requireServerPermission('settings');
@@ -82,13 +71,11 @@ export default async function AdminSettingsPage() {
     if (!user) {
         return <div>Not authenticated</div>;
     }
-    const providers = await getProviders(user.id);
-    const taxConfig = await getTaxConfig();
+    const [providers, taxConfigs, pending] = await Promise.all([
+        getProviders(user.loanProviderId),
+        getTaxConfigs(),
+        getSettingsPendingState(),
+    ]);
 
-    return <SettingsClient initialProviders={providers} initialTaxConfig={taxConfig} />;
+    return <SettingsClient initialProviders={providers} initialTaxConfigs={taxConfigs} initialPending={pending} />;
 }
-
-
-
-
-
