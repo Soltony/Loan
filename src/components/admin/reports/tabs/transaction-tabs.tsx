@@ -1,10 +1,8 @@
 'use client';
 
 import { useReportQuery } from '../hooks/use-report-query';
-import { formatDay, sumOf } from '../lib/format';
+import { BorrowerCell, DataTable, type DataTableColumn, formatDay, IdCell, LoanStatusBadge, Money, sumOf, totalsLabel, TxnStatusBadge } from '../../data-table';
 import { reportQuery, reportUrl } from '../lib/report-filters';
-import { BorrowerCell, IdCell, LoanStatusBadge, Money, TxnStatusBadge } from '../report-cells';
-import { ReportTable, totalsLabel, type ReportColumn } from '../report-table';
 import type { ReportPage, TableSort, TransactionReportRow } from '../types';
 import { tabPaging, tabSort, type ReportTabProps } from './tab-props';
 
@@ -30,7 +28,7 @@ export function DisbursementsTab(props: ReportTabProps) {
     <Money value={sumOf(rows ?? [], pick)} bold={bold} />
   );
 
-  const columns: ReportColumn<TransactionReportRow>[] = [
+  const columns: DataTableColumn<TransactionReportRow>[] = [
     {
       id: 'date',
       header: 'Date',
@@ -106,7 +104,7 @@ export function DisbursementsTab(props: ReportTabProps) {
   ];
 
   return (
-    <ReportTable
+    <DataTable
       caption="Disbursements"
       columns={columns}
       rows={rows}
@@ -130,7 +128,7 @@ export function RepaymentsTab(props: ReportTabProps) {
     <Money value={sumOf(rows ?? [], pick)} bold={bold} />
   );
 
-  const columns: ReportColumn<TransactionReportRow>[] = [
+  const columns: DataTableColumn<TransactionReportRow>[] = [
     { id: 'provider', header: 'Provider', cell: (r) => r.provider },
     { id: 'loanId', header: 'Loan ID', sortKey: 'loanId', cell: (r) => <IdCell id={r.loanId} /> },
     { id: 'customer', header: 'Customer', cell: customer },
@@ -206,7 +204,7 @@ export function RepaymentsTab(props: ReportTabProps) {
   ];
 
   return (
-    <ReportTable
+    <DataTable
       caption="Repayments"
       columns={columns}
       rows={rows}

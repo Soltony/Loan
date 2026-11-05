@@ -10,19 +10,10 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
-import { Badge } from "@/components/ui/badge";
+import { DataTable, DateTimeCell, StatusBadge, type DataTableColumn } from "@/components/admin/data-table";
 import { Button } from "@/components/ui/button";
 import { Loader2, Check, X, Eye } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
-import { formatDistanceToNow } from "date-fns";
 import {
   Dialog,
   DialogContent,
@@ -35,15 +26,6 @@ import { Textarea } from "@/components/ui/textarea";
 import type { PendingReversalApproval, PaginatedReversalApprovals } from "./page";
 import type { User } from "@/lib/types";
 import { usePermissions } from "@/hooks/use-permissions";
-import {
-  Pagination,
-  PaginationContent,
-  PaginationEllipsis,
-  PaginationItem,
-  PaginationLink,
-  PaginationNext,
-  PaginationPrevious,
-} from "@/components/ui/pagination";
 
 export function ReversalApprovalsClient({
   paginatedData: initialData,
@@ -123,86 +105,82 @@ export function ReversalApprovalsClient({
     router.push(`?page=${page}`);
   };
 
-  const renderPaginationItems = () => {
-    const items = [];
-    const maxVisible = 5;
-    const { page, totalPages } = initialData;
+  const isCancel = (change: PendingReversalApproval) =>
+    change.entityType === "DisbursementCancel" || change.entityType === "LoanCancel";
+  const isPostedLoan = (change: PendingReversalApproval) =>
+    change.entityType === "LoanReversal" || change.entityType === "LoanCancel";
 
-    // Always show first page
-    if (page > 1) {
-      items.push(
-        <PaginationItem key="prev">
-          <PaginationPrevious
-            href="#"
-            onClick={(e) => {
-              e.preventDefault();
-              handlePageChange(page - 1);
-            }}
-          />
-        </PaginationItem>
-      );
-    }
-
-    // Calculate page range
-    let startPage = Math.max(1, page - Math.floor(maxVisible / 2));
-    let endPage = Math.min(totalPages, startPage + maxVisible - 1);
-    if (endPage - startPage < maxVisible - 1) {
-      startPage = Math.max(1, endPage - maxVisible + 1);
-    }
-
-    // Show ellipsis before
-    if (startPage > 1) {
-      items.push(
-        <PaginationItem key="ellipsis-start">
-          <PaginationEllipsis />
-        </PaginationItem>
-      );
-    }
-
-    // Show page numbers
-    for (let i = startPage; i <= endPage; i++) {
-      items.push(
-        <PaginationItem key={i}>
-          <PaginationLink
-            href="#"
-            isActive={i === page}
-            onClick={(e) => {
-              e.preventDefault();
-              handlePageChange(i);
-            }}
+  const columns: DataTableColumn<PendingReversalApproval>[] = [
+    {
+      id: "request",
+      header: "Request",
+      cell: (change) => (
+        <div className="font-medium">
+          <div>
+            {isCancel(change) ? "Cancel" : "Reversal"}
+            {isPostedLoan(change) ? " (Posted Loan)" : ""}
+          </div>
+          <div className="text-sm font-normal text-muted-foreground">{change.entityName}</div>
+          {change.providerName && <div className="text-xs font-normal text-muted-foreground">({change.providerName})</div>}
+        </div>
+      ),
+    },
+    {
+      id: "type",
+      header: "Type",
+      cell: (change) =>
+        isCancel(change) ? (
+          <StatusBadge status="Mark Success" tone="success" />
+        ) : (
+          <StatusBadge status={change.changeType} tone="warning" />
+        ),
+    },
+    { id: "requestedBy", header: "Requested By", cell: (change) => change.createdBy?.fullName || "Unknown User" },
+    { id: "requestedAt", header: "Requested At", cell: (change) => <DateTimeCell value={change.createdAt} /> },
+    {
+      id: "actions",
+      header: "Actions",
+      align: "right",
+      className: "space-x-2 whitespace-nowrap",
+      cell: (change) => (
+        <>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-8 w-8"
+            aria-label="Open request"
+            onClick={() => router.push(`/admin/reversal-approvals/${change.id}`)}
           >
-            {i}
-          </PaginationLink>
-        </PaginationItem>
-      );
-    }
-
-    // Show ellipsis after
-    if (endPage < totalPages) {
-      items.push(
-        <PaginationItem key="ellipsis-end">
-          <PaginationEllipsis />
-        </PaginationItem>
-      );
-    }
-
-    // Always show next button
-    if (page < totalPages) {
-      items.push(
-        <PaginationItem key="next">
-          <PaginationNext
-            href="#"
-            onClick={(e) => {
-              e.preventDefault();
-              handlePageChange(page + 1);
-            }}
-          />
-        </PaginationItem>
-      );
-    }
-
-    return items;
-  };
+            <Eye className="h-4 w-4" />
+          </Button>
+          {canProcessApprovals && (
+            <>
+              <Button
+                variant="outline"
+                size="sm"
+                aria-label="Approve"
+                onClick={() => handleProcessChange(change.id, true)}
+                disabled={processingId === change.id || change.createdById === currentUser.id}
+                className="text-green-600 border-green-600 hover:bg-green-50 hover:text-green-700"
+              >
+                {processingId === change.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />}
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                aria-label="Reject"
+                onClick={() => setChangeToReject(change)}
+                disabled={processingId === change.id || change.createdById === currentUser.id}
+                className="text-red-600 border-red-600 hover:bg-red-50 hover:text-red-700"
+              >
+                <X className="h-4 w-4" />
+              </Button>
+            </>
+          )}
+        </>
+      ),
+    },
+  ];
 
   return (
     <>
@@ -219,114 +197,22 @@ export function ReversalApprovalsClient({
             </CardDescription>
           </CardHeader>
           <CardContent>
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Request</TableHead>
-                  <TableHead>Type</TableHead>
-                  <TableHead>Requested By</TableHead>
-                  <TableHead>Requested At</TableHead>
-                  <TableHead className="text-right">Actions</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {changes.length > 0 ? (
-                  changes.map((change) => {
-                    const isCancel = change.entityType === "DisbursementCancel" || change.entityType === "LoanCancel";
-                    const isPostedLoan = change.entityType === "LoanReversal" || change.entityType === "LoanCancel";
-                    const displayType = isCancel ? "Cancel" : "Reversal";
-                    const displaySubtype = isPostedLoan ? " (Posted Loan)" : "";
-                    return (
-                      <TableRow key={change.id}>
-                        <TableCell className="font-medium">
-                          <div>{displayType}{displaySubtype}</div>
-                          <div className="text-sm text-muted-foreground">
-                            {change.entityName}
-                          </div>
-                          {change.providerName && (
-                            <div className="text-xs text-muted-foreground">
-                              ({change.providerName})
-                            </div>
-                          )}
-                        </TableCell>
-                        <TableCell>
-                          <Badge variant={isCancel ? "default" : "secondary"}>
-                            {isCancel ? "Mark Success" : change.changeType}
-                          </Badge>
-                        </TableCell>
-                        <TableCell>
-                          {change.createdBy?.fullName || "Unknown User"}
-                        </TableCell>
-                        <TableCell>
-                          {formatDistanceToNow(new Date(change.createdAt), {
-                            addSuffix: true,
-                          })}
-                        </TableCell>
-                        <TableCell className="text-right space-x-2">
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="h-8 w-8"
-                            onClick={() =>
-                              router.push(`/admin/reversal-approvals/${change.id}`)
-                            }
-                          >
-                            <Eye className="h-4 w-4" />
-                          </Button>
-                          {canProcessApprovals && (
-                            <>
-                              <Button
-                                variant="outline"
-                                size="sm"
-                                onClick={() =>
-                                  handleProcessChange(change.id, true)
-                                }
-                                disabled={
-                                  processingId === change.id ||
-                                  change.createdById === currentUser.id
-                                }
-                                className="text-green-600 border-green-600 hover:bg-green-50 hover:text-green-700"
-                              >
-                                {processingId === change.id ? (
-                                  <Loader2 className="h-4 w-4 animate-spin" />
-                                ) : (
-                                  <Check className="h-4 w-4" />
-                                )}
-                              </Button>
-                              <Button
-                                variant="outline"
-                                size="sm"
-                                onClick={() => setChangeToReject(change)}
-                                disabled={
-                                  processingId === change.id ||
-                                  change.createdById === currentUser.id
-                                }
-                                className="text-red-600 border-red-600 hover:bg-red-50 hover:text-red-700"
-                              >
-                                <X className="h-4 w-4" />
-                              </Button>
-                            </>
-                          )}
-                        </TableCell>
-                      </TableRow>
-                    );
-                  })
-                ) : (
-                  <TableRow>
-                    <TableCell colSpan={5} className="h-24 text-center">
-                      No pending reversal approvals.
-                    </TableCell>
-                  </TableRow>
-                )}
-              </TableBody>
-            </Table>
-            {initialData.totalPages > 1 && (
-              <div className="mt-6 flex justify-center">
-                <Pagination>
-                  <PaginationContent>{renderPaginationItems()}</PaginationContent>
-                </Pagination>
-              </div>
-            )}
+            <DataTable
+              caption="Reversal and cancel requests"
+              columns={columns}
+              rows={changes}
+              rowKey={(change) => change.id}
+              isLoading={false}
+              emptyMessage="No pending reversal approvals."
+              onRowClick={(change) => router.push(`/admin/reversal-approvals/${change.id}`)}
+              paging={{
+                page: initialData.page,
+                pageSize: initialData.pageSize,
+                total: initialData.total,
+                totalPages: initialData.totalPages,
+                onPageChange: handlePageChange,
+              }}
+            />
           </CardContent>
         </Card>
       </div>

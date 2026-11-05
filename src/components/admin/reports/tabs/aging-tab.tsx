@@ -1,10 +1,8 @@
 'use client';
 
 import { useReportQuery } from '../hooks/use-report-query';
-import { formatCount, sumOf } from '../lib/format';
+import { AgingBadge, BorrowerCell, DataTable, type DataTableColumn, formatCount, Money, sumOf, totalsLabel } from '../../data-table';
 import { audienceParams, reportUrl } from '../lib/report-filters';
-import { AgingBadge, BorrowerCell, Money } from '../report-cells';
-import { ReportTable, totalsLabel, type ReportColumn } from '../report-table';
 import { AGING_CLASSES, type BorrowerAgingRow, type ProviderSummary, type ReportPage, type TableSort } from '../types';
 import type { SummaryTabProps } from './provider-summaries';
 import { AgingClassFilter } from './status-filters';
@@ -38,10 +36,10 @@ function ProviderAging({ providers, summaries, isLoading, isFetching, error, onR
   const showTotals = rows.length > 1;
   const sum = (pick: (row: ProviderAgingRow) => number) => sumOf(rows, pick);
 
-  const columns: ReportColumn<ProviderAgingRow>[] = [
+  const columns: DataTableColumn<ProviderAgingRow>[] = [
     { id: 'provider', header: 'Provider', cell: (r) => r.name },
     ...AGING_CLASSES.map(
-      (c): ReportColumn<ProviderAgingRow> => ({
+      (c): DataTableColumn<ProviderAgingRow> => ({
         id: c.key,
         header: (
           <span className="inline-flex flex-col items-end leading-tight">
@@ -68,7 +66,7 @@ function ProviderAging({ providers, summaries, isLoading, isFetching, error, onR
   ];
 
   return (
-    <ReportTable
+    <DataTable
       caption="Aging by provider"
       columns={columns}
       rows={rows}
@@ -101,7 +99,7 @@ function BorrowerAging(props: ReportTabProps) {
     <Money value={sumOf(rows ?? [], pick)} bold={bold} />
   );
 
-  const columns: ReportColumn<BorrowerAgingRow>[] = [
+  const columns: DataTableColumn<BorrowerAgingRow>[] = [
     ...(filters.providerId === 'all'
       ? [{ id: 'provider', header: 'Provider', sortKey: 'provider', cell: (r: BorrowerAgingRow) => r.provider }]
       : []),
@@ -166,7 +164,7 @@ function BorrowerAging(props: ReportTabProps) {
   ];
 
   return (
-    <ReportTable
+    <DataTable
       caption="Borrower-level aging"
       columns={columns}
       rows={rows}

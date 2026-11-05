@@ -8,22 +8,20 @@ import {
   CardDescription,
   CardHeader,
   CardTitle,
-  CardFooter,
 } from "@/components/ui/card";
 import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
+  DataTable,
+  DateTimeCell,
+  IdCell,
+  Money,
+  SearchInput,
+  StatusBadge,
+  type DataTableColumn,
+} from "@/components/admin/data-table";
 import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
-import { Loader2, ChevronLeft, ChevronRight, Search, Eye } from "lucide-react";
+import { Loader2, Eye } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
-import { format } from "date-fns";
 import { useRouter } from "next/navigation";
 import {
   Dialog,
@@ -80,10 +78,13 @@ export default function ReversalsPage() {
   const [isLoading, setIsLoading] = useState(true);
   const [page, setPage] = useState(1);
   const [totalPages, setTotalPages] = useState(1);
+  const [total, setTotal] = useState(0);
+  const [pageSize, setPageSize] = useState(ITEMS_PER_PAGE);
+  const [loadError, setLoadError] = useState<unknown>(null);
+  const [reloadKey, setReloadKey] = useState(0);
   const [fromDate, setFromDate] = useState("");
   const [toDate, setToDate] = useState("");
   const [filterMode, setFilterMode] = useState<FilterMode>("failed");
-  const [searchQuery, setSearchQuery] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
   const [reversingId, setReversingId] = useState<string | null>(null);
   const [cancelDialogOpen, setCancelDialogOpen] = useState(false);
@@ -91,25 +92,16 @@ export default function ReversalsPage() {
   const [cancelTransactionId, setCancelTransactionId] = useState("");
   const [isCancelling, setIsCancelling] = useState(false);
 
-  // Debounce search input
-  useEffect(() => {
-    const timer = setTimeout(() => {
-      setDebouncedSearch(searchQuery);
-      setPage(1); // Reset to first page on search
-    }, 300);
-    return () => clearTimeout(timer);
-  }, [searchQuery]);
-
   const query = useMemo(() => {
     const p = new URLSearchParams();
     p.set("page", String(page));
-    p.set("limit", String(ITEMS_PER_PAGE));
+    p.set("limit", String(pageSize));
     p.set("filter", filterMode);
     if (fromDate) p.set("from", fromDate);
     if (toDate) p.set("to", toDate);
     if (debouncedSearch) p.set("search", debouncedSearch);
     return p.toString();
-  }, [page, fromDate, toDate, filterMode, debouncedSearch]);
+  }, [page, pageSize, fromDate, toDate, filterMode, debouncedSearch]);
 
   useEffect(() => {
     const fetchRows = async () => {
@@ -120,7 +112,10 @@ export default function ReversalsPage() {
         const data = await res.json();
         setRows(data.rows || []);
         setTotalPages(data.totalPages || 1);
+        setTotal(data.total ?? (data.rows || []).length);
+        setLoadError(null);
       } catch (e: any) {
+        setLoadError(e);
         toast({
           title: "Error",
           description: String(e?.message ?? e),
@@ -132,7 +127,7 @@ export default function ReversalsPage() {
     };
 
     void fetchRows();
-  }, [query, toast]);
+  }, [query, reloadKey, toast]);
 
   const reverseTx = async (row: ReversalRow) => {
     setReversingId(row.id);
@@ -160,6 +155,7 @@ export default function ReversalsPage() {
       const refreshed = await refresh.json();
       setRows(refreshed.rows || []);
       setTotalPages(refreshed.totalPages || 1);
+      setTotal(refreshed.total ?? (refreshed.rows || []).length);
     } catch (e: any) {
       toast({
         title: "Error",
@@ -222,6 +218,7 @@ export default function ReversalsPage() {
       const refreshed = await refresh.json();
       setRows(refreshed.rows || []);
       setTotalPages(refreshed.totalPages || 1);
+      setTotal(refreshed.total ?? (refreshed.rows || []).length);
     } catch (e: any) {
       toast({
         title: "Error",
@@ -234,28 +231,70 @@ export default function ReversalsPage() {
   };
 
   const statusBadge = (row: ReversalRow) => {
-    if (row.reversed)
-      return <Badge className="bg-green-600 text-white">Reversed</Badge>;
-    if (row.cancelled)
-      return <Badge className="bg-blue-600 text-white">Cancelled</Badge>;
+    if (row.reversed) return <StatusBadge status="Reversed" tone="success" />;
+    if (row.cancelled) return <StatusBadge status="Cancelled" tone="info" />;
     if (row.pendingApproval) {
-      const type =
-        row.pendingApproval.type === "DisbursementCancel"
-          ? "Cancel"
-          : "Reversal";
-      return <Badge variant="outline">Pending {type}</Badge>;
+      const type = row.pendingApproval.type === "DisbursementCancel" ? "Cancel" : "Reversal";
+      return <StatusBadge status={`Pending ${type}`} tone="warning" />;
     }
-    // Show "Posted" for loans without disbursement transaction
-    if (row.isPosted || row.disbursementStatus === "POSTED")
-      return <Badge className="bg-yellow-600 text-white">Posted</Badge>;
-    if (row.disbursementStatus === "SUCCESS")
-      return <Badge className="bg-green-600 text-white">Success</Badge>;
-    if (row.statusCode == null)
-      return <Badge className="bg-red-600 text-white">Failed</Badge>;
-    if (row.statusCode >= 200 && row.statusCode < 300)
-      return <Badge className="bg-green-600 text-white">OK</Badge>;
-    return <Badge className="bg-red-600 text-white">Failed</Badge>;
+    // Loans posted without a disbursement transaction.
+    if (row.isPosted || row.disbursementStatus === "POSTED") return <StatusBadge status="Posted" tone="warning" />;
+    if (row.disbursementStatus === "SUCCESS") return <StatusBadge status="Success" tone="success" />;
+    if (row.statusCode == null) return <StatusBadge status="Failed" tone="danger" />;
+    if (row.statusCode >= 200 && row.statusCode < 300) return <StatusBadge status="OK" tone="success" />;
+    return <StatusBadge status="Failed" tone="danger" />;
   };
+
+  const columns: DataTableColumn<ReversalRow>[] = [
+    { id: "date", header: "Date", cell: (r) => <DateTimeCell value={r.createdAt} /> },
+    { id: "status", header: "Status", cell: (r) => statusBadge(r) },
+    { id: "provider", header: "Provider", cell: (r) => <IdCell id={r.originalProviderId || r.providerId} /> },
+    { id: "account", header: "Credit Account", className: "font-mono text-xs", cell: (r) => r.creditAccount || "—" },
+    { id: "amount", header: "Amount (ETB)", align: "right", cell: (r) => (r.amount == null ? "—" : <Money value={r.amount} />) },
+    { id: "txn", header: "Txn ID", cell: (r) => <IdCell id={r.transactionId} /> },
+    { id: "loan", header: "Loan", cell: (r) => <IdCell id={r.loanId} /> },
+    {
+      id: "action",
+      header: "Action",
+      align: "right",
+      cell: (r) => {
+        const isPostedOnly = r.isPosted || r.disbursementStatus === "POSTED";
+        const canReverse = !r.reversed && !r.cancelled && !r.pendingApproval && (r.isFailure || isPostedOnly);
+        return (
+          <div className="flex justify-end gap-2">
+            {r.reversed ? (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  const detailId = r.loanId || r.id;
+                  router.push(`/admin/reversal-details?id=${encodeURIComponent(detailId)}`);
+                }}
+              >
+                <Eye className="h-4 w-4 mr-1" />
+                View Details
+              </Button>
+            ) : (
+              <>
+                <Button variant="outline" size="sm" disabled={!canReverse || reversingId === r.id} onClick={() => void reverseTx(r)}>
+                  {reversingId === r.id ? (
+                    <span className="inline-flex items-center gap-2">
+                      <Loader2 className="h-4 w-4 animate-spin" /> Submitting
+                    </span>
+                  ) : (
+                    "Reverse"
+                  )}
+                </Button>
+                <Button variant="secondary" size="sm" disabled={!canReverse} onClick={() => openCancelDialog(r)}>
+                  Cancel
+                </Button>
+              </>
+            )}
+          </div>
+        );
+      },
+    },
+  ];
 
   return (
     <div className="flex-1 space-y-4 p-8 pt-6">
@@ -305,28 +344,15 @@ export default function ReversalsPage() {
         </div>
       </div>
 
-      {/* Search Bar */}
-      <div className="flex items-center gap-2">
-        <div className="relative flex-1 max-w-sm">
-          <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-          <Input
-            type="text"
-            placeholder="Search by account number or phone number..."
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            className="pl-9"
-          />
-        </div>
-        {searchQuery && (
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => setSearchQuery("")}
-          >
-            Clear
-          </Button>
-        )}
-      </div>
+      <SearchInput
+        label="Search reversals"
+        placeholder="Search by account number or phone number..."
+        value={debouncedSearch}
+        onChange={(value) => {
+          setDebouncedSearch(value);
+          setPage(1);
+        }}
+      />
 
       <Card>
         <CardHeader>
@@ -346,141 +372,36 @@ export default function ReversalsPage() {
           </CardDescription>
         </CardHeader>
         <CardContent>
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Date</TableHead>
-                <TableHead>Status</TableHead>
-                <TableHead>Provider</TableHead>
-                <TableHead>Credit Account</TableHead>
-                <TableHead>Amount</TableHead>
-                <TableHead>Txn ID</TableHead>
-                <TableHead>Loan</TableHead>
-                <TableHead className="text-right">Action</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {isLoading ? (
-                <TableRow>
-                  <TableCell colSpan={8} className="h-24 text-center">
-                    <Loader2 className="h-6 w-6 animate-spin mx-auto" />
-                  </TableCell>
-                </TableRow>
-              ) : rows.length ? (
-                rows.map((r) => {
-                  const internalProviderId =
-                    r.originalProviderId || r.providerId;
-                  const isPostedOnly = r.isPosted || r.disbursementStatus === "POSTED";
-                  // For posted loans, allow reverse/cancel if not already processed
-                  const canActOnPosted = isPostedOnly && !r.reversed && !r.cancelled && !r.pendingApproval;
-                  // For failed disbursements, same as before
-                  const canReverse =
-                    !r.reversed &&
-                    !r.cancelled &&
-                    !r.pendingApproval &&
-                    (r.isFailure || isPostedOnly);
-                  return (
-                    <TableRow key={r.id}>
-                      <TableCell>
-                        {format(new Date(r.createdAt), "yyyy-MM-dd HH:mm:ss")}
-                      </TableCell>
-                      <TableCell>{statusBadge(r)}</TableCell>
-                      <TableCell className="font-mono">
-                        {internalProviderId}
-                      </TableCell>
-                      <TableCell className="font-mono">
-                        {r.creditAccount || "—"}
-                      </TableCell>
-                      <TableCell>{r.amount ?? "—"}</TableCell>
-                      <TableCell className="font-mono">
-                        {r.transactionId ?? "—"}
-                      </TableCell>
-                      <TableCell className="font-mono">
-                        {r.loanId ?? "—"}
-                      </TableCell>
-                      <TableCell className="text-right">
-                        <div className="flex justify-end gap-2">
-                          {r.reversed ? (
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              onClick={() => {
-                                const detailId = r.loanId || r.id;
-                                router.push(`/admin/reversal-details?id=${encodeURIComponent(detailId)}`);
-                              }}
-                            >
-                              <Eye className="h-4 w-4 mr-1" />
-                              View Details
-                            </Button>
-                          ) : (
-                            <>
-                              <Button
-                                variant="outline"
-                                disabled={!canReverse || reversingId === r.id}
-                                onClick={() => void reverseTx(r)}
-                              >
-                                {reversingId === r.id ? (
-                                  <span className="inline-flex items-center gap-2">
-                                    <Loader2 className="h-4 w-4 animate-spin" />{" "}
-                                    Submitting
-                                  </span>
-                                ) : (
-                                  "Reverse"
-                                )}
-                              </Button>
-                              <Button
-                                variant="secondary"
-                                disabled={!canReverse}
-                                onClick={() => openCancelDialog(r)}
-                              >
-                                Cancel
-                              </Button>
-                            </>
-                          )}
-                        </div>
-                      </TableCell>
-                    </TableRow>
-                  );
-                })
-              ) : (
-                <TableRow>
-                  <TableCell colSpan={8} className="h-24 text-center">
-                    {filterMode === "posted" 
-                      ? "No posted loans without disbursement records found."
-                      : filterMode === "all"
-                        ? "No disbursement transactions found."
-                        : "No failed disbursements found."}
-                  </TableCell>
-                </TableRow>
-              )}
-            </TableBody>
-          </Table>
+          <DataTable
+            caption="Disbursements"
+            columns={columns}
+            rows={rows}
+            rowKey={(r) => r.id}
+            isLoading={isLoading && rows.length === 0}
+            isFetching={isLoading}
+            error={loadError}
+            onRetry={() => setReloadKey((k) => k + 1)}
+            emptyMessage={
+              filterMode === "posted"
+                ? "No posted loans without disbursement records found."
+                : filterMode === "all"
+                  ? "No disbursement transactions found."
+                  : "No failed disbursements found."
+            }
+            paging={{
+              page,
+              pageSize,
+              total,
+              totalPages: Math.max(1, totalPages),
+              onPageChange: setPage,
+              onPageSizeChange: (size) => {
+                setPageSize(size);
+                setPage(1);
+              },
+              pageSizes: [20, 50, 100],
+            }}
+          />
         </CardContent>
-        <CardFooter className="flex items-center justify-between">
-          <div className="text-sm text-muted-foreground">
-            Page {page} of {totalPages}
-          </div>
-          <div className="flex items-center gap-2">
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setPage((p) => Math.max(1, p - 1))}
-              disabled={page <= 1}
-            >
-              <ChevronLeft className="h-4 w-4" />
-              Prev
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
-              disabled={page >= totalPages}
-            >
-              Next
-              <ChevronRight className="h-4 w-4" />
-            </Button>
-          </div>
-        </CardFooter>
       </Card>
 
       {/* Cancel Dialog */}

@@ -1,7 +1,7 @@
 
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { useRequirePermission } from '@/hooks/use-require-permission';
 import {
   Card,
@@ -11,19 +11,20 @@ import {
   CardTitle,
 } from '@/components/ui/card';
 import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from '@/components/ui/table';
+  DataTable,
+  formatDay,
+  Money,
+  SearchInput,
+  StatusBadge,
+  sumOf,
+  useClientTable,
+  type DataTableColumn,
+} from '@/components/admin/data-table';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Loader2, MoreHorizontal, FileText, CheckCircle, XCircle } from 'lucide-react';
 import { useToast } from '@/hooks/use-toast';
 import type { LoanApplication, UploadedDocument } from '@/lib/types';
-import { format } from 'date-fns';
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -37,10 +38,9 @@ import { Label } from '@/components/ui/label';
 import { Textarea } from '@/components/ui/textarea';
 import { usePermissions } from '@/hooks/use-permissions';
 
-const formatCurrency = (amount: number | null | undefined) => {
-    if (amount === null || amount === undefined) return 'N/A';
-    return new Intl.NumberFormat('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(amount) + ' ETB';
-};
+/** The provider's name: the applications API includes it with the product, though LoanProduct does not declare it. */
+const providerNameOf = (app: LoanApplication): string =>
+    (app.product as unknown as { provider?: { name?: string } }).provider?.name ?? '';
 
 const DocumentViewerDialog = ({ application, isOpen, onClose }: { application: LoanApplication | null; isOpen: boolean; onClose: () => void }) => {
     if (!application) return null;
@@ -133,6 +133,8 @@ export default function ApplicationsPage() {
     
     type ActionType = 'approve' | 'reject' | 'view';
     const [actionState, setActionState] = useState<{ type: ActionType; application: LoanApplication | null }>({ type: 'view', application: null });
+    const [search, setSearch] = useState('');
+    const [loadError, setLoadError] = useState<unknown>(null);
 
     const fetchApplications = async () => {
         setIsLoading(true);
@@ -143,7 +145,9 @@ export default function ApplicationsPage() {
             }
             const data = await response.json();
             setApplications(data);
+            setLoadError(null);
         } catch (error: any) {
+            setLoadError(error);
             toast({
                 title: 'Error',
                 description: error.message,
@@ -207,6 +211,73 @@ export default function ApplicationsPage() {
         }
     };
 
+    const visible = useMemo(() => {
+        const needle = search.toLowerCase();
+        if (!needle) return applications;
+        return applications.filter((app) =>
+            [app.borrowerName, app.product?.name, providerNameOf(app), app.id]
+                .some((value) => String(value ?? '').toLowerCase().includes(needle)),
+        );
+    }, [applications, search]);
+    const table = useClientTable(visible, {
+        sorters: {
+            submitted: (app) => new Date(app.updatedAt),
+            borrower: (app) => app.borrowerName,
+            amount: (app) => app.loanAmount,
+        },
+        initialSort: { by: 'submitted', dir: 'desc' },
+    });
+
+    const columns: DataTableColumn<LoanApplication>[] = [
+        { id: 'submitted', header: 'Date Submitted', sortKey: 'submitted', className: 'whitespace-nowrap', cell: (app) => formatDay(app.updatedAt) },
+        { id: 'borrower', header: 'Borrower', sortKey: 'borrower', cell: (app) => <span className="font-medium">{app.borrowerName}</span> },
+        { id: 'product', header: 'Product', cell: (app) => app.product.name },
+        { id: 'provider', header: 'Provider', cell: (app) => providerNameOf(app) },
+        {
+            id: 'amount',
+            header: 'Amount (ETB)',
+            align: 'right',
+            sortKey: 'amount',
+            cell: (app) => (app.loanAmount == null ? 'N/A' : <Money value={app.loanAmount} />),
+            footer: <Money value={sumOf(visible, (app) => app.loanAmount)} bold />,
+        },
+        { id: 'status', header: 'Status', cell: (app) => <StatusBadge status={app.status} /> },
+        {
+            id: 'actions',
+            header: 'Actions',
+            align: 'right',
+            cell: (app) => (
+                <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                        <Button variant="ghost" className="h-8 w-8 p-0">
+                            <span className="sr-only">Open menu</span>
+                            <MoreHorizontal className="h-4 w-4" />
+                        </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end">
+                        <DropdownMenuLabel>Actions</DropdownMenuLabel>
+                        <DropdownMenuItem onClick={() => setActionState({ type: 'view', application: app })}>
+                            <FileText className="mr-2 h-4 w-4"/>
+                            View Documents
+                        </DropdownMenuItem>
+                        {canUpdateApplications && (
+                            <>
+                                <DropdownMenuItem onClick={() => setActionState({ type: 'approve', application: app })}>
+                                    <CheckCircle className="mr-2 h-4 w-4 text-green-600"/>
+                                    Approve
+                                </DropdownMenuItem>
+                                <DropdownMenuItem className="text-red-600" onClick={() => setActionState({ type: 'reject', application: app })}>
+                                    <XCircle className="mr-2 h-4 w-4"/>
+                                    Request Revision
+                                </DropdownMenuItem>
+                            </>
+                        )}
+                    </DropdownMenuContent>
+                </DropdownMenu>
+            ),
+        },
+    ];
+
     return (
         <>
             <div className="flex-1 space-y-4 p-8 pt-6">
@@ -221,76 +292,32 @@ export default function ApplicationsPage() {
                         <CardDescription>The following applications have all documents uploaded and are ready for a decision.</CardDescription>
                     </CardHeader>
                     <CardContent>
-                        <Table>
-                            <TableHeader>
-                                <TableRow>
-                                    <TableHead>Date Submitted</TableHead>
-                                    <TableHead>Borrower</TableHead>
-                                    <TableHead>Product</TableHead>
-                                    <TableHead>Provider</TableHead>
-                                    <TableHead className="text-right">Amount</TableHead>
-                                    <TableHead>Status</TableHead>
-                                    <TableHead>Actions</TableHead>
-                                </TableRow>
-                            </TableHeader>
-                            <TableBody>
-                                {isLoading ? (
-                                    <TableRow>
-                                        <TableCell colSpan={7} className="h-24 text-center">
-                                            <Loader2 className="h-6 w-6 animate-spin mx-auto"/>
-                                        </TableCell>
-                                    </TableRow>
-                                ) : applications.length > 0 ? (
-                                    applications.map((app) => (
-                                        <TableRow key={app.id}>
-                                            <TableCell>{format(new Date(app.updatedAt), 'yyyy-MM-dd')}</TableCell>
-                                            <TableCell>{app.borrowerName}</TableCell>
-                                            <TableCell>{app.product.name}</TableCell>
-                                            <TableCell>{app.product.provider.name}</TableCell>
-                                            <TableCell className="text-right font-mono">{formatCurrency(app.loanAmount)}</TableCell>
-                                            <TableCell>
-                                                <Badge variant="secondary">{app.status.replace('_', ' ')}</Badge>
-                                            </TableCell>
-                                            <TableCell>
-                                                <DropdownMenu>
-                                                    <DropdownMenuTrigger asChild>
-                                                        <Button variant="ghost" className="h-8 w-8 p-0">
-                                                            <span className="sr-only">Open menu</span>
-                                                            <MoreHorizontal className="h-4 w-4" />
-                                                        </Button>
-                                                    </DropdownMenuTrigger>
-                                                    <DropdownMenuContent align="end">
-                                                        <DropdownMenuLabel>Actions</DropdownMenuLabel>
-                                                        <DropdownMenuItem onClick={() => setActionState({ type: 'view', application: app })}>
-                                                            <FileText className="mr-2 h-4 w-4"/>
-                                                            View Documents
-                                                        </DropdownMenuItem>
-                                                        {canUpdateApplications && (
-                                                            <>
-                                                                <DropdownMenuItem onClick={() => setActionState({ type: 'approve', application: app })}>
-                                                                    <CheckCircle className="mr-2 h-4 w-4 text-green-600"/>
-                                                                    Approve
-                                                                </DropdownMenuItem>
-                                                                <DropdownMenuItem className="text-red-600" onClick={() => setActionState({ type: 'reject', application: app })}>
-                                                                    <XCircle className="mr-2 h-4 w-4"/>
-                                                                    Request Revision
-                                                                </DropdownMenuItem>
-                                                            </>
-                                                        )}
-                                                    </DropdownMenuContent>
-                                                </DropdownMenu>
-                                            </TableCell>
-                                        </TableRow>
-                                    ))
-                                ) : (
-                                    <TableRow>
-                                        <TableCell colSpan={7} className="h-24 text-center">
-                                            No applications are currently pending review.
-                                        </TableCell>
-                                    </TableRow>
-                                )}
-                            </TableBody>
-                        </Table>
+                        <DataTable
+                            caption="Applications pending review"
+                            columns={columns}
+                            rows={applications.length || !isLoading ? table.rows : undefined}
+                            rowKey={(app) => app.id}
+                            isLoading={isLoading && applications.length === 0}
+                            isFetching={isLoading && applications.length > 0}
+                            error={loadError}
+                            onRetry={fetchApplications}
+                            emptyMessage={search ? 'No applications match the search.' : 'No applications are currently pending review.'}
+                            sort={table.sort}
+                            onSortChange={table.onSortChange}
+                            paging={table.paging}
+                            footerLabel="Total"
+                            toolbar={
+                                <SearchInput
+                                    label="Search applications"
+                                    placeholder="Search by borrower, product or provider…"
+                                    value={search}
+                                    onChange={(value) => {
+                                        setSearch(value);
+                                        table.resetPage();
+                                    }}
+                                />
+                            }
+                        />
                     </CardContent>
                 </Card>
             </div>

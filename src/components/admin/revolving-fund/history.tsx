@@ -3,19 +3,55 @@
 import { useMemo, useState } from "react";
 import { format } from "date-fns";
 import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
+  DataTable,
+  DateTimeCell,
+  SearchInput,
+  useClientTable,
+  type DataTableColumn,
+  type SortValue,
+} from "@/components/admin/data-table";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
 import {
   formatCurrency,
   FundReplenishmentRecord,
 } from "@/lib/fund-replenishment-utils";
+
+const RECORD_SORTERS: Record<string, (r: FundReplenishmentRecord) => SortValue> = {
+  date: (r) => r.replenishmentDate,
+  amount: (r) => r.amount,
+  recordedBy: (r) => r.recordedByUser?.fullName,
+  recordedAt: (r) => r.createdAt,
+};
+
+const COLUMNS: DataTableColumn<FundReplenishmentRecord>[] = [
+  {
+    id: "date",
+    header: "Date",
+    sortKey: "date",
+    className: "whitespace-nowrap",
+    cell: (r) => format(new Date(r.replenishmentDate), "dd MMM yyyy"),
+  },
+  { id: "amount", header: "Amount", sortKey: "amount", align: "right", className: "font-mono", cell: (r) => formatCurrency(r.amount) },
+  {
+    id: "before",
+    header: "Balance before",
+    align: "right",
+    className: "font-mono text-muted-foreground",
+    cell: (r) => formatCurrency(r.balanceBefore),
+  },
+  { id: "after", header: "Balance after", align: "right", className: "font-mono", cell: (r) => formatCurrency(r.balanceAfter) },
+  {
+    id: "remarks",
+    header: "Remarks",
+    cell: (r) => (
+      <span className="block max-w-xs truncate" title={r.remarks || ""}>
+        {r.remarks || "—"}
+      </span>
+    ),
+  },
+  { id: "recordedBy", header: "Recorded by", sortKey: "recordedBy", cell: (r) => r.recordedByUser?.fullName ?? "—" },
+  { id: "recordedAt", header: "Recorded at", sortKey: "recordedAt", cell: (r) => <DateTimeCell value={r.createdAt} /> },
+];
 
 export function RevolvingFundHistory(props: {
   records: FundReplenishmentRecord[];
@@ -32,66 +68,34 @@ export function RevolvingFundHistory(props: {
       );
     });
   }, [props.records, query]);
+  const table = useClientTable(filtered, { sorters: RECORD_SORTERS, pageSize: 25 });
 
   return (
     <Card>
       <CardHeader className="space-y-3">
         <CardTitle>Replenishment history</CardTitle>
-        <Input
+        <SearchInput
+          label="Search replenishments"
           placeholder="Search by remarks or recorded by..."
           value={query}
-          onChange={(e) => setQuery(e.target.value)}
+          onChange={(value) => {
+            setQuery(value);
+            table.resetPage();
+          }}
         />
       </CardHeader>
-      <CardContent className="p-0">
-        <div className="rounded-md border overflow-x-auto">
-          <Table>
-            <TableHeader className="bg-muted/50">
-              <TableRow>
-                <TableHead>Date</TableHead>
-                <TableHead className="text-right">Amount</TableHead>
-                <TableHead className="text-right">Balance before</TableHead>
-                <TableHead className="text-right">Balance after</TableHead>
-                <TableHead>Remarks</TableHead>
-                <TableHead>Recorded by</TableHead>
-                <TableHead>Recorded at</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {filtered.length === 0 ? (
-                <TableRow>
-                  <TableCell colSpan={7} className="text-center text-muted-foreground py-8">
-                    No replenishment records yet.
-                  </TableCell>
-                </TableRow>
-              ) : (
-                filtered.map((r) => (
-                  <TableRow key={r.id}>
-                    <TableCell>
-                      {format(new Date(r.replenishmentDate), "dd MMM yyyy")}
-                    </TableCell>
-                    <TableCell className="text-right font-mono">
-                      {formatCurrency(r.amount)}
-                    </TableCell>
-                    <TableCell className="text-right font-mono text-muted-foreground">
-                      {formatCurrency(r.balanceBefore)}
-                    </TableCell>
-                    <TableCell className="text-right font-mono">
-                      {formatCurrency(r.balanceAfter)}
-                    </TableCell>
-                    <TableCell className="max-w-xs truncate" title={r.remarks || ""}>
-                      {r.remarks || "—"}
-                    </TableCell>
-                    <TableCell>{r.recordedByUser?.fullName ?? "—"}</TableCell>
-                    <TableCell className="text-muted-foreground text-sm">
-                      {format(new Date(r.createdAt), "dd MMM yyyy HH:mm")}
-                    </TableCell>
-                  </TableRow>
-                ))
-              )}
-            </TableBody>
-          </Table>
-        </div>
+      <CardContent>
+        <DataTable
+          caption="Replenishment history"
+          columns={COLUMNS}
+          rows={table.rows}
+          rowKey={(r) => r.id}
+          isLoading={false}
+          emptyMessage={query ? "No replenishments match your search." : "No replenishment records yet."}
+          sort={table.sort}
+          onSortChange={table.onSortChange}
+          paging={table.paging}
+        />
       </CardContent>
     </Card>
   );

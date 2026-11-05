@@ -166,6 +166,7 @@ export async function GET(req: NextRequest) {
 
         return NextResponse.json({
             logs: filteredLogs,
+            total: totalCount,
             totalPages: Math.ceil(totalCount / limit),
             currentPage: page,
         });

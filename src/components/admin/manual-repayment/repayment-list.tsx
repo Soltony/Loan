@@ -3,23 +3,15 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import ExcelJS from 'exceljs';
 import { saveAs } from 'file-saver';
-import {
-  ChevronLeft,
-  ChevronRight,
-  FileDown,
-  FileText,
-  Loader2,
-  Search,
-} from 'lucide-react';
+import { FileDown, FileText, Loader2 } from 'lucide-react';
 import {
   Card,
   CardContent,
   CardDescription,
-  CardFooter,
   CardHeader,
   CardTitle,
 } from '@/components/ui/card';
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
+import { DataTable, IdCell, SearchInput, type DataTableColumn } from '@/components/admin/data-table';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import {
@@ -74,7 +66,7 @@ export function RepaymentList({
   const [source, setSource] = useState<string>('ALL');
   const [from, setFrom] = useState('');
   const [to, setTo] = useState('');
-  const [search, setSearch] = useState('');
+  const [pageSize, setPageSize] = useState(PAGE_SIZE);
   const [debouncedSearch, setDebouncedSearch] = useState('');
 
   const [data, setData] = useState<ManualRepaymentListResponse | null>(null);
@@ -82,20 +74,13 @@ export function RepaymentList({
   const [isExporting, setIsExporting] = useState(false);
   const [openId, setOpenId] = useState<string | null>(null);
   const [localRefresh, setLocalRefresh] = useState(0);
-
-  useEffect(() => {
-    const timer = setTimeout(() => {
-      setDebouncedSearch(search);
-      setPage(1);
-    }, 300);
-    return () => clearTimeout(timer);
-  }, [search]);
+  const [loadError, setLoadError] = useState<unknown>(null);
 
   const buildQuery = useCallback(
     (overrides?: { page?: number; limit?: number }) => {
       const p = new URLSearchParams();
       p.set('page', String(overrides?.page ?? page));
-      p.set('limit', String(overrides?.limit ?? PAGE_SIZE));
+      p.set('limit', String(overrides?.limit ?? pageSize));
       if (fixedStatuses?.length) p.set('status', fixedStatuses.join(','));
       else if (status !== 'ALL') p.set('status', status);
       if (source !== 'ALL') p.set('paymentSource', source);
@@ -104,7 +89,7 @@ export function RepaymentList({
       if (debouncedSearch) p.set('search', debouncedSearch);
       return p.toString();
     },
-    [page, fixedStatuses, status, source, from, to, debouncedSearch],
+    [page, pageSize, fixedStatuses, status, source, from, to, debouncedSearch],
   );
 
   useEffect(() => {
@@ -115,9 +100,13 @@ export function RepaymentList({
         const res = await fetch(`/api/manual-repayments?${buildQuery()}`);
         const body = await res.json();
         if (!res.ok) throw new Error(body?.error || 'Failed to load repayments.');
-        if (!cancelled) setData(body);
+        if (!cancelled) {
+          setData(body);
+          setLoadError(null);
+        }
       } catch (e) {
         if (!cancelled) {
+          setLoadError(e);
           toast({ title: 'Error', description: String((e as Error)?.message ?? e), variant: 'destructive' });
         }
       } finally {
@@ -265,6 +254,35 @@ export function RepaymentList({
     }
   };
 
+  const columns: DataTableColumn<ManualRepaymentRow>[] = [
+    { id: 'paymentDate', header: 'Payment date', className: 'whitespace-nowrap', cell: (r) => dateOnly(r.paymentDate) },
+    {
+      id: 'customer',
+      header: 'Customer / loan',
+      cell: (r) => (
+        <div className="space-y-0.5">
+          <div className="text-sm">{r.borrowerId}</div>
+          <IdCell id={r.loanId} />
+        </div>
+      ),
+    },
+    { id: 'method', header: 'Method', cell: (r) => sourceLabel(r.paymentSource) },
+    { id: 'reference', header: 'Reference', className: 'font-mono text-xs', cell: (r) => r.referenceNumber },
+    { id: 'amount', header: 'Amount (ETB)', align: 'right', className: 'font-medium tabular-nums', cell: (r) => money(r.amount) },
+    { id: 'status', header: 'Status', cell: (r) => <StatusBadge status={r.status} /> },
+    { id: 'maker', header: 'Maker', cell: (r) => r.maker?.fullName ?? '—' },
+    {
+      id: 'view',
+      header: <span className="sr-only">Open</span>,
+      align: 'right',
+      cell: (r) => (
+        <Button variant="ghost" size="sm" onClick={() => setOpenId(r.id)}>
+          View
+        </Button>
+      ),
+    },
+  ];
+
   const handleChanged = () => {
     setLocalRefresh((n) => n + 1);
     onChanged?.();
@@ -305,15 +323,16 @@ export function RepaymentList({
 
         <CardContent className="space-y-4">
           <div className="flex flex-wrap items-end gap-2">
-            <div className="relative min-w-[220px] flex-1">
-              <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-              <Input
-                value={search}
-                onChange={(e) => setSearch(e.target.value)}
-                placeholder="Reference, loan ID or telephone…"
-                className="pl-9"
-              />
-            </div>
+            <SearchInput
+              className="min-w-[220px] flex-1"
+              label="Search repayments"
+              placeholder="Reference, loan ID or telephone…"
+              value={debouncedSearch}
+              onChange={(value) => {
+                setDebouncedSearch(value);
+                setPage(1);
+              }}
+            />
 
             {!fixedStatuses && (
               <FilterField label="Status">
@@ -386,86 +405,31 @@ export function RepaymentList({
             </FilterField>
           </div>
 
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Payment date</TableHead>
-                <TableHead>Customer / loan</TableHead>
-                <TableHead>Method</TableHead>
-                <TableHead>Reference</TableHead>
-                <TableHead className="text-right">Amount</TableHead>
-                <TableHead>Status</TableHead>
-                <TableHead>Maker</TableHead>
-                <TableHead />
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {isLoading && (
-                <TableRow>
-                  <TableCell colSpan={8} className="h-24 text-center">
-                    <Loader2 className="mx-auto h-5 w-5 animate-spin text-muted-foreground" />
-                  </TableCell>
-                </TableRow>
-              )}
-              {!isLoading && rows.length === 0 && (
-                <TableRow>
-                  <TableCell colSpan={8} className="h-24 text-center text-sm text-muted-foreground">
-                    {emptyMessage}
-                  </TableCell>
-                </TableRow>
-              )}
-              {!isLoading &&
-                rows.map((r) => (
-                  <TableRow key={r.id}>
-                    <TableCell className="whitespace-nowrap text-sm">{dateOnly(r.paymentDate)}</TableCell>
-                    <TableCell>
-                      <div className="text-sm">{r.borrowerId}</div>
-                      <div className="font-mono text-xs text-muted-foreground">{r.loanId}</div>
-                    </TableCell>
-                    <TableCell className="text-sm">{sourceLabel(r.paymentSource)}</TableCell>
-                    <TableCell className="font-mono text-xs">{r.referenceNumber}</TableCell>
-                    <TableCell className="text-right font-medium tabular-nums">{money(r.amount)}</TableCell>
-                    <TableCell>
-                      <StatusBadge status={r.status} />
-                    </TableCell>
-                    <TableCell className="text-sm">{r.maker?.fullName ?? '—'}</TableCell>
-                    <TableCell className="text-right">
-                      <Button variant="ghost" size="sm" onClick={() => setOpenId(r.id)}>
-                        View
-                      </Button>
-                    </TableCell>
-                  </TableRow>
-                ))}
-            </TableBody>
-          </Table>
+          <DataTable
+            caption={title}
+            columns={columns}
+            rows={rows}
+            rowKey={(r) => r.id}
+            isLoading={isLoading && !data}
+            isFetching={isLoading}
+            error={loadError}
+            onRetry={() => setLocalRefresh((n) => n + 1)}
+            emptyMessage={emptyMessage}
+            onRowClick={(r) => setOpenId(r.id)}
+            paging={{
+              page,
+              pageSize,
+              total: data?.total ?? 0,
+              totalPages: Math.max(1, data?.totalPages ?? 1),
+              onPageChange: setPage,
+              onPageSizeChange: (size) => {
+                setPageSize(size);
+                setPage(1);
+              },
+              pageSizes: [20, 50, 100],
+            }}
+          />
         </CardContent>
-
-        <CardFooter className="justify-between">
-          <p className="text-sm text-muted-foreground">
-            {data ? `${data.total} record(s)` : ''}
-          </p>
-          <div className="flex items-center gap-2">
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setPage((p) => Math.max(1, p - 1))}
-              disabled={page <= 1 || isLoading}
-            >
-              <ChevronLeft className="h-4 w-4" />
-            </Button>
-            <span className="text-sm">
-              Page {page} of {Math.max(1, data?.totalPages ?? 1)}
-            </span>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setPage((p) => p + 1)}
-              disabled={isLoading || page >= (data?.totalPages ?? 1)}
-            >
-              <ChevronRight className="h-4 w-4" />
-            </Button>
-          </div>
-        </CardFooter>
       </Card>
 
       <RepaymentDetailDialog

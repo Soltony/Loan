@@ -9,21 +9,11 @@ import {
   CardDescription,
   CardHeader,
   CardTitle,
-  CardFooter,
 } from "@/components/ui/card";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
+import { DataTable, DateTimeCell, type DataTableColumn } from "@/components/admin/data-table";
 import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
-import { Loader2, Check, X, ChevronLeft, ChevronRight } from "lucide-react";
+import { Loader2, Check, X } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
-import { formatDistanceToNow } from "date-fns";
 import {
   Dialog,
   DialogContent,
@@ -54,7 +44,8 @@ export default function PhoneChangeApprovalsPage() {
 
   const { toast } = useToast();
   const router = useRouter();
-  const { user } = useAuth();
+  // useAuth exposes the signed-in user as currentUser; `user` was always undefined, so own requests were never disabled.
+  const { currentUser: user } = useAuth();
   const { canModule } = usePermissions();
   const canProcess =
     canModule("phone-change-approvals", "update") ||
@@ -64,6 +55,9 @@ export default function PhoneChangeApprovalsPage() {
   const [isLoading, setIsLoading] = useState(true);
   const [page, setPage] = useState(1);
   const [totalPages, setTotalPages] = useState(1);
+  const [total, setTotal] = useState(0);
+  const [pageSize, setPageSize] = useState(10);
+  const [loadError, setLoadError] = useState<unknown>(null);
   const [processingId, setProcessingId] = useState<string | null>(null);
   const [removedIds, setRemovedIds] = useState<Set<string>>(new Set());
 
@@ -75,18 +69,21 @@ export default function PhoneChangeApprovalsPage() {
     setIsLoading(true);
     try {
       const res = await fetch(
-        `/api/phone-change/approvals?status=PENDING&page=${page}&limit=10`
+        `/api/phone-change/approvals?status=PENDING&page=${page}&limit=${pageSize}`
       );
       if (!res.ok) throw new Error("Failed to fetch requests");
       const data = await res.json();
       setRequests(data.data || []);
       setTotalPages(data.totalPages || 1);
+      setTotal(data.total ?? (data.data || []).length);
+      setLoadError(null);
     } catch (e: any) {
+      setLoadError(e);
       toast({ title: "Error", description: String(e?.message ?? e), variant: "destructive" });
     } finally {
       setIsLoading(false);
     }
-  }, [page, toast]);
+  }, [page, pageSize, toast]);
 
   useEffect(() => {
     void fetchRequests();
@@ -141,6 +138,57 @@ export default function PhoneChangeApprovalsPage() {
     }
   };
 
+  const columns: DataTableColumn<PhoneChangeRequestRow>[] = [
+    { id: "old", header: "Old Phone", className: "font-mono", cell: (req) => req.oldPhoneNumber },
+    { id: "new", header: "New Phone", className: "font-mono", cell: (req) => req.newPhoneNumber },
+    {
+      id: "reason",
+      header: "Reason",
+      cell: (req) => (
+        <span className="block max-w-xs truncate" title={req.reason}>
+          {req.reason}
+        </span>
+      ),
+    },
+    { id: "requestedBy", header: "Requested By", cell: (req) => req.requestedByName },
+    { id: "requested", header: "Requested", cell: (req) => <DateTimeCell value={req.createdAt} /> },
+    {
+      id: "actions",
+      header: "Actions",
+      align: "right",
+      cell: (req) => {
+        if (!canProcess) return null;
+        const isSelf = req.requestedById === user?.id;
+        return (
+          <div className="flex justify-end gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => handleProcess(req.id, true)}
+              disabled={processingId === req.id || isSelf}
+              className="text-green-600 border-green-600 hover:bg-green-50 hover:text-green-700"
+              title={isSelf ? "Cannot approve own request" : "Approve"}
+              aria-label="Approve"
+            >
+              {processingId === req.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />}
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setRequestToReject(req)}
+              disabled={processingId === req.id || isSelf}
+              className="text-red-600 border-red-600 hover:bg-red-50 hover:text-red-700"
+              title={isSelf ? "Cannot reject own request" : "Reject"}
+              aria-label="Reject"
+            >
+              <X className="h-4 w-4" />
+            </Button>
+          </div>
+        );
+      },
+    },
+  ];
+
   return (
     <>
       <div className="flex-1 space-y-4 p-8 pt-6">
@@ -161,114 +209,30 @@ export default function PhoneChangeApprovalsPage() {
             </CardDescription>
           </CardHeader>
           <CardContent>
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Old Phone</TableHead>
-                  <TableHead>New Phone</TableHead>
-                  <TableHead>Reason</TableHead>
-                  <TableHead>Requested By</TableHead>
-                  <TableHead>Requested</TableHead>
-                  <TableHead className="text-right">Actions</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {isLoading ? (
-                  <TableRow>
-                    <TableCell colSpan={6} className="h-24 text-center">
-                      <Loader2 className="h-6 w-6 animate-spin mx-auto" />
-                    </TableCell>
-                  </TableRow>
-                ) : visibleRequests.length > 0 ? (
-                  visibleRequests.map((req) => {
-                    const isSelf = req.requestedById === user?.id;
-                    return (
-                      <TableRow key={req.id}>
-                        <TableCell className="font-mono">
-                          {req.oldPhoneNumber}
-                        </TableCell>
-                        <TableCell className="font-mono">
-                          {req.newPhoneNumber}
-                        </TableCell>
-                        <TableCell className="max-w-xs truncate">
-                          {req.reason}
-                        </TableCell>
-                        <TableCell>{req.requestedByName}</TableCell>
-                        <TableCell>
-                          {formatDistanceToNow(new Date(req.createdAt), {
-                            addSuffix: true,
-                          })}
-                        </TableCell>
-                        <TableCell className="text-right space-x-2">
-                          {canProcess && (
-                            <>
-                              <Button
-                                variant="outline"
-                                size="sm"
-                                onClick={() => handleProcess(req.id, true)}
-                                disabled={processingId === req.id || isSelf}
-                                className="text-green-600 border-green-600 hover:bg-green-50 hover:text-green-700"
-                                title={isSelf ? "Cannot approve own request" : "Approve"}
-                              >
-                                {processingId === req.id ? (
-                                  <Loader2 className="h-4 w-4 animate-spin" />
-                                ) : (
-                                  <Check className="h-4 w-4" />
-                                )}
-                              </Button>
-                              <Button
-                                variant="outline"
-                                size="sm"
-                                onClick={() => setRequestToReject(req)}
-                                disabled={processingId === req.id || isSelf}
-                                className="text-red-600 border-red-600 hover:bg-red-50 hover:text-red-700"
-                                title={isSelf ? "Cannot reject own request" : "Reject"}
-                              >
-                                <X className="h-4 w-4" />
-                              </Button>
-                            </>
-                          )}
-                        </TableCell>
-                      </TableRow>
-                    );
-                  })
-                ) : (
-                  <TableRow>
-                    <TableCell colSpan={6} className="h-24 text-center">
-                      No pending phone change requests.
-                    </TableCell>
-                  </TableRow>
-                )}
-              </TableBody>
-            </Table>
+            <DataTable
+              caption="Pending phone change requests"
+              columns={columns}
+              rows={visibleRequests}
+              rowKey={(req) => req.id}
+              isLoading={isLoading && requests.length === 0}
+              isFetching={isLoading}
+              error={loadError}
+              onRetry={() => void fetchRequests()}
+              emptyMessage="No pending phone change requests."
+              paging={{
+                page,
+                pageSize,
+                total,
+                totalPages: Math.max(1, totalPages),
+                onPageChange: setPage,
+                onPageSizeChange: (size) => {
+                  setPageSize(size);
+                  setPage(1);
+                },
+                pageSizes: [10, 25, 50],
+              }}
+            />
           </CardContent>
-          {totalPages > 1 && (
-            <CardFooter className="flex items-center justify-between">
-              <div className="text-sm text-muted-foreground">
-                Page {page} of {totalPages}
-              </div>
-              <div className="flex items-center gap-2">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => setPage((p) => Math.max(1, p - 1))}
-                  disabled={page <= 1}
-                >
-                  <ChevronLeft className="h-4 w-4" />
-                  Prev
-                </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
-                  disabled={page >= totalPages}
-                >
-                  Next
-                  <ChevronRight className="h-4 w-4" />
-                </Button>
-              </div>
-            </CardFooter>
-          )}
         </Card>
       </div>
 

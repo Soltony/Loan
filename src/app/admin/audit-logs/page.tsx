@@ -3,15 +3,13 @@
 
 import React, { useState, useEffect, useCallback } from 'react';
 import { useRequirePermission } from '@/hooks/use-require-permission';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle, CardFooter } from '@/components/ui/card';
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
-import { Badge } from '@/components/ui/badge';
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { DataTable, DateTimeCell, SearchInput, StatusBadge, type DataTableColumn, type StatusTone } from '@/components/admin/data-table';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-import { Loader2, ChevronLeft, ChevronRight, FileJson, Search, X } from 'lucide-react';
+import { FileJson, X } from 'lucide-react';
 import { useToast } from '@/hooks/use-toast';
-import { format } from 'date-fns';
 import { useRouter } from 'next/navigation';
 
 interface AuditLog {
@@ -37,11 +35,14 @@ export default function AuditLogsPage() {
     const [isLoading, setIsLoading] = useState(true);
     const [page, setPage] = useState(1);
     const [totalPages, setTotalPages] = useState(1);
+    const [total, setTotal] = useState(0);
+    const [pageSize, setPageSize] = useState(ITEMS_PER_PAGE);
+    const [loadError, setLoadError] = useState<unknown>(null);
+    const [reloadKey, setReloadKey] = useState(0);
     const [fromDate, setFromDate] = useState('');
     const [toDate, setToDate] = useState('');
 
     // Filter / search state
-    const [searchQuery, setSearchQuery] = useState('');
     const [debouncedSearch, setDebouncedSearch] = useState('');
     const [actionFilter, setActionFilter] = useState('');
     const [entityFilter, setEntityFilter] = useState('');
@@ -68,15 +69,6 @@ export default function AuditLogsPage() {
         fetchMeta();
     }, []);
 
-    // Debounce search input
-    useEffect(() => {
-        const timer = setTimeout(() => {
-            setDebouncedSearch(searchQuery);
-            setPage(1);
-        }, 400);
-        return () => clearTimeout(timer);
-    }, [searchQuery]);
-
     // Reset to page 1 when any filter changes
     const handleFilterChange = useCallback((setter: React.Dispatch<React.SetStateAction<string>>, value: string) => {
         setter(value);
@@ -84,7 +76,6 @@ export default function AuditLogsPage() {
     }, []);
 
     const clearFilters = () => {
-        setSearchQuery('');
         setDebouncedSearch('');
         setActionFilter('');
         setEntityFilter('');
@@ -112,7 +103,7 @@ export default function AuditLogsPage() {
             try {
                 const params = new URLSearchParams({
                     page: String(page),
-                    limit: String(ITEMS_PER_PAGE),
+                    limit: String(pageSize),
                 });
                 if (debouncedSearch) params.set('search', debouncedSearch);
                 if (actionFilter) params.set('action', actionFilter);
@@ -127,7 +118,10 @@ export default function AuditLogsPage() {
                 const data = await response.json();
                 setLogs(data.logs);
                 setTotalPages(data.totalPages);
+                setTotal(data.total ?? data.logs.length);
+                setLoadError(null);
             } catch (error: any) {
+                setLoadError(error);
                 toast({
                     title: 'Error',
                     description: error.message,
@@ -139,18 +133,64 @@ export default function AuditLogsPage() {
         };
 
         fetchLogs();
-    }, [page, debouncedSearch, actionFilter, entityFilter, filterDateFrom, filterDateTo, toast]);
+    }, [page, pageSize, reloadKey, debouncedSearch, actionFilter, entityFilter, filterDateFrom, filterDateTo, toast]);
 
     // change request payload fetching moved to the dedicated detail page
     
-    const getActionBadgeClass = (action: string): string => {
-        if (action.includes('SUCCESS') || action.includes('CREATE')) return 'bg-green-600 text-white';
-        if (action.includes('FAILURE') || action.includes('DELETE')) return 'bg-red-600 text-white';
-        if (action.includes('UPDATE')) return 'bg-blue-600 text-white';
-        if (action.includes('LOGIN')) return 'bg-yellow-500 text-black';
-        return 'bg-gray-500 text-white';
+    // Same reading as before: outcomes and creations green, failures and
+    // deletions red, updates blue, logins amber.
+    const actionTone = (action: string): StatusTone => {
+        if (action.includes('SUCCESS') || action.includes('CREATE')) return 'success';
+        if (action.includes('FAILURE') || action.includes('DELETE')) return 'danger';
+        if (action.includes('UPDATE')) return 'info';
+        if (action.includes('LOGIN')) return 'warning';
+        return 'neutral';
     };
 
+    const columns: DataTableColumn<AuditLog>[] = [
+        {
+            id: 'actor',
+            header: 'Actor',
+            cell: (log) => (
+                <div className="flex flex-col">
+                    <span className="text-sm font-medium">{log.actor?.fullName || 'Unknown user'}</span>
+                    <span className="text-xs text-muted-foreground font-mono break-all">{log.actor?.email || log.actorId}</span>
+                </div>
+            ),
+        },
+        { id: 'action', header: 'Action', cell: (log) => <StatusBadge status={log.action} label={log.action} tone={actionTone(log.action)} /> },
+        {
+            id: 'entity',
+            header: 'Entity',
+            cell: (log) =>
+                log.entity ? (
+                    <div className="flex flex-col">
+                        <span className="font-medium">{log.entity}</span>
+                        <span className="text-xs text-muted-foreground font-mono">{log.entityId}</span>
+                    </div>
+                ) : (
+                    <span className="text-muted-foreground">—</span>
+                ),
+        },
+        { id: 'date', header: 'Date', cell: (log) => <DateTimeCell value={log.createdAt} /> },
+        { id: 'ip', header: 'IP Address', className: 'font-mono text-xs', cell: (log) => log.ipAddress || 'N/A' },
+        {
+            id: 'details',
+            header: 'Details',
+            align: 'right',
+            cell: (log) => (
+                <Button
+                    variant="ghost"
+                    size="icon"
+                    aria-label="Open log entry"
+                    onClick={() => router.push(`/admin/audit-logs/${log.id}`)}
+                    className="h-8 w-8"
+                >
+                    <FileJson className="h-4 w-4" />
+                </Button>
+            ),
+        },
+    ];
 
     return (
         <>
@@ -195,15 +235,13 @@ export default function AuditLogsPage() {
                             {/* Search */}
                             <div className="flex-1 min-w-[200px]">
                                 <label className="text-xs text-muted-foreground mb-1 block">Search</label>
-                                <div className="relative">
-                                    <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
-                                    <Input
-                                        placeholder="Search by actor, action, entity, IP..."
-                                        value={searchQuery}
-                                        onChange={(e) => setSearchQuery(e.target.value)}
-                                        className="pl-9"
-                                    />
-                                </div>
+                                <SearchInput
+                                    label="Search audit logs"
+                                    placeholder="Search by actor, action, entity, IP..."
+                                    value={debouncedSearch}
+                                    onChange={(value) => handleFilterChange(setDebouncedSearch, value)}
+                                    className="max-w-none"
+                                />
                             </div>
 
                             {/* Action filter */}
@@ -273,99 +311,32 @@ export default function AuditLogsPage() {
                         </CardDescription>
                     </CardHeader>
                     <CardContent>
-                        <Table>
-                            <TableHeader>
-                                <TableRow>
-                                    <TableHead>Actor</TableHead>
-                                    <TableHead>Action</TableHead>
-                                    <TableHead>Entity</TableHead>
-                                    <TableHead>Date</TableHead>
-                                    <TableHead>IP Address</TableHead>
-                                    <TableHead>Details</TableHead>
-                                </TableRow>
-                            </TableHeader>
-                            <TableBody>
-                                {isLoading ? (
-                                    <TableRow>
-                                        <TableCell colSpan={6} className="h-24 text-center">
-                                            <Loader2 className="h-6 w-6 animate-spin mx-auto"/>
-                                        </TableCell>
-                                    </TableRow>
-                                ) : logs.length > 0 ? (
-                                    logs.map((log) => (
-                                        <TableRow key={log.id}>
-                                            <TableCell>
-                                                <div className="flex flex-col">
-                                                    <span className="text-sm font-medium">{log.actor?.fullName || 'Unknown user'}</span>
-                                                    <span className="text-xs text-muted-foreground font-mono break-all">{log.actor?.email || log.actorId}</span>
-                                                </div>
-                                            </TableCell>
-                                            <TableCell>
-                                                <Badge
-                                                    className={getActionBadgeClass(log.action)}
-                                                >
-                                                    {log.action}
-                                                </Badge>
-                                            </TableCell>
-                                            <TableCell>
-                                                {log.entity ? (
-                                                    <div className="flex flex-col">
-                                                        <span className="font-medium">{log.entity}</span>
-                                                        <span className="text-xs text-muted-foreground font-mono">{log.entityId}</span>
-                                                    </div>
-                                                ) : (
-                                                    <span className="text-muted-foreground">—</span>
-                                                )}
-                                            </TableCell>
-                                            <TableCell>{format(new Date(log.createdAt), 'yyyy-MM-dd HH:mm:ss')}</TableCell>
-                                            <TableCell className="font-mono">{log.ipAddress || 'N/A'}</TableCell>
-                                            <TableCell>
-                                                <Button
-                                                    variant="ghost"
-                                                    size="icon"
-                                                    onClick={() => router.push(`/admin/audit-logs/${log.id}`)}
-                                                    className="h-8 w-8"
-                                                >
-                                                    <FileJson className="h-4 w-4" />
-                                                </Button>
-                                            </TableCell>
-                                        </TableRow>
-                                    ))
-                                ) : (
-                                    <TableRow>
-                                        <TableCell colSpan={6} className="h-24 text-center">
-                                            No audit logs found.
-                                        </TableCell>
-                                    </TableRow>
-                                )}
-                            </TableBody>
-                        </Table>
+                        <DataTable
+                            caption="Audit log"
+                            columns={columns}
+                            rows={logs}
+                            rowKey={(log) => log.id}
+                            isLoading={isLoading && logs.length === 0}
+                            isFetching={isLoading}
+                            error={loadError}
+                            onRetry={() => setReloadKey((k) => k + 1)}
+                            emptyMessage={hasActiveFilters ? 'No audit logs match the filters.' : 'No audit logs found.'}
+                            onRowClick={(log) => router.push(`/admin/audit-logs/${log.id}`)}
+                            maxHeight="65vh"
+                            paging={{
+                                page,
+                                pageSize,
+                                total,
+                                totalPages: Math.max(1, totalPages),
+                                onPageChange: setPage,
+                                onPageSizeChange: (size) => {
+                                    setPageSize(size);
+                                    setPage(1);
+                                },
+                                pageSizes: [20, 50, 100],
+                            }}
+                        />
                     </CardContent>
-                    <CardFooter>
-                        <div className="flex items-center justify-end w-full space-x-2">
-                             <span className="text-sm text-muted-foreground">
-                                Page {page} of {totalPages}
-                            </span>
-                            <Button
-                                variant="outline"
-                                size="sm"
-                                onClick={() => setPage(p => Math.max(1, p - 1))}
-                                disabled={page === 1}
-                            >
-                                <ChevronLeft className="h-4 w-4" />
-                                Previous
-                            </Button>
-                            <Button
-                                variant="outline"
-                                size="sm"
-                                onClick={() => setPage(p => Math.min(totalPages, p + 1))}
-                                disabled={page === totalPages}
-                            >
-                                Next
-                                <ChevronRight className="h-4 w-4" />
-                            </Button>
-                        </div>
-                    </CardFooter>
                 </Card>
             </div>
             {/* navigation to full detail page */}

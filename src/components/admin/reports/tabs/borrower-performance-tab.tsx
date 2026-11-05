@@ -1,8 +1,6 @@
 'use client';
 
-import { formatDay, sumOf } from '../lib/format';
-import { BorrowerCell, IdCell, LoanStatusBadge, Money } from '../report-cells';
-import { ReportTable, totalsLabel, type ReportColumn } from '../report-table';
+import { BorrowerCell, DataTable, type DataTableColumn, formatDay, IdCell, LoanStatusBadge, Money, sumOf, totalsLabel } from '../../data-table';
 import type { LoanReportRow } from '../types';
 import { LOANS_ORDER, useLoansReport } from './provider-loans-tab';
 import { LoanStatusFilter } from './status-filters';
@@ -15,7 +13,7 @@ export function BorrowerPerformanceTab(props: ReportTabProps) {
   const rows = result.data?.data;
   const total = (pick: (row: LoanReportRow) => number) => <Money value={sumOf(rows ?? [], pick)} />;
 
-  const columns: ReportColumn<LoanReportRow>[] = [
+  const columns: DataTableColumn<LoanReportRow>[] = [
     {
       id: 'borrower',
       header: 'Borrower',
@@ -76,7 +74,7 @@ export function BorrowerPerformanceTab(props: ReportTabProps) {
   ];
 
   return (
-    <ReportTable
+    <DataTable
       caption="Borrower performance"
       columns={columns}
       rows={rows}

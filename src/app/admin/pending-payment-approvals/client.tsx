@@ -10,19 +10,10 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
-import { Badge } from "@/components/ui/badge";
+import { DataTable, DateTimeCell, formatDay, Money, StatusBadge, type DataTableColumn } from "@/components/admin/data-table";
 import { Button } from "@/components/ui/button";
 import { Loader2, Check, X } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
-import { formatDistanceToNow, format } from "date-fns";
 import {
   Dialog,
   DialogContent,
@@ -38,15 +29,6 @@ import type {
 } from "./page";
 import type { User } from "@/lib/types";
 import { usePermissions } from "@/hooks/use-permissions";
-import {
-  Pagination,
-  PaginationContent,
-  PaginationEllipsis,
-  PaginationItem,
-  PaginationLink,
-  PaginationNext,
-  PaginationPrevious,
-} from "@/components/ui/pagination";
 
 export function PendingPaymentApprovalsClient({
   paginatedData: initialData,
@@ -129,82 +111,6 @@ export function PendingPaymentApprovalsClient({
     router.push(`?page=${page}`);
   };
 
-  const renderPaginationItems = () => {
-    const items = [];
-    const maxVisible = 5;
-    const { page, totalPages } = initialData;
-
-    if (page > 1) {
-      items.push(
-        <PaginationItem key="prev">
-          <PaginationPrevious
-            href="#"
-            onClick={(e) => {
-              e.preventDefault();
-              handlePageChange(page - 1);
-            }}
-          />
-        </PaginationItem>
-      );
-    }
-
-    let startPage = Math.max(1, page - Math.floor(maxVisible / 2));
-    let endPage = Math.min(totalPages, startPage + maxVisible - 1);
-    if (endPage - startPage < maxVisible - 1) {
-      startPage = Math.max(1, endPage - maxVisible + 1);
-    }
-
-    if (startPage > 1) {
-      items.push(
-        <PaginationItem key="ellipsis-start">
-          <PaginationEllipsis />
-        </PaginationItem>
-      );
-    }
-
-    for (let i = startPage; i <= endPage; i++) {
-      items.push(
-        <PaginationItem key={i}>
-          <PaginationLink
-            href="#"
-            isActive={i === page}
-            onClick={(e) => {
-              e.preventDefault();
-              handlePageChange(i);
-            }}
-          >
-            {i}
-          </PaginationLink>
-        </PaginationItem>
-      );
-    }
-
-    if (endPage < totalPages) {
-      items.push(
-        <PaginationItem key="ellipsis-end">
-          <PaginationEllipsis />
-        </PaginationItem>
-      );
-    }
-
-    if (page < totalPages) {
-      items.push(
-        <PaginationItem key="next">
-          <PaginationNext
-            href="#"
-            onClick={(e) => {
-              e.preventDefault();
-              handlePageChange(page + 1);
-            }}
-          />
-        </PaginationItem>
-      );
-    }
-
-    return items;
-  };
-
-  // Helper to parse FT reference from payload
   const getFtReference = (change: PendingPaymentApproval): string | null => {
     try {
       const data = JSON.parse(change.payload);
@@ -245,6 +151,81 @@ export function PendingPaymentApprovalsClient({
     }
   };
 
+
+  const columns: DataTableColumn<PendingPaymentApproval>[] = [
+    {
+      id: "request",
+      header: "Request",
+      cell: (change) => (
+        <div className="font-medium">
+          <div className="flex items-center gap-2">
+            <span>Mark Payment Successful</span>
+            {getOriginalStatus(change) === "FAILED" && <StatusBadge status="FAILED" label="Was Failed" />}
+          </div>
+          <div className="text-sm font-normal text-muted-foreground">{change.entityName}</div>
+          {change.providerName && <div className="text-xs font-normal text-muted-foreground">({change.providerName})</div>}
+        </div>
+      ),
+    },
+    {
+      id: "amount",
+      header: "Amount (ETB)",
+      align: "right",
+      cell: (change) => {
+        const amount = getAmount(change);
+        return amount != null ? <Money value={Number(amount)} /> : "—";
+      },
+    },
+    {
+      id: "ft",
+      header: "FT Reference",
+      className: "font-mono text-xs whitespace-nowrap",
+      cell: (change) => getFtReference(change) || "—",
+    },
+    {
+      id: "paymentDate",
+      header: "Payment Date",
+      className: "whitespace-nowrap",
+      cell: (change) => {
+        const paymentDate = getPaymentDate(change);
+        return paymentDate ? formatDay(paymentDate) : "—";
+      },
+    },
+    { id: "requestedBy", header: "Requested By", cell: (change) => change.createdBy?.fullName || "Unknown User" },
+    { id: "requestedAt", header: "Requested At", cell: (change) => <DateTimeCell value={change.createdAt} /> },
+    {
+      id: "actions",
+      header: "Actions",
+      align: "right",
+      className: "space-x-2 whitespace-nowrap",
+      cell: (change) =>
+        canProcessApprovals ? (
+          <>
+            <Button
+              variant="outline"
+              size="sm"
+              aria-label="Approve"
+              onClick={() => handleProcessChange(change.id, true)}
+              disabled={processingId === change.id || change.createdById === currentUser.id}
+              className="text-green-600 border-green-600 hover:bg-green-50 hover:text-green-700"
+            >
+              {processingId === change.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />}
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              aria-label="Reject"
+              onClick={() => setChangeToReject(change)}
+              disabled={processingId === change.id || change.createdById === currentUser.id}
+              className="text-red-600 border-red-600 hover:bg-red-50 hover:text-red-700"
+            >
+              <X className="h-4 w-4" />
+            </Button>
+          </>
+        ) : null,
+    },
+  ];
+
   return (
     <>
       <div className="flex-1 space-y-4 p-8 pt-6">
@@ -261,119 +242,21 @@ export function PendingPaymentApprovalsClient({
             </CardDescription>
           </CardHeader>
           <CardContent>
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Request</TableHead>
-                  <TableHead>Amount</TableHead>
-                  <TableHead>FT Reference</TableHead>
-                  <TableHead>Payment Date</TableHead>
-                  <TableHead>Requested By</TableHead>
-                  <TableHead>Requested At</TableHead>
-                  <TableHead className="text-right">Actions</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {changes.length > 0 ? (
-                  changes.map((change) => {
-                    const ftRef = getFtReference(change);
-                    const amount = getAmount(change);
-                    const pDate = getPaymentDate(change);
-                    const originalStatus = getOriginalStatus(change);
-                    return (
-                      <TableRow key={change.id}>
-                        <TableCell className="font-medium">
-                          <div className="flex items-center gap-2">
-                            <span>Mark Payment Successful</span>
-                            {originalStatus === "FAILED" && (
-                              <Badge className="bg-red-600 text-white">
-                                Was Failed
-                              </Badge>
-                            )}
-                          </div>
-                          <div className="text-sm text-muted-foreground">
-                            {change.entityName}
-                          </div>
-                          {change.providerName && (
-                            <div className="text-xs text-muted-foreground">
-                              ({change.providerName})
-                            </div>
-                          )}
-                        </TableCell>
-                        <TableCell>
-                          {amount != null ? `${amount} ETB` : "—"}
-                        </TableCell>
-                        <TableCell className="font-mono">
-                          {ftRef || "—"}
-                        </TableCell>
-                        <TableCell>
-                           {pDate ? format(new Date(pDate), "yyyy-MM-dd") : "—"}
-                         </TableCell>
-                         <TableCell>
-                           {change.createdBy?.fullName || "Unknown User"}
-                         </TableCell>
-                        <TableCell>
-                          {formatDistanceToNow(new Date(change.createdAt), {
-                            addSuffix: true,
-                          })}
-                        </TableCell>
-                        <TableCell className="text-right space-x-2">
-                          {canProcessApprovals && (
-                            <>
-                              <Button
-                                variant="outline"
-                                size="sm"
-                                onClick={() =>
-                                  handleProcessChange(change.id, true)
-                                }
-                                disabled={
-                                  processingId === change.id ||
-                                  change.createdById === currentUser.id
-                                }
-                                className="text-green-600 border-green-600 hover:bg-green-50 hover:text-green-700"
-                              >
-                                {processingId === change.id ? (
-                                  <Loader2 className="h-4 w-4 animate-spin" />
-                                ) : (
-                                  <Check className="h-4 w-4" />
-                                )}
-                              </Button>
-                              <Button
-                                variant="outline"
-                                size="sm"
-                                onClick={() => setChangeToReject(change)}
-                                disabled={
-                                  processingId === change.id ||
-                                  change.createdById === currentUser.id
-                                }
-                                className="text-red-600 border-red-600 hover:bg-red-50 hover:text-red-700"
-                              >
-                                <X className="h-4 w-4" />
-                              </Button>
-                            </>
-                          )}
-                        </TableCell>
-                      </TableRow>
-                    );
-                  })
-                ) : (
-                  <TableRow>
-                    <TableCell colSpan={6} className="h-24 text-center">
-                      No pending payment approval requests.
-                    </TableCell>
-                  </TableRow>
-                )}
-              </TableBody>
-            </Table>
-            {initialData.totalPages > 1 && (
-              <div className="mt-6 flex justify-center">
-                <Pagination>
-                  <PaginationContent>
-                    {renderPaginationItems()}
-                  </PaginationContent>
-                </Pagination>
-              </div>
-            )}
+            <DataTable
+              caption="Payment resolve requests"
+              columns={columns}
+              rows={changes}
+              rowKey={(change) => change.id}
+              isLoading={false}
+              emptyMessage="No pending payment approval requests."
+              paging={{
+                page: initialData.page,
+                pageSize: initialData.pageSize,
+                total: initialData.total,
+                totalPages: initialData.totalPages,
+                onPageChange: handlePageChange,
+              }}
+            />
           </CardContent>
         </Card>
       </div>

@@ -1,10 +1,8 @@
 'use client';
 
 import { useReportQuery } from '../hooks/use-report-query';
-import { formatCount } from '../lib/format';
+import { DataTable, type DataTableColumn, formatCount, Money } from '../../data-table';
 import { reportQuery, reportUrl } from '../lib/report-filters';
-import { Money } from '../report-cells';
-import { ReportTable, type ReportColumn } from '../report-table';
 import type { CollectionAmounts, CollectionRow, CollectionsPage, TableSort } from '../types';
 import { tabPaging, tabSort, type ReportTabProps } from './tab-props';
 
@@ -28,11 +26,11 @@ export function CollectionsTab(props: ReportTabProps) {
   );
   const totals = result.data?.totals;
 
-  const columns: ReportColumn<CollectionRow>[] = [
+  const columns: DataTableColumn<CollectionRow>[] = [
     { id: 'provider', header: 'Provider', sortKey: 'provider', cell: (r) => r.provider },
     { id: 'date', header: 'Date', sortKey: 'date', cell: (r) => r.date, className: 'whitespace-nowrap' },
     ...AMOUNTS.map(
-      ({ key, header, title }): ReportColumn<CollectionRow> => ({
+      ({ key, header, title }): DataTableColumn<CollectionRow> => ({
         id: key,
         header,
         title,
@@ -63,7 +61,7 @@ export function CollectionsTab(props: ReportTabProps) {
   ];
 
   return (
-    <ReportTable
+    <DataTable
       caption="Collections"
       columns={columns}
       rows={result.data?.data}

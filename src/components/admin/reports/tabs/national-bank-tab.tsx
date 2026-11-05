@@ -1,10 +1,8 @@
 'use client';
 
 import { useReportQuery } from '../hooks/use-report-query';
-import { sumOf } from '../lib/format';
+import { AgingBadge, DataTable, type DataTableColumn, IdCell, Money, sumOf, totalsLabel } from '../../data-table';
 import { reportQuery, reportUrl } from '../lib/report-filters';
-import { AgingBadge, IdCell, Money } from '../report-cells';
-import { ReportTable, totalsLabel, type ReportColumn } from '../report-table';
 import type { NationalBankRow, ReportPage, TableSort } from '../types';
 import { tabPaging, tabSort, type ReportTabProps } from './tab-props';
 
@@ -31,7 +29,7 @@ export function NationalBankTab(props: ReportTabProps) {
   );
   const rows = result.data?.data;
 
-  const text = (id: keyof NationalBankRow, header: string): ReportColumn<NationalBankRow> => ({
+  const text = (id: keyof NationalBankRow, header: string): DataTableColumn<NationalBankRow> => ({
     id,
     header,
     cell: (r) => r[id],
@@ -41,7 +39,7 @@ export function NationalBankTab(props: ReportTabProps) {
     id: Amount,
     header: string,
     options: { sortKey?: string; blankWhenZero?: boolean } = {},
-  ): ReportColumn<NationalBankRow> => ({
+  ): DataTableColumn<NationalBankRow> => ({
     id,
     header,
     align: 'right',
@@ -51,7 +49,7 @@ export function NationalBankTab(props: ReportTabProps) {
     footer: <Money value={sumOf(rows ?? [], (r) => r[id])} />,
   });
 
-  const columns: ReportColumn<NationalBankRow>[] = [
+  const columns: DataTableColumn<NationalBankRow>[] = [
     text('firstName', 'First Name'),
     text('middleName', 'Middle Name'),
     text('lastName', 'Last Name'),
@@ -106,7 +104,7 @@ export function NationalBankTab(props: ReportTabProps) {
   ];
 
   return (
-    <ReportTable
+    <DataTable
       caption="National Bank reporting"
       columns={columns}
       rows={rows}

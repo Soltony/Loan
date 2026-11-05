@@ -8,21 +8,20 @@ import {
   CardDescription,
   CardHeader,
   CardTitle,
-  CardFooter,
 } from "@/components/ui/card";
 import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
+  DataTable,
+  DateTimeCell,
+  IdCell,
+  Money,
+  SearchInput,
+  StatusBadge,
+  type DataTableColumn,
+} from "@/components/admin/data-table";
 import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Checkbox } from "@/components/ui/checkbox";
-import { Loader2, ChevronLeft, ChevronRight, Search, Calendar as CalendarIcon } from "lucide-react";
+import { Loader2, Calendar as CalendarIcon } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import { format, startOfDay } from "date-fns";
 import {
@@ -86,9 +85,12 @@ export default function PendingPaymentsPage() {
   const [isLoading, setIsLoading] = useState(true);
   const [page, setPage] = useState(1);
   const [totalPages, setTotalPages] = useState(1);
+  const [total, setTotal] = useState(0);
+  const [pageSize, setPageSize] = useState(ITEMS_PER_PAGE);
+  const [loadError, setLoadError] = useState<unknown>(null);
+  const [reloadKey, setReloadKey] = useState(0);
   const [fromDate, setFromDate] = useState("");
   const [toDate, setToDate] = useState("");
-  const [searchQuery, setSearchQuery] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("ALL");
   const [resolveDialogOpen, setResolveDialogOpen] = useState(false);
@@ -99,25 +101,16 @@ export default function PendingPaymentsPage() {
   const [paymentDate, setPaymentDate] = useState<Date | undefined>(new Date());
   const [isResolving, setIsResolving] = useState(false);
 
-  // Debounce search input
-  useEffect(() => {
-    const timer = setTimeout(() => {
-      setDebouncedSearch(searchQuery);
-      setPage(1);
-    }, 300);
-    return () => clearTimeout(timer);
-  }, [searchQuery]);
-
   const query = useMemo(() => {
     const p = new URLSearchParams();
     p.set("page", String(page));
-    p.set("limit", String(ITEMS_PER_PAGE));
+    p.set("limit", String(pageSize));
     if (fromDate) p.set("from", fromDate);
     if (toDate) p.set("to", toDate);
     if (debouncedSearch) p.set("search", debouncedSearch);
     if (statusFilter !== "ALL") p.set("status", statusFilter);
     return p.toString();
-  }, [page, fromDate, toDate, debouncedSearch, statusFilter]);
+  }, [page, pageSize, fromDate, toDate, debouncedSearch, statusFilter]);
 
   useEffect(() => {
     const fetchRows = async () => {
@@ -128,7 +121,10 @@ export default function PendingPaymentsPage() {
         const data = await res.json();
         setRows(data.rows || []);
         setTotalPages(data.totalPages || 1);
+        setTotal(data.total ?? (data.rows || []).length);
+        setLoadError(null);
       } catch (e: any) {
+        setLoadError(e);
         toast({
           title: "Error",
           description: String(e?.message ?? e),
@@ -140,7 +136,7 @@ export default function PendingPaymentsPage() {
     };
 
     void fetchRows();
-  }, [query, toast]);
+  }, [query, reloadKey, toast]);
 
   const openResolveDialog = (row: PendingPaymentRow) => {
     setResolvingRow(row);
@@ -186,6 +182,7 @@ export default function PendingPaymentsPage() {
       const refreshed = await refresh.json();
       setRows(refreshed.rows || []);
       setTotalPages(refreshed.totalPages || 1);
+      setTotal(refreshed.total ?? (refreshed.rows || []).length);
     } catch (e: any) {
       toast({
         title: "Error",
@@ -198,14 +195,48 @@ export default function PendingPaymentsPage() {
   };
 
   const statusBadge = (row: PendingPaymentRow) => {
-    if (row.pendingApproval) {
-      return <Badge variant="outline">Pending Approval</Badge>;
-    }
-    if (row.status === "FAILED") {
-      return <Badge className="bg-red-600 text-white">Failed</Badge>;
-    }
-    return <Badge className="bg-yellow-600 text-white">Pending</Badge>;
+    if (row.pendingApproval) return <StatusBadge status="Pending approval" tone="info" />;
+    if (row.status === "FAILED") return <StatusBadge status="Failed" tone="danger" />;
+    return <StatusBadge status="Pending" tone="warning" />;
   };
+
+  const columns: DataTableColumn<PendingPaymentRow>[] = [
+    { id: "date", header: "Date", cell: (r) => <DateTimeCell value={r.createdAt} /> },
+    { id: "status", header: "Status", cell: (r) => statusBadge(r) },
+    {
+      id: "borrower",
+      header: "Borrower",
+      cell: (r) => (
+        <div className="font-mono text-xs">
+          <div className="text-sm">{r.phoneNumber}</div>
+          <div className="text-muted-foreground">{r.accountNumber || "—"}</div>
+        </div>
+      ),
+    },
+    { id: "loan", header: "Loan", cell: (r) => <IdCell id={r.loanId} /> },
+    {
+      id: "product",
+      header: "Product",
+      cell: (r) => (
+        <>
+          {r.loan?.productName || "—"}
+          {r.loan?.providerName && <div className="text-xs text-muted-foreground">({r.loan.providerName})</div>}
+        </>
+      ),
+    },
+    { id: "amount", header: "Amount (ETB)", align: "right", cell: (r) => <Money value={r.amount} /> },
+    { id: "txn", header: "Txn ID", cell: (r) => <IdCell id={r.transactionId} /> },
+    {
+      id: "action",
+      header: "Action",
+      align: "right",
+      cell: (r) => (
+        <Button variant="secondary" size="sm" disabled={!!r.pendingApproval} onClick={() => openResolveDialog(r)}>
+          {r.pendingApproval ? "Pending Approval" : "Mark Successful"}
+        </Button>
+      ),
+    },
+  ];
 
   return (
     <div className="flex-1 space-y-4 p-8 pt-6">
@@ -260,28 +291,15 @@ export default function PendingPaymentsPage() {
         </div>
       </div>
 
-      {/* Search Bar */}
-      <div className="flex items-center gap-2">
-        <div className="relative flex-1 max-w-sm">
-          <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-          <Input
-            type="text"
-            placeholder="Search by transaction ID, borrower ID, loan ID, or account number..."
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            className="pl-9"
-          />
-        </div>
-        {searchQuery && (
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => setSearchQuery("")}
-          >
-            Clear
-          </Button>
-        )}
-      </div>
+      <SearchInput
+        label="Search pending payments"
+        placeholder="Search by transaction ID, borrower ID, loan ID, or account number..."
+        value={debouncedSearch}
+        onChange={(value) => {
+          setDebouncedSearch(value);
+          setPage(1);
+        }}
+      />
 
       <Card>
         <CardHeader>
@@ -293,104 +311,30 @@ export default function PendingPaymentsPage() {
           </CardDescription>
         </CardHeader>
         <CardContent>
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Date</TableHead>
-                <TableHead>Status</TableHead>
-                <TableHead>Borrower</TableHead>
-                <TableHead>Account</TableHead>
-                <TableHead>Loan</TableHead>
-                <TableHead>Product</TableHead>
-                <TableHead>Amount</TableHead>
-                <TableHead>Txn ID</TableHead>
-                <TableHead className="text-right">Action</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {isLoading ? (
-                <TableRow>
-                  <TableCell colSpan={9} className="h-24 text-center">
-                    <Loader2 className="h-6 w-6 animate-spin mx-auto" />
-                  </TableCell>
-                </TableRow>
-              ) : rows.length ? (
-                rows.map((r) => (
-                  <TableRow key={r.id}>
-                    <TableCell>
-                      {format(new Date(r.createdAt), "yyyy-MM-dd HH:mm:ss")}
-                    </TableCell>
-                    <TableCell>{statusBadge(r)}</TableCell>
-                    <TableCell className="font-mono">
-                      {r.phoneNumber}
-                    </TableCell>
-                    <TableCell className="font-mono">
-                      {r.accountNumber || "—"}
-                    </TableCell>
-                    <TableCell className="font-mono">
-                      {r.loanId}
-                    </TableCell>
-                    <TableCell>
-                      {r.loan?.productName || "—"}
-                      {r.loan?.providerName && (
-                        <div className="text-xs text-muted-foreground">
-                          ({r.loan.providerName})
-                        </div>
-                      )}
-                    </TableCell>
-                    <TableCell>{r.amount}</TableCell>
-                    <TableCell className="font-mono">
-                      {r.transactionId}
-                    </TableCell>
-                    <TableCell className="text-right">
-                      <Button
-                        variant="secondary"
-                        size="sm"
-                        disabled={!!r.pendingApproval}
-                        onClick={() => openResolveDialog(r)}
-                      >
-                        {r.pendingApproval
-                          ? "Pending Approval"
-                          : "Mark Successful"}
-                      </Button>
-                    </TableCell>
-                  </TableRow>
-                ))
-              ) : (
-                <TableRow>
-                  <TableCell colSpan={9} className="h-24 text-center">
-                    No unresolved payments found.
-                  </TableCell>
-                </TableRow>
-              )}
-            </TableBody>
-          </Table>
+          <DataTable
+            caption="Pending payments"
+            columns={columns}
+            rows={rows}
+            rowKey={(r) => r.id}
+            isLoading={isLoading && rows.length === 0}
+            isFetching={isLoading}
+            error={loadError}
+            onRetry={() => setReloadKey((k) => k + 1)}
+            emptyMessage="No unresolved payments found."
+            paging={{
+              page,
+              pageSize,
+              total,
+              totalPages: Math.max(1, totalPages),
+              onPageChange: setPage,
+              onPageSizeChange: (size) => {
+                setPageSize(size);
+                setPage(1);
+              },
+              pageSizes: [20, 50, 100],
+            }}
+          />
         </CardContent>
-        <CardFooter className="flex items-center justify-between">
-          <div className="text-sm text-muted-foreground">
-            Page {page} of {totalPages}
-          </div>
-          <div className="flex items-center gap-2">
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setPage((p) => Math.max(1, p - 1))}
-              disabled={page <= 1}
-            >
-              <ChevronLeft className="h-4 w-4" />
-              Prev
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
-              disabled={page >= totalPages}
-            >
-              Next
-              <ChevronRight className="h-4 w-4" />
-            </Button>
-          </div>
-        </CardFooter>
       </Card>
 
       {/* Resolve Dialog */}

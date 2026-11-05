@@ -1,4 +1,4 @@
-import { format } from 'date-fns';
+import { format, formatDistanceToNow } from 'date-fns';
 
 const money = new Intl.NumberFormat('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const count = new Intl.NumberFormat('en-US');
@@ -25,6 +25,20 @@ export function formatDay(value: string | Date | null | undefined): string {
   if (!value) return '';
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? '' : format(date, 'yyyy-MM-dd');
+}
+
+/** A date and time (`yyyy-MM-dd HH:mm`) on the user's calendar, or '' when there is none. */
+export function formatDateTime(value: string | Date | null | undefined): string {
+  if (!value) return '';
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? '' : format(date, 'yyyy-MM-dd HH:mm');
+}
+
+/** "3 hours ago", or '' when there is no date. */
+export function formatRelative(value: string | Date | null | undefined): string {
+  if (!value) return '';
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? '' : formatDistanceToNow(date, { addSuffix: true });
 }
 
 /** Sums a numeric field over rows (page totals). */

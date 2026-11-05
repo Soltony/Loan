@@ -6,16 +6,13 @@ import { Download, Loader2 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
-  Table,
-  TableBody,
-  TableCell,
-  TableFooter,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
+  DataTable,
+  SearchInput,
+  useClientTable,
+  type DataTableColumn,
+  type SortValue,
+} from "@/components/admin/data-table";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
 import {
   Select,
   SelectContent,
@@ -142,6 +139,16 @@ async function exportTransfers(rows: CollectionTransfer[], fileBase: string, fil
   saveAs(new Blob([buffer], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }), fileName);
 }
 
+const TRANSFER_SORTERS: Record<string, (t: CollectionTransfer) => SortValue> = {
+  date: (t) => t.transferDate,
+  provider: (t) => t.provider?.name,
+  component: (t) => componentLabel(t.component),
+  amount: (t) => t.transferAmount,
+  maker: (t) => t.createdAt,
+  checker: (t) => t.checkedAt,
+  status: (t) => transferStatusLabel(t.status),
+};
+
 export function CollectionTransferHistory(props: {
   title: string;
   description?: string;
@@ -185,8 +192,116 @@ export function CollectionTransferHistory(props: {
     () => new Set(props.transfers.map((t) => t.providerId)).size > 1,
     [props.transfers]
   );
-  const columnCount = showProvider ? 12 : 11;
   const truncated = props.totalMatching > props.transfers.length;
+  const table = useClientTable(filtered, { sorters: TRANSFER_SORTERS, pageSize: 25 });
+
+  const columns: DataTableColumn<CollectionTransfer>[] = [
+    { id: "date", header: "Date", sortKey: "date", className: "whitespace-nowrap", cell: (t) => displayDate(t.transferDate) },
+    ...(showProvider
+      ? [
+          {
+            id: "provider",
+            header: "Provider",
+            sortKey: "provider",
+            className: "whitespace-nowrap",
+            cell: (t: CollectionTransfer) => t.provider?.name ?? "-",
+          },
+        ]
+      : []),
+    { id: "component", header: "Component", sortKey: "component", className: "whitespace-nowrap", cell: (t) => componentLabel(t.component) },
+    {
+      id: "amount",
+      header: "Amount",
+      sortKey: "amount",
+      align: "right",
+      cell: (t) => {
+        const struck = t.status === "REJECTED" || t.status === "REVERSED";
+        return <span className={cn("font-mono", struck && "line-through")}>{formatCurrency(t.transferAmount)}</span>;
+      },
+      footer: <span className="font-mono">{formatCurrency(totals.approved)}</span>,
+    },
+    {
+      id: "from",
+      header: "From",
+      cell: (t) => (
+        <span className="block max-w-[200px] truncate" title={sourceAccountLabel(t)}>
+          {sourceAccountLabel(t)}
+        </span>
+      ),
+    },
+    {
+      id: "to",
+      header: "To",
+      cell: (t) => (
+        <span className="block max-w-[200px] truncate" title={t.destinationAccountName}>
+          {t.destinationAccountName}
+        </span>
+      ),
+    },
+    {
+      id: "reference",
+      header: "Reference",
+      className: "font-mono",
+      cell: (t) => (
+        <>
+          <div>{t.transferReference}</div>
+          {t.notes ? (
+            <div className="max-w-[200px] truncate font-sans text-xs text-muted-foreground" title={t.notes}>
+              {t.notes}
+            </div>
+          ) : null}
+        </>
+      ),
+    },
+    {
+      id: "maker",
+      header: "Maker",
+      sortKey: "maker",
+      className: "whitespace-nowrap",
+      cell: (t) => (
+        <>
+          <div>{t.recordedByUser?.fullName || "-"}</div>
+          <div className="text-xs text-muted-foreground">{displayDateTime(t.createdAt)}</div>
+        </>
+      ),
+    },
+    {
+      id: "checker",
+      header: "Checker",
+      sortKey: "checker",
+      className: "whitespace-nowrap",
+      cell: (t) => (
+        <>
+          <div>{t.checkedByUser?.fullName || "-"}</div>
+          {t.checkedAt ? <div className="text-xs text-muted-foreground">{displayDateTime(t.checkedAt)}</div> : null}
+        </>
+      ),
+    },
+    {
+      id: "status",
+      header: "Status",
+      sortKey: "status",
+      cell: (t) => {
+        const note = statusNote(t);
+        return (
+          <>
+            <TransferStatusBadge status={t.status} />
+            {note ? (
+              <div className="mt-1 max-w-[220px] truncate text-xs text-muted-foreground" title={note}>
+                {note}
+              </div>
+            ) : null}
+          </>
+        );
+      },
+    },
+    {
+      id: "actions",
+      header: "Actions",
+      align: "right",
+      cell: (t) => props.renderActions?.(t) ?? <span className="text-sm text-muted-foreground">—</span>,
+    },
+  ];
 
   async function handleExport() {
     setExporting(true);
@@ -195,73 +310,6 @@ export function CollectionTransferHistory(props: {
     } finally {
       setExporting(false);
     }
-  }
-
-  let body: ReactNode;
-  if (props.loading && props.transfers.length === 0) {
-    body = (
-      <TableRow>
-        <TableCell colSpan={columnCount} className="h-24 text-center">
-          <Loader2 className="mx-auto h-5 w-5 animate-spin" />
-        </TableCell>
-      </TableRow>
-    );
-  } else if (filtered.length === 0) {
-    body = (
-      <TableRow>
-        <TableCell colSpan={columnCount} className="h-24 text-center text-muted-foreground">
-          {props.emptyMessage ?? "No transfers found."}
-        </TableCell>
-      </TableRow>
-    );
-  } else {
-    body = filtered.map((t) => {
-      const note = statusNote(t);
-      const struck = t.status === "REJECTED" || t.status === "REVERSED";
-      return (
-        <TableRow key={t.id} className={struck ? "text-muted-foreground" : undefined}>
-          <TableCell className="whitespace-nowrap">{displayDate(t.transferDate)}</TableCell>
-          {showProvider ? <TableCell className="whitespace-nowrap">{t.provider?.name ?? "-"}</TableCell> : null}
-          <TableCell className="whitespace-nowrap">{componentLabel(t.component)}</TableCell>
-          <TableCell className={cn("text-right font-mono", struck && "line-through")}>
-            {formatCurrency(t.transferAmount)}
-          </TableCell>
-          <TableCell className="max-w-[200px] truncate" title={sourceAccountLabel(t)}>
-            {sourceAccountLabel(t)}
-          </TableCell>
-          <TableCell className="max-w-[200px] truncate" title={t.destinationAccountName}>
-            {t.destinationAccountName}
-          </TableCell>
-          <TableCell className="font-mono">
-            <div>{t.transferReference}</div>
-            {t.notes ? (
-              <div className="max-w-[200px] truncate font-sans text-xs text-muted-foreground" title={t.notes}>
-                {t.notes}
-              </div>
-            ) : null}
-          </TableCell>
-          <TableCell className="whitespace-nowrap">
-            <div>{t.recordedByUser?.fullName || "-"}</div>
-            <div className="text-xs text-muted-foreground">{displayDateTime(t.createdAt)}</div>
-          </TableCell>
-          <TableCell className="whitespace-nowrap">
-            <div>{t.checkedByUser?.fullName || "-"}</div>
-            {t.checkedAt ? <div className="text-xs text-muted-foreground">{displayDateTime(t.checkedAt)}</div> : null}
-          </TableCell>
-          <TableCell>
-            <TransferStatusBadge status={t.status} />
-            {note ? (
-              <div className="mt-1 max-w-[220px] truncate text-xs text-muted-foreground" title={note}>
-                {note}
-              </div>
-            ) : null}
-          </TableCell>
-          <TableCell className="text-right">
-            {props.renderActions?.(t) ?? <span className="text-sm text-muted-foreground">—</span>}
-          </TableCell>
-        </TableRow>
-      );
-    });
   }
 
   return (
@@ -325,10 +373,15 @@ export function CollectionTransferHistory(props: {
           />
           <div className="flex min-w-[220px] flex-1 flex-col gap-1">
             <span className="text-xs text-muted-foreground">Search</span>
-            <Input
+            <SearchInput
+              className="max-w-none"
+              label="Search transfers"
               placeholder="Reference, account, maker, checker, notes…"
               value={query}
-              onChange={(e) => setQuery(e.target.value)}
+              onChange={(value) => {
+                setQuery(value);
+                table.resetPage();
+              }}
             />
           </div>
         </div>
@@ -339,43 +392,29 @@ export function CollectionTransferHistory(props: {
           </p>
         ) : null}
       </CardHeader>
-      <CardContent className="p-0">
-        <div className="overflow-x-auto border-t">
-          <Table>
-            <TableHeader className="bg-muted/50">
-              <TableRow>
-                <TableHead>Date</TableHead>
-                {showProvider ? <TableHead>Provider</TableHead> : null}
-                <TableHead>Component</TableHead>
-                <TableHead className="text-right">Amount</TableHead>
-                <TableHead>From</TableHead>
-                <TableHead>To</TableHead>
-                <TableHead>Reference</TableHead>
-                <TableHead>Maker</TableHead>
-                <TableHead>Checker</TableHead>
-                <TableHead>Status</TableHead>
-                <TableHead className="text-right">Actions</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>{body}</TableBody>
-            {filtered.length > 0 ? (
-              <TableFooter>
-                <TableRow>
-                  <TableCell colSpan={showProvider ? 3 : 2} className="font-medium">
-                    Approved ({totals.approvedCount})
-                  </TableCell>
-                  <TableCell className="text-right font-mono font-semibold">{formatCurrency(totals.approved)}</TableCell>
-                  <TableCell colSpan={8} className="text-xs text-muted-foreground">
-                    {totals.pendingCount > 0
-                      ? `Pending approval: ${formatCurrency(totals.pending)} (${totals.pendingCount}). `
-                      : ""}
-                    Rejected and reversed transfers are excluded.
-                  </TableCell>
-                </TableRow>
-              </TableFooter>
-            ) : null}
-          </Table>
-        </div>
+      <CardContent className="space-y-2">
+        <DataTable
+          caption={props.title}
+          columns={columns}
+          rows={table.rows}
+          rowKey={(t) => t.id}
+          isLoading={!!props.loading && props.transfers.length === 0}
+          isFetching={!!props.loading}
+          emptyMessage={props.emptyMessage ?? "No transfers found."}
+          sort={table.sort}
+          onSortChange={table.onSortChange}
+          paging={table.paging}
+          footerLabel={`Approved (${totals.approvedCount})`}
+          rowClassName={(t) => (t.status === "REJECTED" || t.status === "REVERSED" ? "text-muted-foreground" : undefined)}
+        />
+        {filtered.length > 0 ? (
+          <p className="text-xs text-muted-foreground">
+            {totals.pendingCount > 0
+              ? `Pending approval: ${formatCurrency(totals.pending)} (${totals.pendingCount}). `
+              : ""}
+            The approved total excludes rejected and reversed transfers.
+          </p>
+        ) : null}
       </CardContent>
     </Card>
   );

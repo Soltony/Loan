@@ -1,12 +1,19 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { useRouter } from 'next/navigation';
 import { useRequirePermission } from '@/hooks/use-require-permission';
 import { PlusCircle, MoreHorizontal } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
+import {
+    DataTable,
+    SearchInput,
+    StatusBadge,
+    useClientTable,
+    type DataTableColumn,
+    type SortValue,
+} from '@/components/admin/data-table';
 import { Badge } from '@/components/ui/badge';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
 import { AddUserDialog } from '@/components/user/add-user-dialog';
@@ -15,22 +22,33 @@ import type { User, Role, LoanProvider, Permissions } from '@/lib/types';
 import { cn } from '@/lib/utils';
 import { useToast } from '@/hooks/use-toast';
 import { useAuth } from '@/hooks/use-auth';
-import { Loader2 } from 'lucide-react';
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, AlertDialogTrigger } from '@/components/ui/alert-dialog';
 import { allMenuItems, menuPermissionKey, permissionModuleLabel } from '@/lib/menu-items';
-import {
-  Pagination,
-  PaginationContent,
-  PaginationEllipsis,
-  PaginationItem,
-  PaginationLink,
-  PaginationNext,
-  PaginationPrevious,
-} from '@/components/ui/pagination';
-
 
 const PERMISSION_MODULES = allMenuItems.map(item => menuPermissionKey(item)).concat(['products']);
 const ITEMS_PER_PAGE = 10;
+
+const USER_SORTERS: Record<string, (user: User) => SortValue> = {
+    name: (u) => u.fullName,
+    email: (u) => u.email,
+    role: (u) => u.role,
+    provider: (u) => u.providerName,
+    status: (u) => u.status,
+};
+
+const ROLE_SORTERS: Record<string, (role: Role) => SortValue> = {
+    name: (r) => r.name,
+};
+
+/** Rows whose text contains every word of the search. */
+function matchesSearch(search: string, ...fields: Array<string | null | undefined>): boolean {
+    const haystack = fields.filter(Boolean).join(' ').toLowerCase();
+    return search
+        .toLowerCase()
+        .split(/\s+/)
+        .filter(Boolean)
+        .every((word) => haystack.includes(word));
+}
 
 
 function UsersTab() {
@@ -42,7 +60,8 @@ function UsersTab() {
     const { currentUser } = useAuth();
     const [isDialogOpen, setIsDialogOpen] = useState(false);
     const [editingUser, setEditingUser] = useState<User | null>(null);
-    const [currentPage, setCurrentPage] = useState(1);
+    const [search, setSearch] = useState('');
+    const [loadError, setLoadError] = useState<unknown>(null);
     const { toast } = useToast();
 
     const canCreate = !!currentUser?.permissions?.['access-control']?.create;
@@ -74,7 +93,9 @@ function UsersTab() {
             setUsers(usersData);
             setRoles(rolesData);
             setProviders(providersData);
+            setLoadError(null);
         } catch (error) {
+            setLoadError(error);
             toast({
                 title: 'Error',
                 description: 'Could not load initial data.',
@@ -170,87 +191,58 @@ function UsersTab() {
         }
     };
 
-    if (isLoading) {
-        return <div className="flex justify-center items-center h-48"><Loader2 className="h-8 w-8 animate-spin" /></div>
-    }
+    const filteredUsers = useMemo(
+        () => users.filter((u) => matchesSearch(search, u.fullName, u.email, u.role, u.providerName, u.status)),
+        [users, search],
+    );
+    const table = useClientTable(filteredUsers, { sorters: USER_SORTERS, pageSize: ITEMS_PER_PAGE });
 
-    const totalPages = Math.ceil(users.length / ITEMS_PER_PAGE);
-    const startIndex = (currentPage - 1) * ITEMS_PER_PAGE;
-    const paginatedUsers = users.slice(startIndex, startIndex + ITEMS_PER_PAGE);
-
-    const renderPaginationItems = () => {
-      const items = [];
-      const maxVisible = 5;
-
-      if (currentPage > 1) {
-        items.push(
-          <PaginationItem key="prev">
-            <PaginationPrevious
-              href="#"
-              onClick={(e) => {
-                e.preventDefault();
-                setCurrentPage(currentPage - 1);
-              }}
-            />
-          </PaginationItem>
-        );
-      }
-
-      let startPage = Math.max(1, currentPage - Math.floor(maxVisible / 2));
-      let endPage = Math.min(totalPages, startPage + maxVisible - 1);
-      if (endPage - startPage < maxVisible - 1) {
-        startPage = Math.max(1, endPage - maxVisible + 1);
-      }
-
-      if (startPage > 1) {
-        items.push(
-          <PaginationItem key="ellipsis-start">
-            <PaginationEllipsis />
-          </PaginationItem>
-        );
-      }
-
-      for (let i = startPage; i <= endPage; i++) {
-        items.push(
-          <PaginationItem key={i}>
-            <PaginationLink
-              href="#"
-              isActive={i === currentPage}
-              onClick={(e) => {
-                e.preventDefault();
-                setCurrentPage(i);
-              }}
-            >
-              {i}
-            </PaginationLink>
-          </PaginationItem>
-        );
-      }
-
-      if (endPage < totalPages) {
-        items.push(
-          <PaginationItem key="ellipsis-end">
-            <PaginationEllipsis />
-          </PaginationItem>
-        );
-      }
-
-      if (currentPage < totalPages) {
-        items.push(
-          <PaginationItem key="next">
-            <PaginationNext
-              href="#"
-              onClick={(e) => {
-                e.preventDefault();
-                setCurrentPage(currentPage + 1);
-              }}
-            />
-          </PaginationItem>
-        );
-      }
-
-      return items;
-    };
+    const columns: DataTableColumn<User>[] = [
+        { id: 'name', header: 'Full Name', sortKey: 'name', className: 'font-medium', cell: (user) => user.fullName },
+        { id: 'email', header: 'Email', sortKey: 'email', cell: (user) => user.email },
+        {
+            id: 'role',
+            header: 'Role',
+            sortKey: 'role',
+            cell: (user) => {
+                const isAdmin = user.role === 'Admin' || user.role === 'Super Admin';
+                return (
+                    <Badge variant={isAdmin ? 'default' : 'secondary'} style={isAdmin ? { backgroundColor: themeColor, color: 'white' } : {}}>
+                        {user.role}
+                    </Badge>
+                );
+            },
+        },
+        { id: 'provider', header: 'Provider', sortKey: 'provider', cell: (user) => user.providerName || '—' },
+        {
+            id: 'status',
+            header: 'Status',
+            sortKey: 'status',
+            cell: (user) => <StatusBadge status={user.status} tone={user.status === 'Active' ? 'success' : 'danger'} />,
+        },
+        {
+            id: 'actions',
+            header: 'Actions',
+            align: 'right',
+            cell: (user) => (
+                <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                        <Button variant="ghost" className="h-8 w-8 p-0">
+                            <span className="sr-only">Open menu</span>
+                            <MoreHorizontal className="h-4 w-4" />
+                        </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end">
+                        <DropdownMenuLabel>Actions</DropdownMenuLabel>
+                        <DropdownMenuItem onClick={() => handleOpenDialog(user)} disabled={!canUpdate}>Edit</DropdownMenuItem>
+                        <DropdownMenuItem onClick={() => handleToggleStatus(user)} disabled={!canUpdate}>
+                            {user.status === 'Active' ? 'Deactivate' : 'Activate'}
+                        </DropdownMenuItem>
+                    </DropdownMenuContent>
+                </DropdownMenu>
+            ),
+        },
+    ];
 
     return (
         <>
@@ -268,61 +260,31 @@ function UsersTab() {
                     <CardDescription>Manage registered users and their roles.</CardDescription>
                 </CardHeader>
                 <CardContent>
-                    <Table>
-                        <TableHeader>
-                            <TableRow>
-                                <TableHead>Full Name</TableHead>
-                                <TableHead>Email</TableHead>
-                                <TableHead>Role</TableHead>
-                                <TableHead>Provider</TableHead>
-                                <TableHead>Status</TableHead>
-                                <TableHead>Actions</TableHead>
-                            </TableRow>
-                        </TableHeader>
-                        <TableBody>
-                            {paginatedUsers.map((user) => (
-                                <TableRow key={user.id}>
-                                    <TableCell className="font-medium">{user.fullName}</TableCell>
-                                    <TableCell>{user.email}</TableCell>
-                                    <TableCell>
-                                        <Badge variant={user.role === 'Admin' || user.role === 'Super Admin' ? 'default' : 'secondary'} style={user.role === 'Admin' || user.role === 'Super Admin' ? { backgroundColor: themeColor, color: 'white' } : {}}>
-                                            {user.role}
-                                        </Badge>
-                                    </TableCell>
-                                    <TableCell>{user.providerName}</TableCell>
-                                    <TableCell>
-                                        <Badge variant={user.status === 'Active' ? 'secondary' : 'destructive'} style={user.status === 'Active' ? { backgroundColor: '#16a34a', color: 'white' } : {}}>
-                                            {user.status}
-                                        </Badge>
-                                    </TableCell>
-                                    <TableCell>
-                                        <DropdownMenu>
-                                            <DropdownMenuTrigger asChild>
-                                                <Button variant="ghost" className="h-8 w-8 p-0">
-                                                    <span className="sr-only">Open menu</span>
-                                                    <MoreHorizontal className="h-4 w-4" />
-                                                </Button>
-                                            </DropdownMenuTrigger>
-                                            <DropdownMenuContent align="end">
-                                                <DropdownMenuLabel>Actions</DropdownMenuLabel>
-                                                <DropdownMenuItem onClick={() => handleOpenDialog(user)} disabled={!canUpdate}>Edit</DropdownMenuItem>
-                                                <DropdownMenuItem onClick={() => handleToggleStatus(user)} disabled={!canUpdate}>
-                                                    {user.status === 'Active' ? 'Deactivate' : 'Activate'}
-                                                </DropdownMenuItem>
-                                            </DropdownMenuContent>
-                                        </DropdownMenu>
-                                    </TableCell>
-                                </TableRow>
-                            ))}
-                        </TableBody>
-                    </Table>
-                    {totalPages > 1 && (
-                      <div className="mt-6 flex justify-center">
-                        <Pagination>
-                          <PaginationContent>{renderPaginationItems()}</PaginationContent>
-                        </Pagination>
-                      </div>
-                    )}
+                    <DataTable
+                        caption="Users"
+                        columns={columns}
+                        rows={table.rows}
+                        rowKey={(user) => user.id}
+                        isLoading={isLoading && users.length === 0}
+                        isFetching={isLoading}
+                        error={loadError}
+                        onRetry={() => void fetchInitialData()}
+                        emptyMessage={search ? 'No users match your search.' : 'No users yet.'}
+                        sort={table.sort}
+                        onSortChange={table.onSortChange}
+                        paging={table.paging}
+                        toolbar={
+                            <SearchInput
+                                label="Search users"
+                                placeholder="Search by name, email, role or provider..."
+                                value={search}
+                                onChange={(value) => {
+                                    setSearch(value);
+                                    table.resetPage();
+                                }}
+                            />
+                        }
+                    />
                 </CardContent>
             </Card>
             <AddUserDialog
@@ -344,7 +306,8 @@ function RolesTab() {
     const [providers, setProviders] = useState<LoanProvider[]>([]);
     const { currentUser } = useAuth();
     const [deletingRoleId, setDeletingRoleId] = useState<string | null>(null);
-    const [currentPage, setCurrentPage] = useState(1);
+    const [search, setSearch] = useState('');
+    const [loadError, setLoadError] = useState<unknown>(null);
     const { toast } = useToast();
     const router = useRouter();
 
@@ -372,7 +335,9 @@ function RolesTab() {
             const providersData = await providersResponse.json();
             setRoles(rolesData);
             setProviders(providersData);
+            setLoadError(null);
         } catch (error) {
+            setLoadError(error);
             toast({
                 title: 'Error',
                 description: 'Could not load role data.',
@@ -422,87 +387,50 @@ function RolesTab() {
         }
     };
     
-    if (isLoading) {
-        return <div className="flex justify-center items-center h-48"><Loader2 className="h-8 w-8 animate-spin" /></div>
-    }
+    const filteredRoles = useMemo(() => roles.filter((r) => matchesSearch(search, r.name)), [roles, search]);
+    const table = useClientTable(filteredRoles, { sorters: ROLE_SORTERS, pageSize: ITEMS_PER_PAGE });
 
-    const totalPages = Math.ceil(roles.length / ITEMS_PER_PAGE);
-    const startIndex = (currentPage - 1) * ITEMS_PER_PAGE;
-    const paginatedRoles = roles.slice(startIndex, startIndex + ITEMS_PER_PAGE);
-
-    const renderPaginationItems = () => {
-      const items = [];
-      const maxVisible = 5;
-
-      if (currentPage > 1) {
-        items.push(
-          <PaginationItem key="prev">
-            <PaginationPrevious
-              href="#"
-              onClick={(e) => {
-                e.preventDefault();
-                setCurrentPage(currentPage - 1);
-              }}
-            />
-          </PaginationItem>
-        );
-      }
-
-      let startPage = Math.max(1, currentPage - Math.floor(maxVisible / 2));
-      let endPage = Math.min(totalPages, startPage + maxVisible - 1);
-      if (endPage - startPage < maxVisible - 1) {
-        startPage = Math.max(1, endPage - maxVisible + 1);
-      }
-
-      if (startPage > 1) {
-        items.push(
-          <PaginationItem key="ellipsis-start">
-            <PaginationEllipsis />
-          </PaginationItem>
-        );
-      }
-
-      for (let i = startPage; i <= endPage; i++) {
-        items.push(
-          <PaginationItem key={i}>
-            <PaginationLink
-              href="#"
-              isActive={i === currentPage}
-              onClick={(e) => {
-                e.preventDefault();
-                setCurrentPage(i);
-              }}
-            >
-              {i}
-            </PaginationLink>
-          </PaginationItem>
-        );
-      }
-
-      if (endPage < totalPages) {
-        items.push(
-          <PaginationItem key="ellipsis-end">
-            <PaginationEllipsis />
-          </PaginationItem>
-        );
-      }
-
-      if (currentPage < totalPages) {
-        items.push(
-          <PaginationItem key="next">
-            <PaginationNext
-              href="#"
-              onClick={(e) => {
-                e.preventDefault();
-                setCurrentPage(currentPage + 1);
-              }}
-            />
-          </PaginationItem>
-        );
-      }
-
-      return items;
-    };
+    const columns: DataTableColumn<Role>[] = [
+        { id: 'name', header: 'Role Name', sortKey: 'name', className: 'font-medium min-w-[150px]', cell: (role) => role.name },
+        ...PERMISSION_MODULES.map(
+            (module): DataTableColumn<Role> => ({
+                id: `perm-${module}`,
+                header: <span className="capitalize">{permissionModuleLabel(module)}</span>,
+                align: 'center',
+                cell: (role) => {
+                    const access = (role.permissions as Permissions)[module.toLowerCase()];
+                    return (
+                        <div className="flex justify-center items-center space-x-2">
+                            <span title="Create" className={cn(access?.create ? 'text-green-500' : 'text-muted-foreground/30')}>C</span>
+                            <span title="Read" className={cn(access?.read ? 'text-green-500' : 'text-muted-foreground/30')}>R</span>
+                            <span title="Update" className={cn(access?.update ? 'text-green-500' : 'text-muted-foreground/30')}>U</span>
+                            <span title="Delete" className={cn(access?.delete ? 'text-green-500' : 'text-muted-foreground/30')}>D</span>
+                        </div>
+                    );
+                },
+            }),
+        ),
+        {
+            id: 'actions',
+            header: 'Actions',
+            align: 'right',
+            cell: (role) => (
+                <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                        <Button variant="ghost" className="h-8 w-8 p-0">
+                            <span className="sr-only">Open menu</span>
+                            <MoreHorizontal className="h-4 w-4" />
+                        </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end">
+                        <DropdownMenuLabel>Actions</DropdownMenuLabel>
+                        <DropdownMenuItem onClick={() => router.push(`/admin/access-control/roles/${role.id}/edit`)} disabled={!canUpdate}>Edit</DropdownMenuItem>
+                        <DropdownMenuItem className="text-red-600" onClick={() => setDeletingRoleId(role.id)} disabled={!canDelete}>Delete</DropdownMenuItem>
+                    </DropdownMenuContent>
+                </DropdownMenu>
+            ),
+        },
+    ];
 
     return (
         <>
@@ -520,56 +448,31 @@ function RolesTab() {
                     <CardDescription>Define roles to control user access and permissions across the application.</CardDescription>
                 </CardHeader>
                 <CardContent>
-                    <Table>
-                        <TableHeader>
-                            <TableRow>
-                                <TableHead className="w-[150px]">Role Name</TableHead>
-                                {PERMISSION_MODULES.map(module => (
-                                    <TableHead key={module} className="text-center capitalize">{permissionModuleLabel(module)}</TableHead>
-                                ))}
-                                <TableHead className="text-right">Actions</TableHead>
-                            </TableRow>
-                        </TableHeader>
-                        <TableBody>
-                            {paginatedRoles.map((role) => (
-                                <TableRow key={role.id}>
-                                    <TableCell className="font-medium">{role.name}</TableCell>
-                                    {PERMISSION_MODULES.map(module => (
-                                        <TableCell key={module} className="text-center">
-                                            <div className="flex justify-center items-center space-x-2">
-                                                <span title="Create" className={cn((role.permissions as Permissions)[module.toLowerCase()]?.create ? 'text-green-500' : 'text-muted-foreground/30')}>C</span>
-                                                <span title="Read" className={cn((role.permissions as Permissions)[module.toLowerCase()]?.read ? 'text-green-500' : 'text-muted-foreground/30')}>R</span>
-                                                <span title="Update" className={cn((role.permissions as Permissions)[module.toLowerCase()]?.update ? 'text-green-500' : 'text-muted-foreground/30')}>U</span>
-                                                <span title="Delete" className={cn((role.permissions as Permissions)[module.toLowerCase()]?.delete ? 'text-green-500' : 'text-muted-foreground/30')}>D</span>
-                                            </div>
-                                        </TableCell>
-                                    ))}
-                                    <TableCell className="text-right">
-                                        <DropdownMenu>
-                                            <DropdownMenuTrigger asChild>
-                                                <Button variant="ghost" className="h-8 w-8 p-0">
-                                                    <span className="sr-only">Open menu</span>
-                                                    <MoreHorizontal className="h-4 w-4" />
-                                                </Button>
-                                            </DropdownMenuTrigger>
-                                            <DropdownMenuContent align="end">
-                                                <DropdownMenuLabel>Actions</DropdownMenuLabel>
-                                                <DropdownMenuItem onClick={() => router.push(`/admin/access-control/roles/${role.id}/edit`)} disabled={!canUpdate}>Edit</DropdownMenuItem>
-                                                <DropdownMenuItem className="text-red-600" onClick={() => setDeletingRoleId(role.id)} disabled={!canDelete}>Delete</DropdownMenuItem>
-                                            </DropdownMenuContent>
-                                        </DropdownMenu>
-                                    </TableCell>
-                                </TableRow>
-                            ))}
-                        </TableBody>
-                    </Table>
-                    {totalPages > 1 && (
-                      <div className="mt-6 flex justify-center">
-                        <Pagination>
-                          <PaginationContent>{renderPaginationItems()}</PaginationContent>
-                        </Pagination>
-                      </div>
-                    )}
+                    <DataTable
+                        caption="Roles"
+                        columns={columns}
+                        rows={table.rows}
+                        rowKey={(role) => role.id}
+                        isLoading={isLoading && roles.length === 0}
+                        isFetching={isLoading}
+                        error={loadError}
+                        onRetry={() => void fetchRolesAndProviders()}
+                        emptyMessage={search ? 'No roles match your search.' : 'No roles yet.'}
+                        sort={table.sort}
+                        onSortChange={table.onSortChange}
+                        paging={table.paging}
+                        toolbar={
+                            <SearchInput
+                                label="Search roles"
+                                placeholder="Search roles..."
+                                value={search}
+                                onChange={(value) => {
+                                    setSearch(value);
+                                    table.resetPage();
+                                }}
+                            />
+                        }
+                    />
                 </CardContent>
             </Card>
             <AlertDialog open={!!deletingRoleId} onOpenChange={(isOpen) => !isOpen && setDeletingRoleId(null)}>

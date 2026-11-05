@@ -2,9 +2,7 @@
 
 import { useMemo, useState } from 'react';
 import type { LoanProvider } from '@/lib/types';
-import { formatMoney } from '../lib/format';
-import { Money } from '../report-cells';
-import { ReportTable, type ReportColumn } from '../report-table';
+import { DataTable, type DataTableColumn, formatMoney, Money } from '../../data-table';
 import type { ProviderSummary, TableSort } from '../types';
 import type { SummaryTabProps } from './provider-summaries';
 
@@ -51,7 +49,7 @@ export function FundUtilizationTab({ providers, summaries, isLoading, isFetching
     : 0;
   const showTotals = rows.length > 1;
 
-  const columns: ReportColumn<UtilizationRow>[] = [
+  const columns: DataTableColumn<UtilizationRow>[] = [
     { id: 'provider', header: 'Provider', sortKey: 'provider', cell: (r) => r.provider.name },
     {
       id: 'fund',
@@ -97,7 +95,7 @@ export function FundUtilizationTab({ providers, summaries, isLoading, isFetching
 
   return (
     <div className="space-y-2">
-      <ReportTable
+      <DataTable
         caption="Fund utilization"
         columns={columns}
         rows={rows}

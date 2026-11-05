@@ -4,19 +4,25 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { useRequirePermission } from '@/hooks/use-require-permission';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
-import { Badge } from '@/components/ui/badge';
+import {
+    DataTable,
+    Money,
+    SearchInput,
+    formatMoney,
+    useClientTable,
+    type DataTableColumn,
+    type SortValue,
+} from '@/components/admin/data-table';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { StatTile } from '@/components/ui/stat-tile';
-import { Loader2, RefreshCw, Download, Search, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, ArrowUpDown, ArrowUp, ArrowDown, Users, Banknote, Landmark, AlertTriangle } from 'lucide-react';
+import { Loader2, RefreshCw, Download, Users, Banknote, Landmark, AlertTriangle } from 'lucide-react';
 import { useToast } from '@/hooks/use-toast';
 import { updateNplStatus } from '@/actions/npl';
 import { usePermissions } from '@/hooks/use-permissions';
 import { useAuth } from '@/hooks/use-auth';
 import { branchLabel } from '@/lib/branches';
-import { cn } from '@/lib/utils';
 import { format } from 'date-fns';
 import * as ExcelJS from 'exceljs';
 import { saveAs } from 'file-saver';
@@ -39,15 +45,19 @@ interface Provider {
     name: string;
 }
 
-const formatCurrency = (amount: number | null | undefined) => {
-    if (amount === null || amount === undefined || isNaN(amount)) return "0.00";
-    return new Intl.NumberFormat("en-US", {
-        minimumFractionDigits: 2,
-        maximumFractionDigits: 2,
-    }).format(amount);
+/** How each sortable column reads its value. */
+const NPL_SORTERS: Record<string, (entry: NplEntry) => SortValue> = {
+    borrowerId: (e) => e.borrowerId,
+    borrowerName: (e) => e.borrowerName,
+    accountNumber: (e) => e.accountNumber,
+    providerName: (e) => e.providerName,
+    daysOverdue: (e) => e.daysOverdue,
+    principalOutstanding: (e) => e.principalOutstanding,
+    interestOutstanding: (e) => e.interestOutstanding,
+    serviceFeeOutstanding: (e) => e.serviceFeeOutstanding,
+    penaltyOutstanding: (e) => e.penaltyOutstanding,
+    totalOutstanding: (e) => e.totalOutstanding,
 };
-
-type SortDir = 'asc' | 'desc';
 
 export default function NplManagementPage() {
     useRequirePermission('npl');
@@ -63,6 +73,7 @@ export default function NplManagementPage() {
     const [isLoading, setIsLoading] = useState(true);
     const [isUpdating, setIsUpdating] = useState(false);
     const [isExporting, setIsExporting] = useState(false);
+    const [loadError, setLoadError] = useState<unknown>(null);
     const { toast } = useToast();
 
     // Filters
@@ -70,12 +81,6 @@ export default function NplManagementPage() {
     const [providerFilter, setProviderFilter] = useState('all');
     const [daysOverdueMin, setDaysOverdueMin] = useState('');
     const [daysOverdueMax, setDaysOverdueMax] = useState('');
-
-    // Table State
-    const [sortBy, setSortBy] = useState<keyof NplEntry>('daysOverdue');
-    const [sortDir, setSortDir] = useState<SortDir>('desc');
-    const [page, setPage] = useState(1);
-    const [pageSize, setPageSize] = useState(50);
 
     const fetchBorrowers = async () => {
         setIsLoading(true);
@@ -87,6 +92,7 @@ export default function NplManagementPage() {
             if (!response.ok) throw new Error('Failed to fetch NPL borrowers');
             const data = await response.json();
             setEntries(data);
+            setLoadError(null);
 
             // Extract unique providers for filter
             const responseProviders = await fetch('/api/providers');
@@ -95,6 +101,7 @@ export default function NplManagementPage() {
                 setProviders(providersData);
             }
         } catch (error) {
+            setLoadError(new Error('Could not load NPL data.'));
             toast({
                 title: 'Error',
                 description: 'Could not load NPL data.',
@@ -156,33 +163,12 @@ export default function NplManagementPage() {
         });
     }, [entries, searchQuery, providerFilter, daysOverdueMin, daysOverdueMax]);
 
-    const sortedEntries = useMemo(() => {
-        const sorted = [...filteredEntries];
-        sorted.sort((a, b) => {
-            const aVal = a[sortBy];
-            const bVal = b[sortBy];
-            
-            if (aVal === bVal) return 0;
-            if (aVal == null) return sortDir === 'asc' ? -1 : 1;
-            if (bVal == null) return sortDir === 'asc' ? 1 : -1;
-
-            if (typeof aVal === 'number' && typeof bVal === 'number') {
-                return sortDir === 'asc' ? aVal - bVal : bVal - aVal;
-            }
-            
-            return sortDir === 'asc' 
-                ? String(aVal).localeCompare(String(bVal))
-                : String(bVal).localeCompare(String(aVal));
-        });
-        return sorted;
-    }, [filteredEntries, sortBy, sortDir]);
-
-    const paginatedEntries = useMemo(() => {
-        const start = (page - 1) * pageSize;
-        return sortedEntries.slice(start, start + pageSize);
-    }, [sortedEntries, page, pageSize]);
-
-    const totalPages = Math.ceil(sortedEntries.length / pageSize);
+    const table = useClientTable(filteredEntries, {
+        sorters: NPL_SORTERS,
+        initialSort: { by: 'daysOverdue', dir: 'desc' },
+        pageSize: 50,
+    });
+    const sortedEntries = table.sortedRows;
 
     // Headline figures for the rows currently in view, so the cards always
     // describe what the table below is showing.
@@ -212,19 +198,60 @@ export default function NplManagementPage() {
 
     const isFiltered = filteredEntries.length !== entries.length;
 
-    const toggleSort = (field: keyof NplEntry) => {
-        if (sortBy === field) {
-            setSortDir(sortDir === 'asc' ? 'desc' : 'asc');
-        } else {
-            setSortBy(field);
-            setSortDir('asc');
-        }
-    };
-
-    const renderSortIcon = (field: keyof NplEntry) => {
-        if (sortBy !== field) return <ArrowUpDown className="ml-2 h-4 w-4 opacity-50" />;
-        return sortDir === 'asc' ? <ArrowUp className="ml-2 h-4 w-4" /> : <ArrowDown className="ml-2 h-4 w-4" />;
-    };
+    const columns: DataTableColumn<NplEntry>[] = [
+        { id: 'borrowerId', header: 'Borrower ID', sortKey: 'borrowerId', className: 'font-mono text-xs', cell: (e) => e.borrowerId },
+        { id: 'borrowerName', header: 'Customer Name', sortKey: 'borrowerName', className: 'font-medium', cell: (e) => e.borrowerName },
+        { id: 'accountNumber', header: 'Account Number', sortKey: 'accountNumber', className: 'font-mono', cell: (e) => e.accountNumber },
+        { id: 'providerName', header: 'Loan Provider', sortKey: 'providerName', cell: (e) => e.providerName },
+        {
+            id: 'daysOverdue',
+            header: 'Days Overdue',
+            sortKey: 'daysOverdue',
+            align: 'right',
+            className: 'tabular-nums',
+            cell: (e) => e.daysOverdue.toLocaleString(),
+        },
+        {
+            id: 'principal',
+            header: 'Principal Outstanding',
+            sortKey: 'principalOutstanding',
+            align: 'right',
+            cell: (e) => <Money value={e.principalOutstanding} />,
+            footer: <Money value={summary.principal} bold />,
+        },
+        {
+            id: 'interest',
+            header: 'Interest Outstanding',
+            sortKey: 'interestOutstanding',
+            align: 'right',
+            cell: (e) => <Money value={e.interestOutstanding} />,
+            footer: <Money value={summary.interest} bold />,
+        },
+        {
+            id: 'serviceFee',
+            header: 'Service Fee Outstanding',
+            sortKey: 'serviceFeeOutstanding',
+            align: 'right',
+            cell: (e) => <Money value={e.serviceFeeOutstanding} />,
+            footer: <Money value={summary.serviceFee} bold />,
+        },
+        {
+            id: 'penalty',
+            header: 'Penalty Outstanding',
+            sortKey: 'penaltyOutstanding',
+            align: 'right',
+            cell: (e) => <Money value={e.penaltyOutstanding} />,
+            footer: <Money value={summary.penalty} bold />,
+        },
+        {
+            id: 'total',
+            header: 'Total Outstanding',
+            sortKey: 'totalOutstanding',
+            align: 'right',
+            cell: (e) => <Money value={e.totalOutstanding} bold />,
+            footer: <Money value={summary.total} bold />,
+        },
+    ];
 
     const handleExcelExport = async () => {
         setIsExporting(true);
@@ -332,7 +359,7 @@ export default function NplManagementPage() {
                 />
                 <StatTile
                     label="Total Outstanding"
-                    value={formatCurrency(summary.total)}
+                    value={formatMoney(summary.total)}
                     hint="Principal, interest, fees and penalty"
                     icon={Banknote}
                     tone={summary.total > 0 ? 'danger' : 'success'}
@@ -340,8 +367,8 @@ export default function NplManagementPage() {
                 />
                 <StatTile
                     label="Principal at Risk"
-                    value={formatCurrency(summary.principal)}
-                    hint={`Plus ${formatCurrency(summary.charges)} in interest, fees & penalty`}
+                    value={formatMoney(summary.principal)}
+                    hint={`Plus ${formatMoney(summary.charges)} in interest, fees & penalty`}
                     icon={Landmark}
                     tone="warning"
                     loading={isLoading}
@@ -358,16 +385,23 @@ export default function NplManagementPage() {
 
             <div className="flex flex-col gap-4">
                 <div className="flex flex-wrap items-center gap-2">
-                    <div className="relative flex-1 min-w-[300px]">
-                        <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-                        <Input
-                            placeholder="Search by ID, name or account..."
-                            value={searchQuery}
-                            onChange={(e) => setSearchQuery(e.target.value)}
-                            className="pl-9"
-                        />
-                    </div>
-                    <Select value={providerFilter} onValueChange={setProviderFilter}>
+                    <SearchInput
+                        className="flex-1 min-w-[300px]"
+                        label="Search NPL borrowers"
+                        placeholder="Search by ID, name or account..."
+                        value={searchQuery}
+                        onChange={(value) => {
+                            setSearchQuery(value);
+                            table.resetPage();
+                        }}
+                    />
+                    <Select
+                        value={providerFilter}
+                        onValueChange={(value) => {
+                            setProviderFilter(value);
+                            table.resetPage();
+                        }}
+                    >
                         <SelectTrigger className="w-[200px]">
                             <SelectValue placeholder="All Providers" />
                         </SelectTrigger>
@@ -396,7 +430,10 @@ export default function NplManagementPage() {
                             placeholder="Min Days Overdue"
                             type="number"
                             value={daysOverdueMin}
-                            onChange={(e) => setDaysOverdueMin(e.target.value)}
+                            onChange={(e) => {
+                                setDaysOverdueMin(e.target.value);
+                                table.resetPage();
+                            }}
                             className="w-[150px]"
                         />
                         <span>-</span>
@@ -404,11 +441,13 @@ export default function NplManagementPage() {
                             placeholder="Max Days Overdue"
                             type="number"
                             value={daysOverdueMax}
-                            onChange={(e) => setDaysOverdueMax(e.target.value)}
+                            onChange={(e) => {
+                                setDaysOverdueMax(e.target.value);
+                                table.resetPage();
+                            }}
                             className="w-[150px]"
                         />
                     </div>
-                    {isLoading && <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />}
                 </div>
 
                 <Card>
@@ -416,135 +455,22 @@ export default function NplManagementPage() {
                         <CardTitle>NPL Borrowers</CardTitle>
                         <CardDescription>This list contains all borrowers who have been flagged due to overdue loans based on their provider's NPL threshold.</CardDescription>
                     </CardHeader>
-                    <CardContent className="p-0">
-                        <div className="rounded-md border overflow-x-auto">
-                            <Table>
-                                <TableHeader className="bg-muted/50">
-                                    <TableRow>
-                                        <TableHead onClick={() => toggleSort('borrowerId')} className="cursor-pointer whitespace-nowrap">
-                                            <div className="flex items-center">Borrower ID {renderSortIcon('borrowerId')}</div>
-                                        </TableHead>
-                                        <TableHead onClick={() => toggleSort('borrowerName')} className="cursor-pointer whitespace-nowrap">
-                                            <div className="flex items-center">Customer Name {renderSortIcon('borrowerName')}</div>
-                                        </TableHead>
-                                        <TableHead onClick={() => toggleSort('accountNumber')} className="cursor-pointer whitespace-nowrap">
-                                            <div className="flex items-center">Account Number {renderSortIcon('accountNumber')}</div>
-                                        </TableHead>
-                                        <TableHead onClick={() => toggleSort('providerName')} className="cursor-pointer whitespace-nowrap">
-                                            <div className="flex items-center">Loan Provider {renderSortIcon('providerName')}</div>
-                                        </TableHead>
-                                        <TableHead onClick={() => toggleSort('daysOverdue')} className="cursor-pointer whitespace-nowrap text-right">
-                                            <div className="flex items-center justify-end">Days Overdue {renderSortIcon('daysOverdue')}</div>
-                                        </TableHead>
-                                        <TableHead onClick={() => toggleSort('principalOutstanding')} className="cursor-pointer whitespace-nowrap text-right">
-                                            <div className="flex items-center justify-end">Principal Outstanding {renderSortIcon('principalOutstanding')}</div>
-                                        </TableHead>
-                                        <TableHead onClick={() => toggleSort('interestOutstanding')} className="cursor-pointer whitespace-nowrap text-right">
-                                            <div className="flex items-center justify-end">Interest Outstanding {renderSortIcon('interestOutstanding')}</div>
-                                        </TableHead>
-                                        <TableHead onClick={() => toggleSort('serviceFeeOutstanding')} className="cursor-pointer whitespace-nowrap text-right">
-                                            <div className="flex items-center justify-end">Service Fee Outstanding {renderSortIcon('serviceFeeOutstanding')}</div>
-                                        </TableHead>
-                                        <TableHead onClick={() => toggleSort('penaltyOutstanding')} className="cursor-pointer whitespace-nowrap text-right">
-                                            <div className="flex items-center justify-end">Penalty Outstanding {renderSortIcon('penaltyOutstanding')}</div>
-                                        </TableHead>
-                                        <TableHead onClick={() => toggleSort('totalOutstanding')} className="cursor-pointer whitespace-nowrap text-right font-bold">
-                                            <div className="flex items-center justify-end">Total Outstanding {renderSortIcon('totalOutstanding')}</div>
-                                        </TableHead>
-                                    </TableRow>
-                                </TableHeader>
-                                <TableBody>
-                                    {isLoading ? (
-                                        <TableRow>
-                                            <TableCell colSpan={10} className="h-24 text-center">
-                                                <Loader2 className="h-6 w-6 animate-spin mx-auto"/>
-                                            </TableCell>
-                                        </TableRow>
-                                    ) : paginatedEntries.length > 0 ? (
-                                        paginatedEntries.map((entry, idx) => (
-                                            <TableRow key={`${entry.borrowerId}-${entry.providerName}-${idx}`}>
-                                                <TableCell className="font-mono text-xs">{entry.borrowerId}</TableCell>
-                                                <TableCell className="font-medium">{entry.borrowerName}</TableCell>
-                                                <TableCell className="font-mono">{entry.accountNumber}</TableCell>
-                                                <TableCell>{entry.providerName}</TableCell>
-                                                <TableCell className="text-right font-mono">{entry.daysOverdue}</TableCell>
-                                                <TableCell className="text-right font-mono">{formatCurrency(entry.principalOutstanding)}</TableCell>
-                                                <TableCell className="text-right font-mono">{formatCurrency(entry.interestOutstanding)}</TableCell>
-                                                <TableCell className="text-right font-mono">{formatCurrency(entry.serviceFeeOutstanding)}</TableCell>
-                                                <TableCell className="text-right font-mono">{formatCurrency(entry.penaltyOutstanding)}</TableCell>
-                                                <TableCell className="text-right font-mono font-bold">{formatCurrency(entry.totalOutstanding)}</TableCell>
-                                            </TableRow>
-                                        ))
-                                    ) : (
-                                        <TableRow>
-                                            <TableCell colSpan={10} className="h-24 text-center">
-                                                No NPL data found matching your filters.
-                                            </TableCell>
-                                        </TableRow>
-                                    )}
-                                </TableBody>
-                            </Table>
-                        </div>
-
-                        {/* Pagination Controls */}
-                        <div className="flex items-center justify-between px-4 py-4 border-t">
-                            <div className="text-sm text-muted-foreground">
-                                Showing {Math.min(sortedEntries.length, (page - 1) * pageSize + 1)} to {Math.min(sortedEntries.length, page * pageSize)} of {sortedEntries.length} entries
-                            </div>
-                            <div className="flex items-center space-x-2">
-                                <Button
-                                    variant="outline"
-                                    size="sm"
-                                    onClick={() => setPage(1)}
-                                    disabled={page === 1}
-                                >
-                                    <ChevronsLeft className="h-4 w-4" />
-                                </Button>
-                                <Button
-                                    variant="outline"
-                                    size="sm"
-                                    onClick={() => setPage(prev => Math.max(1, prev - 1))}
-                                    disabled={page === 1}
-                                >
-                                    <ChevronLeft className="h-4 w-4" />
-                                </Button>
-                                <div className="text-sm font-medium">
-                                    Page {page} of {totalPages}
-                                </div>
-                                <Button
-                                    variant="outline"
-                                    size="sm"
-                                    onClick={() => setPage(prev => Math.min(totalPages, prev + 1))}
-                                    disabled={page === totalPages}
-                                >
-                                    <ChevronRight className="h-4 w-4" />
-                                </Button>
-                                <Button
-                                    variant="outline"
-                                    size="sm"
-                                    onClick={() => setPage(totalPages)}
-                                    disabled={page === totalPages}
-                                >
-                                    <ChevronsRight className="h-4 w-4" />
-                                </Button>
-                                <Select
-                                    value={pageSize.toString()}
-                                    onValueChange={(val) => {
-                                        setPageSize(parseInt(val));
-                                        setPage(1);
-                                    }}
-                                >
-                                    <SelectTrigger className="h-8 w-[70px]">
-                                        <SelectValue placeholder={pageSize.toString()} />
-                                    </SelectTrigger>
-                                    <SelectContent>
-                                        {[10, 20, 50, 100].map(size => (
-                                            <SelectItem key={size} value={size.toString()}>{size}</SelectItem>
-                                        ))}
-                                    </SelectContent>
-                                </Select>
-                            </div>
-                        </div>
+                    <CardContent>
+                        <DataTable
+                            caption="NPL borrowers"
+                            columns={columns}
+                            rows={table.rows}
+                            rowKey={(entry, idx) => `${entry.borrowerId}-${entry.providerName}-${idx}`}
+                            isLoading={isLoading && entries.length === 0}
+                            isFetching={isLoading}
+                            error={loadError}
+                            onRetry={() => void fetchBorrowers()}
+                            emptyMessage="No NPL data found matching your filters."
+                            sort={table.sort}
+                            onSortChange={table.onSortChange}
+                            paging={table.paging}
+                            footerLabel={isFiltered ? 'Total (filtered)' : 'Total'}
+                        />
                     </CardContent>
                 </Card>
             </div>

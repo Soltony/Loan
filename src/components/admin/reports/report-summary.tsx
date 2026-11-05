@@ -4,7 +4,7 @@ import { AlarmClock, Banknote, HandCoins, ShieldAlert, Wallet } from 'lucide-rea
 import { StatTile } from '@/components/ui/stat-tile';
 import { cn } from '@/lib/utils';
 import { useReportQuery } from './hooks/use-report-query';
-import { formatCompact, formatCount, formatMoney } from './lib/format';
+import { formatCompact, formatCount, formatMoney } from '../data-table';
 import { periodLabel, reportUrl, scopeParams, type ReportFilters } from './lib/report-filters';
 import { NPL_CLASSES, type OverviewSummary } from './types';
 

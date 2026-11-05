@@ -5,7 +5,7 @@ import { Check, Copy } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { cn } from '@/lib/utils';
-import { formatMoney } from './lib/format';
+import { formatDateTime, formatMoney, formatRelative } from './format';
 
 /** A borrower: name, then phone and bank account in full. */
 export function BorrowerCell({
@@ -98,6 +98,69 @@ export function TxnStatusBadge({ status }: { status: string | null | undefined }
     >
       {status}
     </Badge>
+  );
+}
+
+export type StatusTone = 'success' | 'warning' | 'danger' | 'info' | 'neutral';
+
+const TONE_WORDS: Array<[StatusTone, RegExp]> = [
+  ['danger', /\b(reject|rejected|fail|failed|failure|error|declined|overdue|defaulted|loss|blocked|locked|inactive|cancel+ed|reversed|npl)\b/],
+  ['warning', /\b(pending|processing|sent|submitted|awaiting|review|requested|queued|retry|retrying|partial)\b/],
+  ['success', /\b(approved|success|successful|succeeded|paid|completed|complete|active|resolved|posted|disbursed|delivered|done|settled|closed)\b/],
+];
+
+const TONE_CLASSES: Record<StatusTone, string> = {
+  success: 'border-transparent bg-emerald-100 text-emerald-800 hover:bg-emerald-100 dark:bg-emerald-500/15 dark:text-emerald-300',
+  warning: 'border-transparent bg-amber-100 text-amber-900 hover:bg-amber-100 dark:bg-amber-500/15 dark:text-amber-300',
+  danger: 'border-transparent bg-red-100 text-red-800 hover:bg-red-100 dark:bg-red-500/15 dark:text-red-300',
+  info: 'border-transparent bg-sky-100 text-sky-800 hover:bg-sky-100 dark:bg-sky-500/15 dark:text-sky-300',
+  neutral: '',
+};
+
+/** The tone a status word reads as (PENDING_APPROVAL → warning, FAILED → danger, …). */
+export function statusTone(status: string): StatusTone {
+  const words = status.toLowerCase().replace(/[^a-z]+/g, ' ');
+  return TONE_WORDS.find(([, pattern]) => pattern.test(words))?.[0] ?? 'neutral';
+}
+
+/**
+ * Any status, coloured by what it says: approved/paid/success green,
+ * pending/processing amber, rejected/failed red, anything else plain.
+ * `PENDING_APPROVAL` reads as "Pending approval".
+ */
+export function StatusBadge({
+  status,
+  tone,
+  label,
+}: {
+  status: string | null | undefined;
+  tone?: StatusTone;
+  /** Shown instead of the status itself. */
+  label?: string;
+}) {
+  if (!status) return <span className="text-muted-foreground">—</span>;
+  const resolved = tone ?? statusTone(status);
+  const text =
+    label ??
+    (/^[A-Z0-9_]+$/.test(status)
+      ? status.charAt(0) + status.slice(1).toLowerCase().replace(/_/g, ' ')
+      : status);
+  return (
+    <Badge variant={resolved === 'neutral' ? 'secondary' : 'outline'} className={cn('whitespace-nowrap', TONE_CLASSES[resolved])}>
+      {text}
+    </Badge>
+  );
+}
+
+/** A date and time on the user's calendar, with how long ago it was underneath. */
+export function DateTimeCell({ value, relative = true }: { value: string | Date | null | undefined; relative?: boolean }) {
+  const text = formatDateTime(value);
+  if (!text) return <span className="text-muted-foreground">—</span>;
+  return (
+    <div className="whitespace-nowrap">
+      <div className="tabular-nums">{text}</div>
+      {relative ? <div className="text-xs text-muted-foreground">{formatRelative(value)}</div> : null}
+    </div>
   );
 }
 

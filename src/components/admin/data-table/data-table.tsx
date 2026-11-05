@@ -1,5 +1,6 @@
 'use client';
 
+import type React from 'react';
 import type { ReactNode } from 'react';
 import {
   ArrowDown,
@@ -16,15 +17,23 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Skeleton } from '@/components/ui/skeleton';
 import { TableBody, TableCell, TableFooter, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { cn } from '@/lib/utils';
-import { PAGE_SIZES } from './lib/report-filters';
-import type { TableSort } from './types';
 
-export interface ReportColumn<T> {
+export type SortDir = 'asc' | 'desc';
+
+export interface TableSort {
+  by: string;
+  dir: SortDir;
+}
+
+/** Rows-per-page choices, unless a table's paging names its own. */
+export const PAGE_SIZES = [25, 50, 100, 200];
+
+export interface DataTableColumn<T> {
   id: string;
   header: ReactNode;
   cell: (row: T) => ReactNode;
   align?: 'right' | 'center';
-  /** The report route's sort key; unset = not sortable. */
+  /** The key the rows are sorted by (server sort key, or a useClientTable sorter); unset = not sortable. */
   sortKey?: string;
   /** This column's cell in the totals row. */
   footer?: ReactNode;
@@ -33,17 +42,20 @@ export interface ReportColumn<T> {
   className?: string;
 }
 
-export interface ReportPaging {
+export interface DataTablePaging {
   page: number;
   pageSize: number;
   total: number;
   totalPages: number;
   onPageChange: (page: number) => void;
+  /** Unset: the page size is fixed (no rows-per-page picker). */
   onPageSizeChange?: (pageSize: number) => void;
+  /** Rows-per-page choices; PAGE_SIZES by default. */
+  pageSizes?: number[];
 }
 
-export interface ReportTableProps<T> {
-  columns: ReportColumn<T>[];
+export interface DataTableProps<T> {
+  columns: DataTableColumn<T>[];
   rows: T[] | undefined;
   rowKey: (row: T, index: number) => string;
   /** Nothing loaded yet. */
@@ -57,11 +69,16 @@ export interface ReportTableProps<T> {
   sort?: TableSort;
   onSortChange?: (sort: TableSort) => void;
   /** Server paging; unset = every row is on screen. */
-  paging?: ReportPaging;
+  paging?: DataTablePaging;
   /** First cell of the totals row, unless that column has its own total. */
   footerLabel?: ReactNode;
   /** Controls above the table (filters). */
   toolbar?: ReactNode;
+  /** Opens a row (click or Enter); the row reads as a link. */
+  onRowClick?: (row: T) => void;
+  rowClassName?: (row: T) => string | undefined;
+  /** Height of the scrolling area; '60vh' by default. */
+  maxHeight?: string;
   caption: string;
 }
 
@@ -76,7 +93,7 @@ function SortableHead<T>({
   sort,
   onSortChange,
 }: {
-  column: ReportColumn<T>;
+  column: DataTableColumn<T>;
   sort?: TableSort;
   onSortChange?: (sort: TableSort) => void;
 }) {
@@ -118,7 +135,7 @@ function SortableHead<T>({
   );
 }
 
-function Pagination({ paging }: { paging: ReportPaging }) {
+function Pagination({ paging }: { paging: DataTablePaging }) {
   const { page, pageSize, total } = paging;
   const totalPages = Math.max(1, paging.totalPages);
   const first = (page - 1) * pageSize + 1;
@@ -137,7 +154,7 @@ function Pagination({ paging }: { paging: ReportPaging }) {
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                {PAGE_SIZES.map((size) => (
+                {(paging.pageSizes ?? PAGE_SIZES).map((size) => (
                   <SelectItem key={size} value={String(size)}>
                     {size}
                   </SelectItem>
@@ -197,11 +214,12 @@ function Pagination({ paging }: { paging: ReportPaging }) {
 }
 
 /**
- * A report table: one scrolling area with a sticky header and totals row,
+ * The admin table: one scrolling area with a sticky header and totals row,
  * paging below it (always in view), and loading, empty, error and refreshing
- * states.
+ * states. Sorting and paging are the caller's: a report route's (server) or
+ * useClientTable's (rows already in memory).
  */
-export function ReportTable<T>({
+export function DataTable<T>({
   columns,
   rows,
   rowKey,
@@ -215,8 +233,11 @@ export function ReportTable<T>({
   paging,
   footerLabel,
   toolbar,
+  onRowClick,
+  rowClassName,
+  maxHeight = '60vh',
   caption,
-}: ReportTableProps<T>) {
+}: DataTableProps<T>) {
   const hasRows = !!rows && rows.length > 0;
   const refreshing = isFetching && hasRows;
   const showFooter = hasRows && columns.some((c) => c.footer !== undefined);
@@ -255,7 +276,21 @@ export function ReportTable<T>({
     );
   } else {
     body = rows.map((row, index) => (
-      <TableRow key={rowKey(row, index)}>
+      <TableRow
+        key={rowKey(row, index)}
+        className={cn(onRowClick && 'cursor-pointer focus-visible:bg-muted/50 focus-visible:outline-none', rowClassName?.(row))}
+        {...(onRowClick && {
+          tabIndex: 0,
+          onClick: (event: React.MouseEvent) => {
+            // Buttons, links and inputs inside the row do their own thing.
+            if ((event.target as HTMLElement).closest('button, a, input, select, textarea, [role="checkbox"]')) return;
+            onRowClick(row);
+          },
+          onKeyDown: (event: React.KeyboardEvent) => {
+            if (event.key === 'Enter' && event.target === event.currentTarget) onRowClick(row);
+          },
+        })}
+      >
         {columns.map((c) => (
           <TableCell key={c.id} className={cn('py-3', c.align && ALIGN[c.align], c.className)}>
             {c.cell(row)}
@@ -279,7 +314,7 @@ export function ReportTable<T>({
         </div>
       ) : null}
       <div className="overflow-hidden rounded-md border bg-card">
-        <div className="relative max-h-[60vh] overflow-auto">
+        <div className="relative overflow-auto" style={{ maxHeight }}>
           <table
             className={cn('w-full caption-bottom text-sm transition-opacity', refreshing && 'opacity-60')}
             aria-busy={isFetching}

@@ -34,7 +34,7 @@ import { Button } from "@/components/ui/button";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { cn } from "@/lib/utils";
 import { useReportQuery } from "../hooks/use-report-query";
-import { formatCompact, formatCount, formatMoney } from "../lib/format";
+import { formatCompact, formatCount, formatMoney } from '../../data-table';
 import { periodLabel, reportUrl, scopeParams, type ReportFilters } from "../lib/report-filters";
 import type { OverviewData } from "../types";
 

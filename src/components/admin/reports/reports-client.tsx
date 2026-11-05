@@ -1,13 +1,13 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Loader2, Search, X } from 'lucide-react';
+import { useCallback, useMemo, useState } from 'react';
+import { Loader2 } from 'lucide-react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { Input } from '@/components/ui/input';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import { useAuth } from '@/hooks/use-auth';
 import type { LoanProvider } from '@/lib/types';
+import { SearchInput } from '../data-table';
 import { useReportExport } from '../report-export-provider';
 import { ExportDialog } from './export-dialog';
 import { useReportFilters } from './hooks/use-report-filters';
@@ -24,67 +24,6 @@ import { useProviderSummaries } from './tabs/provider-summaries';
 import { ProviderLoansTab } from './tabs/provider-loans-tab';
 import type { ReportTabProps } from './tabs/tab-props';
 import { DisbursementsTab, RepaymentsTab } from './tabs/transaction-tabs';
-
-/** The search box: typed text reaches the filters 300 ms after the last keystroke. */
-function ReportSearch({
-  value,
-  onChange,
-  placeholder,
-  disabled,
-}: {
-  value: string;
-  onChange: (search: string) => void;
-  placeholder: string;
-  disabled: boolean;
-}) {
-  const [text, setText] = useState(value);
-  // The last value handed to the filters: a different `value` comes from elsewhere (a link).
-  const sent = useRef(value);
-  useEffect(() => {
-    if (value !== sent.current) {
-      sent.current = value;
-      setText(value);
-    }
-  }, [value]);
-  useEffect(() => {
-    const next = text.trim();
-    if (next === sent.current) return;
-    const timer = setTimeout(() => {
-      sent.current = next;
-      onChange(next);
-    }, 300);
-    return () => clearTimeout(timer);
-  }, [text, onChange]);
-
-  return (
-    <div className="relative w-full max-w-md">
-      <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-      <Input
-        type="text"
-        aria-label="Search reports"
-        placeholder={placeholder}
-        value={disabled ? '' : text}
-        disabled={disabled}
-        onChange={(e) => setText(e.target.value)}
-        className="pl-9 pr-9"
-      />
-      {text && !disabled ? (
-        <button
-          type="button"
-          aria-label="Clear search"
-          className="absolute right-2 top-1/2 -translate-y-1/2 rounded-sm p-1 text-muted-foreground hover:text-foreground"
-          onClick={() => {
-            setText('');
-            sent.current = '';
-            onChange('');
-          }}
-        >
-          <X className="h-4 w-4" />
-        </button>
-      ) : null}
-    </div>
-  );
-}
 
 /** The tabs that read the provider summaries ask for them only while they are open. */
 function UtilizationPanel({ providers, filters }: { providers: LoanProvider[]; filters: ReportFilters }) {
@@ -200,7 +139,8 @@ export function ReportsClient({ providers }: { providers: LoanProvider[] }) {
         {tab !== 'overview' ? (
           <>
             <ReportSummary filters={view} />
-            <ReportSearch
+            <SearchInput
+              label="Search reports"
               value={view.search}
               onChange={onSearch}
               placeholder={searchPlaceholder ?? 'Search is not available for this report'}

@@ -1,6 +1,6 @@
 import type { UpdateFilters } from '../hooks/use-report-filters';
 import type { ReportFilters } from '../lib/report-filters';
-import type { ReportPaging } from '../report-table';
+import type { DataTablePaging } from '../../data-table';
 import type { TableSort } from '../types';
 
 export interface ReportTabProps {
@@ -12,7 +12,7 @@ export interface ReportTabProps {
 export function tabPaging(
   data: { total: number; totalPages: number } | undefined,
   { filters, update }: ReportTabProps,
-): ReportPaging | undefined {
+): DataTablePaging | undefined {
   if (!data) return undefined;
   return {
     page: filters.page,
