@@ -27,7 +27,10 @@ export async function getUserFromSession(options?: { allowRefresh?: boolean }): 
       where: { id: session.userId },
       include: {
         role: true,
-        loanProvider: true,
+        // Only what the session needs (providerName). The whole row carries the
+        // provider's ~300 KB icon, read on every request and sent to the browser
+        // with the signed-in user.
+        loanProvider: { select: { id: true, name: true } },
       },
     });
 
@@ -66,7 +69,7 @@ export async function getUserFromSession(options?: { allowRefresh?: boolean }): 
 
         const user = await prisma.user.findUnique({
           where: { id: session.userId },
-          include: { role: true, loanProvider: true },
+          include: { role: true, loanProvider: { select: { id: true, name: true } } },
         });
         if (!user) return null;
         if (user.status === 'Inactive') return null;

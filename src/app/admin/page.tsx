@@ -1,7 +1,7 @@
 
 import { DashboardClient } from '@/components/admin/dashboard-client';
 import { getUserFromSession } from '@/lib/user';
-import { getDashboardData, parseDashboardPeriod, parseDashboardDay } from './dashboard/page';
+import { getDashboardData, parseDashboardPeriod, parseDashboardDay } from '@/lib/dashboard-data';
 import { redirect } from 'next/navigation';
 import { allMenuItems, menuPermissionKey } from '@/lib/menu-items';
 import { parseBranchCodeQueryParam } from '@/lib/branch-filter';

@@ -39,13 +39,17 @@ export default function AdminLoginPage() {
     setError(null);
     setLockSeconds(0);
     try {
+      // login() also loads the signed-in user into the auth context.
       await login(phoneNumber, password);
-      router.push('/admin');
-      router.refresh(); // This is important to re-fetch server-side data
       toast({
         title: 'Login Successful',
         description: 'Welcome back!',
       });
+      // One navigation, so the dashboard renders once. A router.refresh() here
+      // was queued behind the navigation and rendered /admin — every dashboard
+      // query — a second time on each sign-in. Replace: Back should not return
+      // to the login form.
+      router.replace('/admin');
     } catch (err: any) {
       // Show server message as-is to avoid duplicated attempt/delay info.
       const delay = typeof err.retryAfter === 'number'

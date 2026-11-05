@@ -1,7 +1,33 @@
-import type { PrismaClient } from '@prisma/client';
+import type { Prisma, PrismaClient } from '@prisma/client';
 import { calculateOutstandingBreakdown } from './loan-calculator';
 import { addAmounts, zeroAmounts, type ReconciledAmounts } from './repayment-reconciliation';
 import { reconcileRepaymentsForLoans } from './repayment-reconciliation-data';
+import { scopeChunks } from './reports/scope';
+
+/**
+ * The loans a dashboard view covers. Every query below filters through the
+ * loan relation (a join) instead of passing loan ids: an `IN` list of a few
+ * thousand ids is a statement SQL Server takes about a second to run, and the
+ * old id-batched reads made the dashboard take ~14 s to appear after sign-in.
+ * Borrower scopes (Branch/District) still go in `IN`-sized chunks.
+ */
+export interface DashboardLoanScope {
+  providerId?: string;
+  /** null/undefined = no borrower restriction; [] = no borrowers in scope. */
+  borrowerIds?: string[] | null;
+  /** Only loans disbursed inside this window. */
+  disbursedRange?: { gte: Date; lte: Date } | null;
+}
+
+/** Non-reversed loans of the scope, for one chunk of its borrowers. */
+function liveLoanWhere(scope: DashboardLoanScope, borrowerIds: string[] | null): Prisma.LoanWhereInput {
+  return {
+    repaymentStatus: { not: 'REVERSED' },
+    ...(scope.providerId ? { product: { providerId: scope.providerId } } : {}),
+    ...(borrowerIds ? { borrowerId: { in: borrowerIds } } : {}),
+    ...(scope.disbursedRange ? { disbursedDate: scope.disbursedRange } : {}),
+  };
+}
 
 const CATEGORIES = ['Principal', 'Interest', 'ServiceFee', 'Penalty', 'Tax'] as const;
 type Category = (typeof CATEGORIES)[number];
@@ -51,23 +77,53 @@ export async function getPortfolioLedgerMetrics(
     tax: number;
   };
 }> {
-  const activeLoans = await prisma.loan.findMany({
+  const scope: DashboardLoanScope = { providerId, borrowerIds, disbursedRange };
+  const accounts = await prisma.ledgerAccount.findMany({
     where: {
-      repaymentStatus: { not: 'REVERSED' },
-      ...(providerId ? { product: { providerId } } : {}),
-      ...(borrowerIds ? { borrowerId: { in: borrowerIds } } : {}),
-      ...(disbursedRange ? { disbursedDate: disbursedRange } : {}),
+      category: { in: [...CATEGORIES] },
+      type: { in: ['Receivable', 'Received'] },
+      ...(providerId ? { providerId } : {}),
     },
-    select: { id: true, loanAmount: true },
+    select: { id: true, type: true, category: true, name: true, balance: true },
   });
+  const accountById = new Map(accounts.map((a) => [a.id, a]));
+  const accountIds = accounts.map((a) => a.id);
 
-  const loanIds = activeLoans.map((l) => l.id);
-  const totalDisbursed = activeLoans.reduce((sum, l) => sum + l.loanAmount, 0);
-
+  // Loans and their ledger entries summed in the database, one statement each
+  // per borrower chunk: per account and Debit/Credit, not entry by entry.
+  let totalDisbursed = 0;
+  let loanCount = 0;
   const receivableNet = emptyCategoryAmounts();
   const receivedNet = emptyCategoryAmounts();
+  for (const chunk of scopeChunks(borrowerIds ?? null)) {
+    const where = liveLoanWhere(scope, chunk);
+    const [loans, grouped] = await Promise.all([
+      prisma.loan.aggregate({ _sum: { loanAmount: true }, _count: { _all: true }, where }),
+      accountIds.length > 0
+        ? prisma.ledgerEntry.groupBy({
+            by: ['ledgerAccountId', 'type'],
+            where: { ledgerAccountId: { in: accountIds }, journalEntry: { loan: { is: where } } },
+            _sum: { amount: true },
+          })
+        : Promise.resolve([]),
+    ]);
+    totalDisbursed += loans._sum.loanAmount ?? 0;
+    loanCount += loans._count._all;
+    for (const group of grouped) {
+      const account = accountById.get(group.ledgerAccountId);
+      if (!account) continue;
+      const amount = group._sum.amount ?? 0;
+      const signed = group.type === 'Debit' ? amount : -amount;
+      const key = categoryKey(account.category);
+      if (account.type === 'Receivable') {
+        receivableNet[key] += signed;
+      } else {
+        receivedNet[key] += signed;
+      }
+    }
+  }
 
-  if (loanIds.length === 0) {
+  if (loanCount === 0) {
     return {
       totalDisbursed: 0,
       receivables: {
@@ -87,15 +143,6 @@ export async function getPortfolioLedgerMetrics(
     };
   }
 
-  const accounts = await prisma.ledgerAccount.findMany({
-    where: {
-      category: { in: [...CATEGORIES] },
-      type: { in: ['Receivable', 'Received'] },
-      ...(providerId ? { providerId } : {}),
-    },
-    select: { id: true, type: true, category: true, name: true, balance: true },
-  });
-
   if (accounts.length === 0) {
     return {
       totalDisbursed,
@@ -114,36 +161,6 @@ export async function getPortfolioLedgerMetrics(
         tax: 0,
       },
     };
-  }
-
-  const accountById = new Map(accounts.map((a) => [a.id, a]));
-  const accountIds = accounts.map((a) => a.id);
-
-  // SQL Server caps ~2100 parameters per query; batch loan IDs.
-  const LOAN_ID_BATCH = 500;
-  const entries: { amount: number; type: string; ledgerAccountId: string }[] = [];
-  for (let i = 0; i < loanIds.length; i += LOAN_ID_BATCH) {
-    const batch = loanIds.slice(i, i + LOAN_ID_BATCH);
-    const batchEntries = await prisma.ledgerEntry.findMany({
-      where: {
-        ledgerAccountId: { in: accountIds },
-        journalEntry: { loanId: { in: batch } },
-      },
-      select: { amount: true, type: true, ledgerAccountId: true },
-    });
-    entries.push(...batchEntries);
-  }
-
-  for (const entry of entries) {
-    const account = accountById.get(entry.ledgerAccountId);
-    if (!account) continue;
-    const signed = entry.type === 'Debit' ? entry.amount : -entry.amount;
-    const key = categoryKey(account.category);
-    if (account.type === 'Receivable') {
-      receivableNet[key] += signed;
-    } else {
-      receivedNet[key] += signed;
-    }
   }
 
   const clampReceivable = (value: number) => Math.max(0, value);
@@ -182,9 +199,22 @@ export async function getPortfolioLedgerMetrics(
   };
 }
 
+export interface OpenLoan {
+  id: string;
+  productId: string;
+  providerId: string;
+  dueDate: Date;
+  /** What the loan still owes in all. */
+  outstanding: number;
+  principal: number;
+  interest: number;
+  serviceFee: number;
+  penalty: number;
+}
+
 export interface OpenLoanOutstanding {
   /** Loans that still owe something (outstanding > 0.01), in scope. */
-  loans: { id: string; productId: string; dueDate: Date; outstanding: number }[];
+  loans: OpenLoan[];
   receivables: {
     principal: number;
     interest: number;
@@ -192,6 +222,51 @@ export interface OpenLoanOutstanding {
     penalty: number;
   };
   total: number;
+}
+
+function sumOpenLoans(loans: OpenLoan[]): OpenLoanOutstanding {
+  const result: OpenLoanOutstanding = {
+    loans,
+    receivables: { principal: 0, interest: 0, serviceFee: 0, penalty: 0 },
+    total: 0,
+  };
+  for (const loan of loans) {
+    result.receivables.principal += loan.principal;
+    result.receivables.interest += loan.interest;
+    result.receivables.serviceFee += loan.serviceFee;
+    result.receivables.penalty += loan.penalty;
+    result.total += loan.outstanding;
+  }
+  return result;
+}
+
+/** One provider's share of an all-provider result, without asking the database again. */
+export function narrowOpenLoans(open: OpenLoanOutstanding, providerId: string): OpenLoanOutstanding {
+  return sumOpenLoans(open.loans.filter((loan) => loan.providerId === providerId));
+}
+
+/** The product terms the loan calculator reads. */
+const PRODUCT_TERMS = {
+  id: true,
+  providerId: true,
+  duration: true,
+  serviceFee: true,
+  serviceFeeEnabled: true,
+  dailyFee: true,
+  dailyFeeEnabled: true,
+  penaltyRules: true,
+  penaltyRulesEnabled: true,
+  penaltyPerInstallment: true,
+} as const;
+
+function groupByLoan<T extends { loanId: string }>(rows: T[]): Map<string, T[]> {
+  const byLoan = new Map<string, T[]>();
+  for (const row of rows) {
+    const list = byLoan.get(row.loanId);
+    if (list) list.push(row);
+    else byLoan.set(row.loanId, [row]);
+  }
+  return byLoan;
 }
 
 /**
@@ -206,58 +281,64 @@ export interface OpenLoanOutstanding {
  */
 export async function getOpenLoanOutstanding(
   prisma: PrismaClient,
-  scope: {
-    providerId?: string;
-    borrowerIds?: string[] | null;
-    disbursedRange?: { gte: Date; lte: Date } | null;
-  },
+  scope: DashboardLoanScope,
   asOf: Date = new Date(),
 ): Promise<OpenLoanOutstanding> {
-  const [loans, taxConfigs] = await Promise.all([
-    prisma.loan.findMany({
-      where: {
-        repaymentStatus: 'Unpaid',
-        ...(scope.providerId ? { product: { providerId: scope.providerId } } : {}),
-        ...(scope.borrowerIds ? { borrowerId: { in: scope.borrowerIds } } : {}),
-        ...(scope.disbursedRange ? { disbursedDate: scope.disbursedRange } : {}),
-      },
-      include: {
-        payments: { select: { amount: true, date: true } },
-        installments: true,
-        product: {
-          select: {
-            duration: true,
-            serviceFee: true,
-            serviceFeeEnabled: true,
-            dailyFee: true,
-            dailyFeeEnabled: true,
-            penaltyRules: true,
-            penaltyRulesEnabled: true,
-            penaltyPerInstallment: true,
-          },
-        },
-      },
-    }),
+  const [taxConfigs, products] = await Promise.all([
     // Same tax set the loans report uses.
     prisma.tax.findMany(),
+    // Once per product, not copied into every loan row.
+    prisma.loanProduct.findMany({ select: PRODUCT_TERMS }),
   ]);
+  const productById = new Map(products.map((p) => [p.id, p]));
 
-  const result: OpenLoanOutstanding = {
-    loans: [],
-    receivables: { principal: 0, interest: 0, serviceFee: 0, penalty: 0 },
-    total: 0,
-  };
-  for (const loan of loans) {
-    const owed = calculateOutstandingBreakdown(loan as any, loan.product as any, taxConfigs as any, asOf);
-    if (owed.total <= 0.01) continue;
-    result.loans.push({ id: loan.id, productId: loan.productId, dueDate: loan.dueDate, outstanding: owed.total });
-    result.receivables.principal += owed.principal;
-    result.receivables.interest += owed.interest;
-    result.receivables.serviceFee += owed.serviceFee;
-    result.receivables.penalty += owed.penalty;
-    result.total += owed.total;
+  const open: OpenLoan[] = [];
+  for (const chunk of scopeChunks(scope.borrowerIds ?? null)) {
+    const where: Prisma.LoanWhereInput = {
+      repaymentStatus: 'Unpaid',
+      ...(scope.providerId ? { product: { providerId: scope.providerId } } : {}),
+      ...(chunk ? { borrowerId: { in: chunk } } : {}),
+      ...(scope.disbursedRange ? { disbursedDate: scope.disbursedRange } : {}),
+    };
+    // Three flat reads joined through the loan relation. An `include` would
+    // fetch payments and installments with `loanId IN (…)` lists of up to
+    // ~2,000 ids per statement: about 3 s for the open book, against 0.2 s.
+    const [loans, payments, installments] = await Promise.all([
+      prisma.loan.findMany({ where }),
+      prisma.payment.findMany({ where: { loan: where }, select: { loanId: true, amount: true, date: true } }),
+      prisma.loanInstallment.findMany({ where: { loan: where } }),
+    ]);
+    const paymentsOf = groupByLoan(payments);
+    const installmentsOf = groupByLoan(installments);
+
+    for (const loan of loans) {
+      const product = productById.get(loan.productId);
+      if (!product) continue;
+      const owed = calculateOutstandingBreakdown(
+        {
+          ...loan,
+          payments: paymentsOf.get(loan.id) ?? [],
+          installments: installmentsOf.get(loan.id) ?? [],
+        } as unknown as Parameters<typeof calculateOutstandingBreakdown>[0],
+        product as unknown as Parameters<typeof calculateOutstandingBreakdown>[1],
+        taxConfigs as unknown as Parameters<typeof calculateOutstandingBreakdown>[2],
+        asOf,
+      );
+      if (owed.total <= 0.01) continue;
+      open.push({
+        id: loan.id,
+        productId: loan.productId,
+        providerId: product.providerId,
+        dueDate: loan.dueDate,
+        outstanding: owed.total,
+        principal: owed.principal,
+        interest: owed.interest,
+        serviceFee: owed.serviceFee,
+        penalty: owed.penalty,
+      });
+    }
   }
-  return result;
+  return sumOpenLoans(open);
 }
 
 /**
@@ -283,17 +364,16 @@ export async function sumReconciledCollections(
 }
 
 /**
- * Accrued income (Interest / ServiceFee / Penalty) attributable to a set of
- * loans, summed from `Income`-type ledger entries — the loan-scoped equivalent
- * of the dashboard's account-balance income card. Used for Branch/District
- * dashboards. Empty `loanIds` returns zeros.
+ * Accrued income (Interest / ServiceFee / Penalty) attributable to the loans of
+ * a scope, summed from `Income`-type ledger entries — the loan-scoped
+ * equivalent of the dashboard's account-balance income card. Used for
+ * Branch/District and date-scoped dashboards. No loans in scope gives zeros.
  */
-export async function getIncomeForLoanIds(
+export async function getIncomeForLoanScope(
   prisma: PrismaClient,
-  loanIds: string[],
+  scope: DashboardLoanScope,
 ): Promise<{ interest: number; serviceFee: number; penalty: number }> {
   const zero = { interest: 0, serviceFee: 0, penalty: 0 };
-  if (loanIds.length === 0) return zero;
 
   const accounts = await prisma.ledgerAccount.findMany({
     where: { type: 'Income', category: { in: ['Interest', 'ServiceFee', 'Penalty'] } },
@@ -305,14 +385,12 @@ export async function getIncomeForLoanIds(
   const accountIds = accounts.map((a) => a.id);
   const sums = { interest: 0, serviceFee: 0, penalty: 0 };
 
-  const LOAN_ID_BATCH = 500;
-  for (let i = 0; i < loanIds.length; i += LOAN_ID_BATCH) {
-    const batch = loanIds.slice(i, i + LOAN_ID_BATCH);
+  for (const chunk of scopeChunks(scope.borrowerIds ?? null)) {
     const grouped = await prisma.ledgerEntry.groupBy({
       by: ['ledgerAccountId'],
       where: {
         ledgerAccountId: { in: accountIds },
-        journalEntry: { loanId: { in: batch } },
+        journalEntry: { loan: { is: liveLoanWhere(scope, chunk) } },
       },
       _sum: { amount: true },
     });

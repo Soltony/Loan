@@ -88,7 +88,7 @@ export function getEffectiveBranchCodes(
 }
 
 /** Recursively find a `Branchcode`/`branchcode` key (it lives under `detail` in CBS payloads). */
-function extractBranchCode(value: unknown): number | null {
+export function extractBranchCode(value: unknown): number | null {
   if (value == null || typeof value !== 'object') return null;
   for (const [key, v] of Object.entries(value as Record<string, unknown>)) {
     if (key.toLowerCase() === 'branchcode') {
@@ -106,41 +106,72 @@ export async function getBorrowerIdsForBranchCode(branchCode: number): Promise<s
   return getBorrowerIdsForBranchCodes([branchCode]);
 }
 
-export async function getBorrowerIdsForBranchCodes(branchCodes: number[]): Promise<string[]> {
-  if (branchCodes.length === 0) return [];
+/**
+ * The branch code at the start of a `"branchcode": <code>` snippet (any key
+ * casing, number or quoted). Exact: `"Branchcode":409` is 409, never 4.
+ */
+export function branchCodeFromSnippet(snippet: string | null | undefined): number | null {
+  const match = /^"branchcode"\s*:\s*"?\s*(\d+)/i.exec(snippet ?? '');
+  if (!match) return null;
+  const n = Number.parseInt(match[1], 10);
+  return Number.isFinite(n) ? n : null;
+}
 
-  // `contains` is only a prefilter: '"Branchcode":4' also matches 40, 409, ...
-  // so every candidate row is re-checked against the parsed JSON below.
-  const patterns = branchCodes.flatMap((branchCode) => [
-    `"Branchcode":${branchCode}`,
-    `"Branchcode": ${branchCode}`,
-    `"branchcode":${branchCode}`,
-    `"branchcode": ${branchCode}`,
-    `"Branchcode":"${branchCode}"`,
-    `"Branchcode": "${branchCode}"`,
-    `"branchcode":"${branchCode}"`,
-    `"branchcode": "${branchCode}"`,
-  ]);
+/**
+ * Each provisioned-data row that names a branch, as `"branchcode": <code>…` —
+ * the first `"branchcode"` key in the JSON text, which is the first one
+ * extractBranchCode meets walking the object. One scan of the table, and only
+ * a few dozen characters per row come back instead of the whole JSON.
+ *
+ * It replaces eight `LIKE '%…%'` patterns per branch code ORed together: each
+ * pattern rescans every JSON blob, which took 16 s for a District user with
+ * five branches (3 s for one branch) on every page they opened, the dashboard
+ * after sign-in first. The explicit CI collation keeps the key match
+ * case-insensitive on any database collation.
+ */
+async function branchSnippets(): Promise<Array<{ borrowerId: string; snippet: string | null }>> {
+  return prisma.$queryRaw<Array<{ borrowerId: string; snippet: string | null }>>`
+    SELECT [borrowerId],
+           SUBSTRING([data], CHARINDEX(N'"branchcode"', [data] COLLATE Latin1_General_CI_AS), 64) AS [snippet]
+    FROM [dbo].[ProvisionedData]
+    WHERE CHARINDEX(N'"branchcode"', [data] COLLATE Latin1_General_CI_AS) > 0`;
+}
 
-  const rows = await prisma.provisionedData.findMany({
-    where: { OR: patterns.map((p) => ({ data: { contains: p } })) },
-    select: { borrowerId: true, data: true },
-  });
-
+async function loadBorrowerIdsForBranchCodes(branchCodes: number[]): Promise<string[]> {
   const wanted = new Set(branchCodes);
   const borrowerIds = new Set<string>();
-  for (const row of rows) {
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(row.data);
-    } catch {
-      continue;
-    }
-    const code = extractBranchCode(parsed);
+  for (const row of await branchSnippets()) {
+    const code = branchCodeFromSnippet(row.snippet);
     if (code != null && wanted.has(code)) borrowerIds.add(row.borrowerId);
   }
-
   return [...borrowerIds];
+}
+
+/**
+ * Branch scopes are read on every request a Branch/District user makes (the
+ * reports screen alone sends two or three at once), and change only when
+ * customer data is re-fetched, so each set of codes is kept briefly. A
+ * request in flight is shared, not repeated.
+ */
+const BRANCH_SCOPE_TTL_MS = 60_000;
+const branchScopeCache = new Map<string, { at: number; borrowerIds: Promise<string[]> }>();
+
+export async function getBorrowerIdsForBranchCodes(branchCodes: number[]): Promise<string[]> {
+  if (branchCodes.length === 0) return [];
+  const key = [...new Set(branchCodes)].sort((a, b) => a - b).join(',');
+  const now = Date.now();
+  let entry = branchScopeCache.get(key);
+  if (!entry || now - entry.at >= BRANCH_SCOPE_TTL_MS) {
+    const borrowerIds = loadBorrowerIdsForBranchCodes(branchCodes);
+    entry = { at: now, borrowerIds };
+    branchScopeCache.set(key, entry);
+    // A failed read is not kept.
+    borrowerIds.catch(() => {
+      if (branchScopeCache.get(key)?.borrowerIds === borrowerIds) branchScopeCache.delete(key);
+    });
+  }
+  // Callers get their own copy of the list.
+  return [...(await entry.borrowerIds)];
 }
 
 function intersectBorrowerIds(existing: string[], branchBorrowerIds: string[]): string[] {

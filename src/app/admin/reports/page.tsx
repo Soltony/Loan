@@ -7,23 +7,25 @@ import { requireServerPermission } from '@/lib/require-permission';
 
 export const dynamic = 'force-dynamic';
 
+// What the screen reads of a provider. Not whole rows: the ~300 KB `icon` would
+// be serialized into the page.
+const PROVIDER_FIELDS = { id: true, name: true, displayOrder: true, colorHex: true, startingCapital: true } as const;
+
 /** The providers a user may pick on the reports screen. */
 async function getProviders(user: NonNullable<Awaited<ReturnType<typeof getUserFromSession>>>): Promise<LoanProviderType[]> {
     const isSuperAdminOrRecon = user.role === 'Super Admin' || user.role === 'Reconciliation';
-    if (isSuperAdminOrRecon) {
-        return (await prisma.loanProvider.findMany({ orderBy: { displayOrder: 'asc' } })) as unknown as LoanProviderType[];
-    }
+    const everyProvider = async () =>
+        (await prisma.loanProvider.findMany({ orderBy: { displayOrder: 'asc' }, select: PROVIDER_FIELDS })) as unknown as LoanProviderType[];
+    if (isSuperAdminOrRecon) return everyProvider();
 
     if (user.loanProviderId) {
-        const provider = await prisma.loanProvider.findUnique({ where: { id: user.loanProviderId } });
+        const provider = await prisma.loanProvider.findUnique({ where: { id: user.loanProviderId }, select: PROVIDER_FIELDS });
         return provider ? ([provider] as unknown as LoanProviderType[]) : [];
     }
 
     // A user who can read reports but is not bound to a provider picks from all
     // of them (common for Auditor/Loan Manager).
-    if (user.role !== 'Loan Provider') {
-        return (await prisma.loanProvider.findMany({ orderBy: { displayOrder: 'asc' } })) as unknown as LoanProviderType[];
-    }
+    if (user.role !== 'Loan Provider') return everyProvider();
 
     return [];
 }

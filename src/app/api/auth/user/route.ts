@@ -19,7 +19,9 @@ export async function GET(req: NextRequest) {
       where: { id: session.userId },
       include: {
         role: true,
-        loanProvider: true,
+        // Only what the response needs (providerName): the whole row carries the
+        // provider's ~300 KB icon, and this runs right after every sign-in.
+        loanProvider: { select: { id: true, name: true } },
       },
     });
 
