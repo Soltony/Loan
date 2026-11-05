@@ -1,17 +1,34 @@
 
 import { NextRequest, NextResponse } from 'next/server';
 import prisma from '@/lib/prisma';
-import { getSession } from '@/lib/session';
+import { getUserFromSession } from '@/lib/user';
+import { hasPermissionForEntity } from '@/lib/permissions';
 import { requiredDocumentSchema } from '@/lib/schemas';
 import { z } from 'zod';
 import { auditRequestContext, createAuditLog } from '@/lib/audit-log';
 
+/**
+ * Required documents are part of a product, so they follow the product editor's
+ * rule: reading needs product read, any change needs product create or update.
+ */
+async function authorize(access: 'read' | 'edit') {
+    const user = await getUserFromSession();
+    if (!user?.id) {
+        return { denied: NextResponse.json({ error: 'Not authenticated' }, { status: 401 }) } as const;
+    }
+    const allowed = access === 'read'
+        ? hasPermissionForEntity(user, 'LoanProduct', 'read')
+        : hasPermissionForEntity(user, 'LoanProduct', 'create') || hasPermissionForEntity(user, 'LoanProduct', 'update');
+    if (!allowed) {
+        return { denied: NextResponse.json({ error: 'Not authorized' }, { status: 403 }) } as const;
+    }
+    return { user } as const;
+}
+
 // GET all required documents for a product
 export async function GET(req: NextRequest) {
-    const session = await getSession();
-    if (!session?.userId) {
-        return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
-    }
+    const auth = await authorize('read');
+    if ('denied' in auth) return auth.denied;
     const { searchParams } = new URL(req.url);
     const productId = searchParams.get('productId');
 
@@ -34,11 +51,9 @@ export async function GET(req: NextRequest) {
 
 // POST a new required document
 export async function POST(req: NextRequest) {
-    
-    const session = await getSession();
-    if (!session?.userId) {
-        return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
-    }
+    const auth = await authorize('edit');
+    if ('denied' in auth) return auth.denied;
+    const { user } = auth;
 
     try {
         const body = await req.json();
@@ -53,7 +68,7 @@ export async function POST(req: NextRequest) {
         });
 
         await createAuditLog({
-            actorId: session.userId,
+            actorId: user.id,
             action: 'REQUIRED_DOCUMENT_CREATED',
             entity: 'RequiredDocument',
             entityId: newDocument.id,
@@ -73,10 +88,9 @@ export async function POST(req: NextRequest) {
 
 // PUT to update a required document
 export async function PUT(req: NextRequest) {
-    const session = await getSession();
-    if (!session?.userId) {
-        return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
-    }
+    const auth = await authorize('edit');
+    if ('denied' in auth) return auth.denied;
+    const { user } = auth;
     
     try {
         const body = await req.json();
@@ -92,7 +106,7 @@ export async function PUT(req: NextRequest) {
         });
 
         await createAuditLog({
-            actorId: session.userId,
+            actorId: user.id,
             action: 'REQUIRED_DOCUMENT_UPDATED',
             entity: 'RequiredDocument',
             entityId: updatedDocument.id,
@@ -116,10 +130,9 @@ export async function PUT(req: NextRequest) {
 
 // DELETE a required document
 export async function DELETE(req: NextRequest) {
-    const session = await getSession();
-    if (!session?.userId) {
-        return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
-    }
+    const auth = await authorize('edit');
+    if ('denied' in auth) return auth.denied;
+    const { user } = auth;
     
     const { searchParams } = new URL(req.url);
     const id = searchParams.get('id');
@@ -133,7 +146,7 @@ export async function DELETE(req: NextRequest) {
             where: { id },
         });
         await createAuditLog({
-            actorId: session.userId,
+            actorId: user.id,
             action: 'REQUIRED_DOCUMENT_DELETED',
             entity: 'RequiredDocument',
             entityId: id,

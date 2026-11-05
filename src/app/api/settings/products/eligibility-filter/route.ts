@@ -1,13 +1,18 @@
 
 import { NextRequest, NextResponse } from 'next/server';
 import prisma from '@/lib/prisma';
-import { getSession } from '@/lib/session';
+import { getUserFromSession } from '@/lib/user';
+import { hasPermissionForEntity } from '@/lib/permissions';
 import { auditRequestContext, createAuditLog } from '@/lib/audit-log';
 
 export async function DELETE(req: NextRequest) {
-    const session = await getSession();
-    if (!session?.userId) {
+    const user = await getUserFromSession();
+    if (!user?.id) {
         return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
+    }
+    // Same rule the product's eligibility card uses to show Delete.
+    if (!hasPermissionForEntity(user, 'EligibilityList', 'delete')) {
+        return NextResponse.json({ error: 'Not authorized' }, { status: 403 });
     }
 
     const { searchParams } = new URL(req.url);
@@ -58,7 +63,7 @@ export async function DELETE(req: NextRequest) {
         });
 
         await createAuditLog({
-            actorId: session.userId,
+            actorId: user.id,
             action: 'ELIGIBILITY_LIST_DELETED',
             entity: 'LoanProduct',
             entityId: productId,

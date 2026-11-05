@@ -1,6 +1,7 @@
 
 import { NextRequest, NextResponse } from 'next/server';
-import { createSession, createLegacySession } from '@/lib/session';
+import { cookies } from 'next/headers';
+import { createLegacySession } from '@/lib/session';
 import { auditRequestContext, createAuditLog } from '@/lib/audit-log';
 
 function snippet(text: string, maxLen = 300) {
@@ -124,39 +125,25 @@ export async function POST(req: NextRequest) {
         //     phone = phone.substring(3);
         // }
 
-        // Resolve the phone to a local DB user and create a DB-backed session
-        const { default: prisma } = await import('@/lib/prisma');
-        const user = await prisma.user.findUnique({ where: { phoneNumber: phone } });
+        // The mini-app always runs as the borrower (the phone), even when that phone also
+        // belongs to a staff account. A super-app token used to open a full staff session
+        // here, skipping the password, the forced password change and the Inactive check.
+        // Staff cookies in this browser would outrank the borrower session in getSession,
+        // so drop them first.
+        const cookieStore = await cookies();
+        cookieStore.delete('accessToken');
+        cookieStore.delete('refreshToken');
 
-        if (!user) {
-            // No local user exists — create a legacy session cookie so the mini-app
-            // can log in using only the super app token (no provisioning required).
-            await createLegacySession(phone, token);
-            await createAuditLog({
-                actorId: String(phone),
-                action: 'BORROWER_CONNECT_SUCCESS',
-                entity: 'Borrower',
-                entityId: String(phone),
-                ipAddress,
-                userAgent,
-            });
-            return NextResponse.json({ borrowerId: phone, userId: null, legacy: true }, { status: 200 });
-        }
-
-        await createSession(user.id, token); // Pass DB user id and raw token to session
-        // A super-app token whose phone matches a staff account opens a full user
-        // session with no password, so it gets its own action to stand out.
+        await createLegacySession(phone, token);
         await createAuditLog({
-            actorId: user.id,
-            action: 'USER_LOGIN_VIA_SUPERAPP',
-            entity: 'USER',
-            entityId: user.id,
+            actorId: String(phone),
+            action: 'BORROWER_CONNECT_SUCCESS',
+            entity: 'Borrower',
+            entityId: String(phone),
             ipAddress,
             userAgent,
-            details: { phoneNumber: phone },
         });
-
-        return NextResponse.json({ borrowerId: phone, userId: user.id }, { status: 200 });
+        return NextResponse.json({ borrowerId: phone, userId: null, legacy: true }, { status: 200 });
 
     } catch (error: any) {
         return NextResponse.json({ error: `An internal error occurred: ${error.message}` }, { status: 500 });

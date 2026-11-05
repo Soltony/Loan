@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import prisma from '@/lib/prisma';
-import { getSession } from '@/lib/session';
+import { getUserFromSession } from '@/lib/user';
+import { hasPermissionForEntity } from '@/lib/permissions';
 import { auditRequestContext, createAuditLog, sanitizeForAudit } from '@/lib/audit-log';
 
 const parseJson = (value: string | null | undefined) => {
@@ -21,8 +22,8 @@ export async function GET(req: NextRequest) {
 }
 
 export async function PUT(req: NextRequest) {
-  const session = await getSession();
-  if (!session?.userId) return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
+  const user = await getUserFromSession();
+  if (!user?.id) return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
 
   try {
     const body = await req.json();
@@ -46,6 +47,10 @@ export async function PUT(req: NextRequest) {
 
     // if exists update else create
     const existing = await prisma.loanCycleConfig.findUnique({ where: { productId } });
+    // Same rule the Loan Cycle tab uses: update an existing config, create a new one.
+    if (!hasPermissionForEntity(user, 'LoanCycleConfig', existing ? 'update' : 'create')) {
+      return NextResponse.json({ error: 'Not authorized' }, { status: 403 });
+    }
     let result;
     if (existing) {
       result = await prisma.loanCycleConfig.update({ where: { id: existing.id }, data: { metric, enabled: enabled ?? true, cycleRanges: cycleRanges ? JSON.stringify(cycleRanges) : undefined, grades: grades ? JSON.stringify(grades) : undefined } });
@@ -56,7 +61,7 @@ export async function PUT(req: NextRequest) {
     const snapshot = (c: typeof result | null) =>
       c ? { metric: c.metric, enabled: c.enabled, cycleRanges: parseJson(c.cycleRanges), grades: parseJson(c.grades) } : null;
     await createAuditLog({
-      actorId: session.userId,
+      actorId: user.id,
       action: existing ? 'LOAN_CYCLE_CONFIG_UPDATED' : 'LOAN_CYCLE_CONFIG_CREATED',
       entity: 'LoanProduct',
       entityId: productId,

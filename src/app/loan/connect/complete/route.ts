@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { cookies } from 'next/headers';
 import { MiniAppConnectError, connectMiniAppSession } from '@/lib/miniapp-connect';
+import { auditRequestContext } from '@/lib/audit-log';
 
 const miniAppConnectTokenCookie = 'miniappConnectToken';
 
@@ -30,7 +31,7 @@ export async function POST(request: Request) {
   }
 
   try {
-    const { borrowerId } = await connectMiniAppSession(superAppToken);
+    const { borrowerId } = await connectMiniAppSession(superAppToken, auditRequestContext(request));
     const destination = new URL(`/loan?borrowerId=${encodeURIComponent(borrowerId)}`, request.url);
     const response = NextResponse.redirect(destination, { status: 303 });
 

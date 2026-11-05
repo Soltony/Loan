@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import prisma from '@/lib/prisma';
-import { getSession } from '@/lib/session';
+import { getUserFromSession } from '@/lib/user';
+import { hasPermissionForEntity } from '@/lib/permissions';
 import { auditRequestContext, createAuditLog } from '@/lib/audit-log';
 
 // GET the latest active T&C for a provider
@@ -32,9 +33,13 @@ export async function GET(req: NextRequest) {
 
 // POST a new version of the T&C
 export async function POST(req: NextRequest) {
-    const session = await getSession();
-    if (!session?.userId) {
+    const user = await getUserFromSession();
+    if (!user?.id) {
         return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
+    }
+    // Same rule the Agreement tab uses to enable editing.
+    if (!hasPermissionForEntity(user, 'TermsAndConditions', 'create') && !hasPermissionForEntity(user, 'TermsAndConditions', 'update')) {
+        return NextResponse.json({ error: 'Not authorized' }, { status: 403 });
     }
 
     try {
@@ -75,7 +80,7 @@ export async function POST(req: NextRequest) {
         });
 
         await createAuditLog({
-            actorId: session.userId,
+            actorId: user.id,
             action: 'TERMS_PUBLISHED',
             entity: 'TermsAndConditions',
             entityId: newVersion.id,

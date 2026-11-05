@@ -1,4 +1,6 @@
-import { createLegacySession, createSession } from '@/lib/session';
+import { cookies } from 'next/headers';
+import { createLegacySession } from '@/lib/session';
+import { createAuditLog } from '@/lib/audit-log';
 
 function snippet(text: string, maxLen = 300) {
   const normalized = text.replace(/\s+/g, ' ').trim();
@@ -24,7 +26,7 @@ type ConnectOptions = {
 
 export async function connectMiniAppSession(
   superAppToken: string,
-  _options: ConnectOptions = {}
+  options: ConnectOptions = {}
 ) {
   const TOKEN_VALIDATION_API_URL = process.env.TOKEN_VALIDATION_API_URL;
 
@@ -117,14 +119,21 @@ export async function connectMiniAppSession(
     throw new MiniAppConnectError(400, 'Phone number not found in validation response.');
   }
 
-  const { default: prisma } = await import('@/lib/prisma');
-  const user = await prisma.user.findUnique({ where: { phoneNumber: phone } });
+  // Same rule as /api/auth/connect: the mini-app always runs as the borrower, never as
+  // a staff account that shares the phone (that skipped the password and Inactive check).
+  // Drop staff cookies so they cannot outrank the borrower session in getSession.
+  const cookieStore = await cookies();
+  cookieStore.delete('accessToken');
+  cookieStore.delete('refreshToken');
 
-  if (!user) {
-    await createLegacySession(phone, token);
-    return { borrowerId: phone, userId: null, legacy: true };
-  }
-
-  await createSession(user.id, token);
-  return { borrowerId: phone, userId: user.id, legacy: false };
+  await createLegacySession(phone, token);
+  await createAuditLog({
+    actorId: String(phone),
+    action: 'BORROWER_CONNECT_SUCCESS',
+    entity: 'Borrower',
+    entityId: String(phone),
+    ipAddress: options.ipAddress ?? undefined,
+    userAgent: options.userAgent ?? undefined,
+  });
+  return { borrowerId: phone, userId: null, legacy: true };
 }
