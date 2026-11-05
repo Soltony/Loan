@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useMemo, useState, useSyncExternalStore } from "react";
 import {
   Bar,
   BarChart,
@@ -16,7 +16,6 @@ import {
   YAxis,
 } from "recharts";
 import { format, parse } from "date-fns";
-import type { DateRange } from "react-day-picker";
 import {
   AlertTriangle,
   BarChart3,
@@ -30,18 +29,14 @@ import {
   Users,
   Wallet,
 } from "lucide-react";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../ui/card";
-import { Button } from "../ui/button";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "../ui/table";
-import { useToast } from "@/hooks/use-toast";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { cn } from "@/lib/utils";
+import { useReportQuery } from "../hooks/use-report-query";
+import { formatCompact, formatCount, formatMoney } from "../lib/format";
+import { periodLabel, reportUrl, scopeParams, type ReportFilters } from "../lib/report-filters";
+import type { OverviewData } from "../types";
 
 // ---------------------------------------------------------------------------
 // Palette
@@ -83,64 +78,22 @@ const PALETTE = {
   },
 };
 
-type AgingRow = { bucket: string; loans: number; amount: number };
-type TrendPoint = { period: string; disbursed: number; collected: number };
-
-type OverviewData = {
-  scope: { providerId: string; from: string | null; to: string | null; timeframe: string };
-  kpis: {
-    disbursedAmount: number;
-    loansDisbursed: number;
-    uniqueBorrowers: number;
-    avgLoanSize: number;
-    collectedAmount: number;
-    repaymentCount: number;
-    collectionRate: number;
-    outstandingPrincipal: number;
-    outstandingBalance: number;
-    outstandingLoans: number;
-    overduePrincipal: number;
-    overdueBalance: number;
-    overdueLoans: number;
-    parRatio: number;
-  };
-  income: {
-    principal: number;
-    interest: number;
-    serviceFee: number;
-    penalty: number;
-    tax: number;
-    total: number;
-  };
-  aging: AgingRow[];
-  trend: {
-    granularity: "day" | "month";
-    clamped: boolean;
-    from: string;
-    to: string;
-    points: TrendPoint[];
-  };
-  generatedAt: string;
-};
-
-const fullCurrency = (value: number) =>
-  new Intl.NumberFormat("en-US", {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  }).format(value || 0);
-
-// Stat tiles and axis ticks auto-compact; tables and tooltips stay exact.
-const compactCurrency = (value: number) => {
-  const abs = Math.abs(value || 0);
-  if (abs >= 1_000_000) return `${(value / 1_000_000).toFixed(2)}M`;
-  if (abs >= 10_000) return `${(value / 1_000).toFixed(1)}K`;
-  return new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 }).format(value || 0);
-};
-
-const compactNumber = (value: number) =>
-  new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 }).format(value || 0);
-
 const formatPercent = (value: number) => `${(value || 0).toFixed(1)}%`;
+
+/** The app's dark mode, a class on <html> (tailwind darkMode: ['class']), watched for changes. */
+function subscribeToTheme(onChange: () => void) {
+  const observer = new MutationObserver(onChange);
+  observer.observe(document.documentElement, { attributes: true, attributeFilter: ["class"] });
+  return () => observer.disconnect();
+}
+
+function useIsDark(): boolean {
+  return useSyncExternalStore(
+    subscribeToTheme,
+    () => document.documentElement.classList.contains("dark"),
+    () => false,
+  );
+}
 
 /** Stat tile: label (sentence case) + value + a quiet supporting line. */
 function StatTile({
@@ -175,7 +128,7 @@ function ChartTooltip({
   label,
 }: {
   active?: boolean;
-  payload?: any[];
+  payload?: Array<{ name: string; value: number; color?: string }>;
   label?: string;
 }) {
   if (!active || !payload?.length) return null;
@@ -184,97 +137,38 @@ function ChartTooltip({
       <div className="mb-1 font-medium text-popover-foreground">{label}</div>
       {payload.map((entry) => (
         <div key={entry.name} className="flex items-center gap-2 text-popover-foreground">
-          <span
-            className="inline-block h-2 w-2 rounded-full"
-            style={{ backgroundColor: entry.color }}
-          />
+          <span className="inline-block h-2 w-2 rounded-full" style={{ backgroundColor: entry.color }} />
           <span className="text-muted-foreground">{entry.name}</span>
-          <span className="ml-auto font-medium tabular-nums">
-            {fullCurrency(entry.value)}
-          </span>
+          <span className="ml-auto font-medium tabular-nums">{formatMoney(entry.value)}</span>
         </div>
       ))}
     </div>
   );
 }
 
-export function ReportsOverview({
-  providerId,
-  timeframe,
-  dateRange,
-  branchCode,
-  periodLabel,
-}: {
-  providerId: string | null;
-  timeframe: string;
-  dateRange?: DateRange;
-  branchCode: string;
-  periodLabel: string;
-}) {
-  const { toast } = useToast();
-  const [data, setData] = useState<OverviewData | null>(null);
-  const [isLoading, setIsLoading] = useState(true);
+/** The Overall tab: headline figures, the disbursed/collected trend, aging and collected income. */
+export function OverviewTab({ filters }: { filters: ReportFilters }) {
+  const { data, error, isFetching, refetch } = useReportQuery<OverviewData>(
+    reportUrl("/api/reports/overview", scopeParams(filters)),
+  );
   const [showTrendTable, setShowTrendTable] = useState(false);
   const [showAgingTable, setShowAgingTable] = useState(false);
-
-  // The app wires dark mode through a class (tailwind darkMode: ['class']) and
-  // ships no toggle, so the mode is read once rather than observed.
-  const [isDark, setIsDark] = useState(false);
-  useEffect(() => {
-    setIsDark(document.documentElement.classList.contains("dark"));
-  }, []);
-  const theme = isDark ? PALETTE.dark : PALETTE.light;
-
-  const fetchOverview = useCallback(async () => {
-    if (!providerId || providerId === "none") return;
-    setIsLoading(true);
-    try {
-      const params = new URLSearchParams({ providerId, timeframe });
-      if (dateRange?.from) params.set("from", dateRange.from.toISOString());
-      if (dateRange?.to) params.set("to", dateRange.to.toISOString());
-      if (branchCode && branchCode !== "all") params.set("branchCode", branchCode);
-
-      const response = await fetch(`/api/reports/overview?${params.toString()}`);
-      if (!response.ok) {
-        const body = await response.json().catch(() => ({}));
-        throw new Error(body.error || "Failed to fetch overview data");
-      }
-      setData(await response.json());
-    } catch (error: any) {
-      toast({
-        title: "Error fetching overview",
-        description: error.message,
-        variant: "destructive",
-      });
-    } finally {
-      setIsLoading(false);
-    }
-  }, [providerId, timeframe, dateRange, branchCode, toast]);
-
-  useEffect(() => {
-    fetchOverview();
-  }, [fetchOverview]);
+  const theme = useIsDark() ? PALETTE.dark : PALETTE.light;
 
   const trendData = useMemo(() => {
-    if (!data) return [];
+    if (!data?.trend) return [];
     return data.trend.points.map((point) => {
       const parsed =
         data.trend.granularity === "day"
           ? parse(point.period, "yyyy-MM-dd", new Date())
           : parse(point.period, "yyyy-MM", new Date());
-      return {
-        ...point,
-        label: format(parsed, data.trend.granularity === "day" ? "MMM d" : "MMM yy"),
-      };
+      return { ...point, label: format(parsed, data.trend.granularity === "day" ? "MMM d" : "MMM yy") };
     });
   }, [data]);
 
-  const agingTotal = useMemo(
-    () => (data?.aging ?? []).reduce((sum, row) => sum + row.amount, 0),
-    [data]
-  );
+  const agingTotal = useMemo(() => (data?.aging ?? []).reduce((sum, row) => sum + row.amount, 0), [data]);
 
-  if (!data && isLoading) {
+  if (!data && !error) {
     return (
       <div className="flex h-64 items-center justify-center text-muted-foreground">
         <Loader2 className="mr-2 h-5 w-5 animate-spin" />
@@ -283,17 +177,17 @@ export function ReportsOverview({
     );
   }
 
-  if (!data) {
+  if (!data || !data.trend) {
     return (
       <Card>
         <CardHeader>
           <CardTitle>Overview unavailable</CardTitle>
           <CardDescription>
-            The summary could not be loaded for the current selection.
+            {error instanceof Error ? error.message : "The summary could not be loaded for the current selection."}
           </CardDescription>
         </CardHeader>
         <CardContent>
-          <Button variant="outline" onClick={fetchOverview}>
+          <Button variant="outline" onClick={refetch}>
             <RefreshCw className="mr-2 h-4 w-4" />
             Retry
           </Button>
@@ -307,34 +201,35 @@ export function ReportsOverview({
   return (
     // Refetches hold the previous render at reduced opacity instead of flashing
     // a skeleton, so the cards never jump.
-    <div className={cn("space-y-4", isLoading && "pointer-events-none opacity-60")}>
+    <div className={cn("space-y-4", isFetching && "pointer-events-none opacity-60")} aria-busy={isFetching}>
       <div className="flex flex-wrap items-center justify-between gap-2">
         <p className="text-sm text-muted-foreground">
-          {periodLabel} · generated {format(new Date(data.generatedAt), "MMM d, yyyy HH:mm")}
+          {periodLabel(filters)} · generated {format(new Date(data.generatedAt), "MMM d, yyyy HH:mm")}
         </p>
-        <Button variant="ghost" size="sm" onClick={fetchOverview} disabled={isLoading}>
-          <RefreshCw className={cn("mr-2 h-4 w-4", isLoading && "animate-spin")} />
-          Refresh
-        </Button>
+        {error ? (
+          <p className="text-xs text-destructive">
+            Could not refresh: {error instanceof Error ? error.message : "Something went wrong."}
+          </p>
+        ) : null}
       </div>
 
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
         <StatTile
           label="Disbursed"
-          value={compactCurrency(kpis.disbursedAmount)}
-          hint={`${compactNumber(kpis.loansDisbursed)} loans in period`}
+          value={formatCompact(kpis.disbursedAmount)}
+          hint={`${formatCount(kpis.loansDisbursed)} loans in period`}
           icon={TrendingUp}
         />
         <StatTile
           label="Collected"
-          value={compactCurrency(kpis.collectedAmount)}
-          hint={`${compactNumber(kpis.repaymentCount)} repayments received`}
+          value={formatCompact(kpis.collectedAmount)}
+          hint={`${formatCount(kpis.repaymentCount)} repayments received`}
           icon={TrendingDown}
         />
         <StatTile
           label="Outstanding"
-          value={compactCurrency(kpis.outstandingBalance)}
-          hint={`${compactNumber(kpis.outstandingLoans)} unpaid loans, as of today`}
+          value={formatCompact(kpis.outstandingBalance)}
+          hint={`${formatCount(kpis.outstandingLoans)} unpaid loans, as of today`}
           icon={Wallet}
         />
         {/* Deliberately not called a "collection rate": collections in a period
@@ -351,20 +246,20 @@ export function ReportsOverview({
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
         <StatTile
           label="Borrowers served"
-          value={compactNumber(kpis.uniqueBorrowers)}
+          value={formatCount(kpis.uniqueBorrowers)}
           hint="Unique borrowers disbursed in period"
           icon={Users}
         />
         <StatTile
           label="Average loan size"
-          value={compactCurrency(kpis.avgLoanSize)}
+          value={formatCompact(kpis.avgLoanSize)}
           hint="Disbursed ÷ loan count"
           icon={Banknote}
         />
         <StatTile
           label="Overdue portfolio"
-          value={compactCurrency(kpis.overdueBalance)}
-          hint={`${compactNumber(kpis.overdueLoans)} loans past due date`}
+          value={formatCompact(kpis.overdueBalance)}
+          hint={`${formatCount(kpis.overdueLoans)} loans past due date`}
           icon={AlertTriangle}
         />
         <StatTile
@@ -384,11 +279,7 @@ export function ReportsOverview({
               {data.trend.clamped ? " · last 12 months" : ""}
             </CardDescription>
           </div>
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => setShowTrendTable((prev) => !prev)}
-          >
+          <Button variant="ghost" size="sm" onClick={() => setShowTrendTable((prev) => !prev)}>
             <Table2 className="mr-2 h-4 w-4" />
             {showTrendTable ? "Chart" : "Table"}
           </Button>
@@ -408,12 +299,8 @@ export function ReportsOverview({
                   {trendData.map((point) => (
                     <TableRow key={point.period}>
                       <TableCell>{point.label}</TableCell>
-                      <TableCell className="text-right tabular-nums">
-                        {fullCurrency(point.disbursed)}
-                      </TableCell>
-                      <TableCell className="text-right tabular-nums">
-                        {fullCurrency(point.collected)}
-                      </TableCell>
+                      <TableCell className="text-right tabular-nums">{formatMoney(point.disbursed)}</TableCell>
+                      <TableCell className="text-right tabular-nums">{formatMoney(point.collected)}</TableCell>
                     </TableRow>
                   ))}
                 </TableBody>
@@ -436,15 +323,13 @@ export function ReportsOverview({
                   tickLine={false}
                   axisLine={false}
                   width={64}
-                  tickFormatter={compactCurrency}
+                  tickFormatter={formatCompact}
                 />
                 <Tooltip content={<ChartTooltip />} cursor={{ stroke: theme.grid }} />
                 <Legend
                   iconType="plainline"
                   wrapperStyle={{ fontSize: 12, paddingTop: 8 }}
-                  formatter={(value) => (
-                    <span style={{ color: theme.axis }}>{value}</span>
-                  )}
+                  formatter={(value) => <span style={{ color: theme.axis }}>{value}</span>}
                 />
                 <Line
                   type="monotone"
@@ -479,15 +364,9 @@ export function ReportsOverview({
           <CardHeader className="flex flex-row items-start justify-between space-y-0">
             <div>
               <CardTitle>Aging distribution</CardTitle>
-              <CardDescription>
-                Outstanding balance by classification, as of today
-              </CardDescription>
+              <CardDescription>Outstanding balance by classification, as of today</CardDescription>
             </div>
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => setShowAgingTable((prev) => !prev)}
-            >
+            <Button variant="ghost" size="sm" onClick={() => setShowAgingTable((prev) => !prev)}>
               <Table2 className="mr-2 h-4 w-4" />
               {showAgingTable ? "Chart" : "Table"}
             </Button>
@@ -506,12 +385,8 @@ export function ReportsOverview({
                   {aging.map((row) => (
                     <TableRow key={row.bucket}>
                       <TableCell>{row.bucket}</TableCell>
-                      <TableCell className="text-right tabular-nums">
-                        {compactNumber(row.loans)}
-                      </TableCell>
-                      <TableCell className="text-right tabular-nums">
-                        {fullCurrency(row.amount)}
-                      </TableCell>
+                      <TableCell className="text-right tabular-nums">{formatCount(row.loans)}</TableCell>
+                      <TableCell className="text-right tabular-nums">{formatMoney(row.amount)}</TableCell>
                     </TableRow>
                   ))}
                 </TableBody>
@@ -522,19 +397,14 @@ export function ReportsOverview({
               </div>
             ) : (
               <ResponsiveContainer width="100%" height={280}>
-                <BarChart
-                  data={aging}
-                  layout="vertical"
-                  barCategoryGap={10}
-                  margin={{ top: 4, right: 56, left: 8, bottom: 0 }}
-                >
+                <BarChart data={aging} layout="vertical" barCategoryGap={10} margin={{ top: 4, right: 56, left: 8, bottom: 0 }}>
                   <CartesianGrid horizontal={false} stroke={theme.grid} strokeWidth={1} />
                   <XAxis
                     type="number"
                     tick={{ fontSize: 12, fill: theme.axis }}
                     tickLine={false}
                     axisLine={{ stroke: theme.grid }}
-                    tickFormatter={compactCurrency}
+                    tickFormatter={formatCompact}
                   />
                   <YAxis
                     type="category"
@@ -555,7 +425,7 @@ export function ReportsOverview({
                       position="right"
                       fill={theme.axis}
                       fontSize={12}
-                      formatter={compactCurrency}
+                      formatter={formatCompact}
                     />
                   </Bar>
                 </BarChart>
@@ -580,16 +450,16 @@ export function ReportsOverview({
               ].map((row) => (
                 <div key={row.label} className="flex items-center justify-between text-sm">
                   <dt className="text-muted-foreground">{row.label}</dt>
-                  <dd className="font-medium tabular-nums">{fullCurrency(row.value)}</dd>
+                  <dd className="font-medium tabular-nums">{formatMoney(row.value)}</dd>
                 </div>
               ))}
               <div className="flex items-center justify-between border-t pt-3 text-sm">
                 <dt className="font-medium">Total income</dt>
-                <dd className="font-semibold tabular-nums">{fullCurrency(income.total)}</dd>
+                <dd className="font-semibold tabular-nums">{formatMoney(income.total)}</dd>
               </div>
               <div className="flex items-center justify-between text-sm">
                 <dt className="text-muted-foreground">Principal recovered</dt>
-                <dd className="tabular-nums">{fullCurrency(income.principal)}</dd>
+                <dd className="tabular-nums">{formatMoney(income.principal)}</dd>
               </div>
             </dl>
           </CardContent>

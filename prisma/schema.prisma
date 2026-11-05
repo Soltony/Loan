@@ -230,6 +230,13 @@ model Loan {
   disbursementTransactions   DisbursementTransaction[]
   createdAt                  DateTime                  @default(now())
   updatedAt                  DateTime                  @updatedAt
+
+  // Reports: provider + period, period, borrower (search and branch scope),
+  // and overdue loans (status + due date).
+  @@index([productId, disbursedDate])
+  @@index([disbursedDate])
+  @@index([borrowerId])
+  @@index([repaymentStatus, dueDate])
 }
 
 model Payment {
@@ -243,6 +250,9 @@ model Payment {
   outstandingBalanceBeforePayment Float?
   journalEntryId                  String?          @unique
   journalEntry                    JournalEntry?    @relation(fields: [journalEntryId], references: [id], onUpdate: NoAction, onDelete: NoAction)
+
+  @@index([loanId])
+  @@index([date])
 }
 
 model LoanInstallment {
@@ -443,6 +453,10 @@ model JournalEntry {
   entries     LedgerEntry[]
   payment     Payment?
   taxTransferSimulation TaxTransferSimulation?
+
+  @@index([loanId])
+  @@index([providerId, date])
+  @@index([date])
 }
 
 model LedgerEntry {
@@ -453,6 +467,9 @@ model LedgerEntry {
   ledgerAccount   LedgerAccount @relation(fields: [ledgerAccountId], references: [id], onDelete: NoAction, onUpdate: NoAction)
   type            String // Debit or Credit
   amount          Float
+
+  @@index([journalEntryId])
+  @@index([ledgerAccountId])
 }
 
 // --------------------------------------
@@ -616,6 +633,8 @@ model PendingPayment {
   status        String   @default("PENDING") // PENDING, COMPLETED, FAILED
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
+
+  @@index([loanId, status])
 }
 
 model PaymentTransaction {
@@ -625,6 +644,8 @@ model PaymentTransaction {
   status        String // e.g., RECEIVED, PROCESSED, FAILED_VALIDATION
   payload       String   @db.NVarChar(Max)
   receivedAt    DateTime @default(now())
+
+  @@index([txnRef])
 }
 
 // Records disbursement requests sent to the external payment/disbursement service
@@ -648,6 +669,8 @@ model DisbursementTransaction {
   @@index([providerId])
   @@index([transactionId])
   @@index([disbursementStatus])
+  // The transactions report matches journals to transfers within minutes.
+  @@index([createdAt])
 }
 
 // Maps phone numbers to external bank account numbers returned by the

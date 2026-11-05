@@ -50,10 +50,14 @@ const cents = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
  * Every event counts, not only those inside the report's date range: the balance
  * on a given day is the whole history up to it. Reversed loans must be left out
  * by the caller — a reversal takes the loan and its repayments off the books.
+ *
+ * `dayOf` names the calendar day of an instant (`yyyy-MM-dd`); by default the
+ * server's, and the caller passes the user's when its rows are on their days.
  */
 export function buildOutstandingSeries(
     loans: OutstandingLoanInput[],
     reconciled: OutstandingRepaymentInput,
+    dayOf: (date: Date) => string = (date) => format(date, 'yyyy-MM-dd'),
 ): Map<string, OutstandingSeries> {
     type Event = { day: string; loanId: string; delta: number };
     const eventsByProvider = new Map<string, Event[]>();
@@ -65,7 +69,7 @@ export function buildOutstandingSeries(
 
     for (const loan of loans) {
         add(loan.provider, {
-            day: format(new Date(loan.disbursedDate), 'yyyy-MM-dd'),
+            day: dayOf(new Date(loan.disbursedDate)),
             loanId: loan.id,
             delta: loan.loanAmount,
         });
@@ -73,7 +77,7 @@ export function buildOutstandingSeries(
             const principal = reconciled.byEntry.get(entry.id)?.principal ?? 0;
             if (principal === 0) continue;
             add(loan.provider, {
-                day: format(new Date(entry.date), 'yyyy-MM-dd'),
+                day: dayOf(new Date(entry.date)),
                 loanId: loan.id,
                 delta: -principal,
             });

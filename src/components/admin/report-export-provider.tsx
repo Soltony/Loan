@@ -12,7 +12,8 @@ import { AlertCircle, CheckCircle2, FileSpreadsheet, X } from "lucide-react";
 import { Progress } from "@/components/ui/progress";
 import { cn } from "@/lib/utils";
 
-export type ExportPhase = "fetching" | "generating";
+/** fetching: pages read in the browser; building: the server builds the workbook; generating: the file is saved. */
+export type ExportPhase = "fetching" | "building" | "generating";
 
 export interface ExportProgress {
   done: number;
@@ -133,8 +134,10 @@ function ExportWidget({
   onDismiss: () => void;
 }) {
   const { status, progress } = job;
+  // The server reports no progress while it builds: the bar pulses instead.
+  const indeterminate = status === "running" && progress.phase === "building";
   const percent =
-    status === "success" || progress.phase === "generating"
+    status === "success" || progress.phase === "generating" || indeterminate
       ? 100
       : progress.total > 0
       ? Math.min(100, Math.round((progress.done / progress.total) * 100))
@@ -186,9 +189,11 @@ function ExportWidget({
           </div>
           {status === "running" && (
             <>
-              <Progress value={percent} className="h-1.5" />
+              <Progress value={percent} className={cn("h-1.5", indeterminate && "animate-pulse opacity-60")} />
               <p className="text-xs text-muted-foreground">
-                {progress.phase === "generating"
+                {progress.phase === "building"
+                  ? "Building the workbook on the server…"
+                  : progress.phase === "generating"
                   ? "Building Excel file…"
                   : progress.total > 0
                   ? `Fetching report data · ${progress.done}/${progress.total} pages · ${percent}%`
