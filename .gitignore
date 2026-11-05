@@ -46,3 +46,5 @@ firebase-debug.log
 firestore-debug.log
 # TIN migration reports (contain names/TINs — do not commit)
 scripts/output/
+# App logs, including audit entries saved during a database outage (phones, IPs)
+/logs/

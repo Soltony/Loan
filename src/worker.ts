@@ -238,6 +238,18 @@ async function main() {
         logger.info('Starting cbs-npl-retry-service long-running loop');
         await runCbsNplRetryServiceLoop();
         break;
+      case 'audit-replay':
+        // Audit entries saved to disk during a database outage are replayed by the app
+        // itself after its next successful audit write; this forces it now.
+        {
+          const { replayAuditFallback } = await import('./lib/audit-log');
+          const result = await replayAuditFallback();
+          logger.info(
+            `Audit fallback replay finished files=${result.files} inserted=${result.inserted} alreadyPresent=${result.alreadyPresent} rejected=${result.rejected} stopped=${result.stopped}`,
+          );
+          process.exit(result.stopped ? 1 : 0);
+        }
+        break;
       default:
         console.error(`Error: Unknown task "${task}".`);
         process.exit(1);
