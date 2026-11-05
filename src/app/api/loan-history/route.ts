@@ -4,6 +4,8 @@ import { requireMiniAppAuthContext } from "@/lib/miniapp-auth";
 import { ensureInstallmentRollover } from "@/lib/installment-rollover";
 import { calculateInstallmentPenalty } from "@/lib/installment-penalty";
 import { getAsOfDate } from "@/lib/date-utils";
+import { getPhoneNumbersForAccount } from "@/lib/account-utils";
+import { forBorrower } from "@/lib/miniapp/payload";
 
 const safeJsonParse = (jsonString: string | null | undefined, defaultValue: any) => {
   if (!jsonString) return defaultValue;
@@ -21,10 +23,14 @@ export async function GET(req: NextRequest) {
   try {
     const ctx = await requireMiniAppAuthContext();
     const borrowerId = String(ctx.borrowerId);
+    // Every phone number linked to the borrower's accounts, as the mini-app pages load
+    // them: this list replaces theirs on refresh, so it must not drop loans taken under
+    // a previous phone number.
+    const phoneNumbers = await getPhoneNumbersForAccount(borrowerId);
 
     // Ensure rollover so the returned schedule is consistent with repayment validation
     const loans = await prisma.loan.findMany({
-      where: { borrowerId },
+      where: { borrowerId: { in: phoneNumbers } },
       select: { id: true },
     });
     for (const l of loans) {
@@ -33,7 +39,7 @@ export async function GET(req: NextRequest) {
 
     const asOfDate = getAsOfDate();
     const refreshedLoans = await prisma.loan.findMany({
-      where: { borrowerId },
+      where: { borrowerId: { in: phoneNumbers } },
       include: {
         product: { include: { provider: true } },
         payments: { orderBy: { date: "asc" } },
@@ -55,7 +61,7 @@ export async function GET(req: NextRequest) {
       repaidAmount: loan.repaidAmount || 0,
       penaltyAmount: loan.penaltyAmount,
       product: {
-        ...loan.product,
+        ...forBorrower(loan.product),
         serviceFee: safeJsonParse(loan.product.serviceFee, { type: "percentage", value: 0 }),
         dailyFee: safeJsonParse(loan.product.dailyFee, { type: "percentage", value: 0 }),
         penaltyRules: safeJsonParse(loan.product.penaltyRules, []),

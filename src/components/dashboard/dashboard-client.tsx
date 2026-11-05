@@ -3,15 +3,6 @@
 import { useState, useMemo, useEffect, useCallback, useRef } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
 import type {
   LoanDetails,
   LoanProvider,
@@ -20,37 +11,36 @@ import type {
   Tax,
 } from "@/lib/types";
 import { IconDisplay } from "@/components/icons";
-import { ChevronRight, Loader2, Eye, EyeOff } from "lucide-react";
+import {
+  ChevronRight,
+  Loader2,
+  Eye,
+  EyeOff,
+  History,
+  Landmark,
+  Info,
+} from "lucide-react";
 import { cn } from "@/lib/utils";
 import { ProductCard } from "@/components/loan/product-card";
 import { RepaymentDialog } from "@/components/loan/repayment-dialog";
 import { checkLoanEligibility } from "@/actions/eligibility";
 import { useToast } from "@/hooks/use-toast";
-import { Separator } from "@/components/ui/separator";
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-  DialogDescription,
-  DialogFooter,
-  DialogClose,
-} from "../ui/dialog";
 import AccountSelector from "@/components/loan/account-selector";
-import { ScrollArea } from "../ui/scroll-area";
 import { Checkbox } from "../ui/checkbox";
 import { Skeleton } from "../ui/skeleton";
+import { MiniAppShell } from "@/components/miniapp/shell";
+import { BottomSheet } from "@/components/miniapp/bottom-sheet";
+import { Amount, BrandButton, Panel, SectionTitle } from "@/components/miniapp/ui";
+import { usePersistentFlag } from "@/components/miniapp/use-persistent-flag";
+import {
+  firstName,
+  formatETB,
+  formatMoney,
+  maskAccount,
+  titleCaseName,
+} from "@/lib/miniapp/format";
 
-const formatCurrency = (amount: number | null | undefined) => {
-  if (amount === null || amount === undefined || isNaN(amount))
-    return "0.00 ETB";
-  return (
-    new Intl.NumberFormat("en-US", {
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 2,
-    }).format(amount) + " ETB"
-  );
-};
+const HIDE_AMOUNTS_KEY = "miniapp.hideAmounts";
 
 interface DashboardClientProps {
   providers: LoanProvider[];
@@ -109,9 +99,20 @@ export function DashboardClient({
     null
   );
   const [agreementChecked, setAgreementChecked] = useState(false);
+  const [isSavingAgreement, setIsSavingAgreement] = useState(false);
+  // The product whose Apply was tapped, while its up-to-date limit is fetched.
+  const [applyingProductId, setApplyingProductId] = useState<string | null>(
+    null
+  );
+  // Coming back to a page the browser kept in memory must not leave Apply spinning.
+  useEffect(() => {
+    const reset = () => setApplyingProductId(null);
+    window.addEventListener("pageshow", reset);
+    return () => window.removeEventListener("pageshow", reset);
+  }, []);
 
-  const [isMaxLimitVisible, setIsMaxLimitVisible] = useState(true);
-  const [isAvailableVisible, setIsAvailableVisible] = useState(true);
+  // One privacy toggle for every amount on the page, remembered on this phone.
+  const [hideAmounts, toggleHideAmounts] = usePersistentFlag(HIDE_AMOUNTS_KEY);
 
   const checkAgreement = useCallback(
     async (providerId: string) => {
@@ -127,8 +128,8 @@ export function DashboardClient({
       } catch (error) {
         console.error(error);
         toast({
-          title: "Error",
-          description: "Could not verify agreement status.",
+          title: "Something went wrong",
+          description: "We could not load the loan terms. Please try again.",
           variant: "destructive",
         });
       }
@@ -138,6 +139,7 @@ export function DashboardClient({
 
   const handleAcceptAgreement = async () => {
     if (!borrowerId || !agreementState.terms) return;
+    setIsSavingAgreement(true);
     try {
       const response = await fetch("/api/borrowers/agreements", {
         method: "POST",
@@ -156,10 +158,12 @@ export function DashboardClient({
     } catch (error) {
       console.error(error);
       toast({
-        title: "Error",
-        description: "Could not save agreement.",
+        title: "Something went wrong",
+        description: "We could not save your agreement. Please try again.",
         variant: "destructive",
       });
+    } finally {
+      setIsSavingAgreement(false);
     }
   };
 
@@ -195,14 +199,14 @@ export function DashboardClient({
         if (!isLatest()) return;
         console.error("Error recalculating eligibility:", error);
         const defaultReason =
-          "Could not calculate loan eligibility for this provider.";
+          "We could not work out your loan limit right now. Please try again shortly.";
         const newReasons = provider.products.reduce(
           (acc, p) => ({ ...acc, [p.id]: defaultReason }),
           {}
         );
         setEligibility({ limits: {}, reasons: newReasons });
         toast({
-          title: "Calculation Error",
+          title: "Limit not available",
           description: defaultReason,
           variant: "destructive",
         });
@@ -354,7 +358,7 @@ export function DashboardClient({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [providers, borrowerId, providerIdFromUrl]);
 
-  const { overallMaxLimit, totalBorrowed, availableToBorrow } = useMemo(() => {
+  const { overallMaxLimit, availableToBorrow } = useMemo(() => {
     const unpaidLoans = loanHistory.filter(
       (loan) => loan.repaymentStatus === "Unpaid"
     );
@@ -419,6 +423,7 @@ export function DashboardClient({
   const handleApply = async (product: LoanProduct) => {
     if (agreementState.terms && !agreementState.hasAgreed) {
       setProductToApply(product);
+      setAgreementChecked(false);
       setIsAgreementDialogOpen(true);
       return;
     }
@@ -427,6 +432,7 @@ export function DashboardClient({
     params.set("providerId", selectedProviderId);
     params.set("product", product.id);
 
+    setApplyingProductId(product.id);
     // Fetch fresh eligibility for this borrower + provider to ensure UI uses up-to-date limit
     let productLimit = eligibility.limits[product.id] ?? 0;
     try {
@@ -512,9 +518,7 @@ export function DashboardClient({
 
       toast({
         title: "Payment Successful",
-        description: `${formatCurrency(
-          amount
-        )} has been paid towards your loan.`,
+        description: `${formatETB(amount)} has been paid towards your loan.`,
       });
 
       try {
@@ -543,6 +547,70 @@ export function DashboardClient({
     } finally {
       setIsRepayDialogOpen(false);
       setRepayingLoanInfo(null);
+    }
+  };
+
+  // A new disbursement account was chosen (or an existing one made active).
+  const handleAccountSelected = async (acc: {
+    accountNumber: string;
+    customerName?: string | null;
+    isActive?: boolean;
+  }) => {
+    const unchanged =
+      !!selectedAccount &&
+      String(selectedAccount.accountNumber) === String(acc.accountNumber);
+    setSelectedAccount(acc);
+    setShowAccountModal(false);
+    // The account already in use was tapped again: nothing to redo.
+    if (unchanged) return;
+    const providerIdToUse =
+      selectedProviderId || providerIdFromUrl || providers[0]?.id;
+    // The limit depends on the active account: work it out again now. Waiting for
+    // fetch-customer to report new data is not enough, since data already stored for
+    // this account reports nothing new and the previous account's limit would stay.
+    if (providerIdToUse) recalculateEligibility(providerIdToUse);
+    try {
+      const res = await fetch("/api/phone-accounts/fetch-customer", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          phoneNumber: borrowerId,
+          accountNumber: acc.accountNumber,
+          providerId: providerIdToUse,
+        }),
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) {
+        console.error("[dashboard] fetch-customer failed", res.status, data);
+        toast({
+          title: "Account not checked",
+          description:
+            data?.error ||
+            "We could not check this account right now. Please try again shortly.",
+          variant: "destructive",
+        });
+        return;
+      }
+      toast(
+        data?.pending && !data?.saved && !data?.reused
+          ? {
+              title: "Checking your account",
+              description: "Your limit will update in a moment.",
+            }
+          : {
+              title: "Account updated",
+              description: `Loans will be paid into ${maskAccount(acc.accountNumber)}.`,
+            }
+      );
+      followDataFetch(acc.accountNumber, data);
+    } catch (err: any) {
+      console.error("[dashboard] fetch-customer error", err);
+      toast({
+        title: "Account not checked",
+        description:
+          "We could not reach the bank to check this account. Please try again shortly.",
+        variant: "destructive",
+      });
     }
   };
 
@@ -592,276 +660,273 @@ export function DashboardClient({
     };
   }, [refreshLoanHistory]);
 
-  const renderAmount = (amount: number, isVisible: boolean) => {
-    if (!isVisible) {
-      return "******";
+  const activeProducts = useMemo(
+    () =>
+      (selectedProvider?.products ?? []).filter((p) => p.status === "Active"),
+    [selectedProvider]
+  );
+  const productsWithLoans = activeProducts.filter(
+    (p) => activeLoansByProduct[p.id]
+  );
+  const productsToBorrow = activeProducts.filter(
+    (p) => !activeLoansByProduct[p.id]
+  );
+  // Why nothing can be borrowed, shown under the limit (the products repeat it).
+  const limitReason = useMemo(() => {
+    if (availableToBorrow > 0) return "";
+    for (const p of activeProducts) {
+      const reason = eligibility.reasons[p.id];
+      if (reason && !(eligibility.limits[p.id] > 0)) return reason;
     }
-    return formatCurrency(amount);
-  };
+    return "";
+  }, [activeProducts, availableToBorrow, eligibility]);
+
+  const historyHref = `/history?${searchParams.toString()}`;
+  const greetingName = firstName(selectedAccount?.customerName);
+  const amount = (value: number) =>
+    hideAmounts ? "••••••" : formatMoney(value);
 
   return (
     <>
-      <div className="flex flex-col min-h-screen bg-background">
-        <main className="flex-1">
-          <div className="container py-2 md:py-4">
-            <div className="flex flex-col">
-              <div className="py-2">
-                <div className="flex justify-center space-x-4 overflow-x-auto">
-                  {providers.map((provider) => (
-                    <div
-                      key={provider.id}
-                      onClick={() => handleProviderSelect(provider.id)}
-                      className="flex flex-col items-center space-y-2 cursor-pointer flex-shrink-0"
-                    >
-                      <div
-                        className={cn(
-                          "h-20 w-20 rounded-full flex items-center justify-center border-2 transition-all",
-                          selectedProviderId === provider.id
-                            ? `border-current`
-                            : "border-transparent"
-                        )}
-                        style={{
-                          color:
-                            selectedProviderId === provider.id
-                              ? provider.colorHex
-                              : "transparent",
-                        }}
-                      >
-                        <div
-                          className={cn(
-                            "h-16 w-16 rounded-full bg-card flex items-center justify-center transition-all shadow-md hover:shadow-lg",
-                            selectedProviderId === provider.id
-                              ? "shadow-lg"
-                              : ""
-                          )}
-                        >
-                          {isRecalculating &&
-                          selectedProviderId === provider.id ? (
-                            <Loader2 className="h-8 w-8 animate-spin" />
-                          ) : (
-                            <IconDisplay
-                              iconName={provider.icon}
-                              className="h-8 w-8 text-muted-foreground"
-                            />
-                          )}
-                        </div>
-                      </div>
-                      <span
-                        className={cn(
-                          "text-sm font-medium",
-                          selectedProviderId === provider.id
-                            ? ""
-                            : "text-muted-foreground"
-                        )}
-                        style={{
-                          color:
-                            selectedProviderId === provider.id
-                              ? provider.colorHex
-                              : "",
-                        }}
-                      >
-                        {provider.name}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-
-              {selectedAccount && (
-                <Card
-                  className="my-4 cursor-pointer relative overflow-hidden"
-                  onClick={() => setShowAccountModal(true)}
-                  style={{
-                    backgroundColor: selectedProvider?.colorHex,
-                    color: "#ffffff",
-                  }}
-                >
-                  <div className="absolute inset-0 z-0 opacity-10">
-                    <svg
-                      width="100%"
-                      height="100%"
-                      xmlns="http://www.w3.org/2000/svg"
-                    >
-                      <defs>
-                        <pattern
-                          id="hex-pattern"
-                          patternUnits="userSpaceOnUse"
-                          width="40"
-                          height="69.28"
-                          patternTransform="scale(1) rotate(0)"
-                        >
-                          <polygon
-                            points="20,0 40,17.32 40,51.96 20,69.28 0,51.96 0,17.32"
-                            stroke="currentColor"
-                            strokeWidth="1.5"
-                            fill="none"
-                          />
-                        </pattern>
-                      </defs>
-                      <rect
-                        width="100%"
-                        height="100%"
-                        fill="url(#hex-pattern)"
-                      />
-                    </svg>
-                  </div>
-                  <CardContent className="p-4 relative z-10">
-                    <div className="flex items-center justify-between">
-                      <div>
-                        <p className="text-xs opacity-80">
-                          {selectedAccount.customerName}
-                        </p>
-                        <p className="font-semibold">
-                          {selectedAccount.accountNumber}
-                        </p>
-                      </div>
-                      <div className="text-right">
-                        <Badge className="bg-white/20 text-white border-none">
-                          Active
-                        </Badge>
-                      </div>
-                    </div>
-                    <Separator className="my-3 bg-white/20" />
-                    <div className="flex items-center justify-between w-full">
-                      <div className="text-left">
-                        <div className="flex items-center gap-2">
-                          <p className="text-sm opacity-80 mb-1">Max Limit</p>
-                          <button
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              setIsMaxLimitVisible((v) => !v);
-                            }}
-                            className="focus:outline-none"
-                          >
-                            {isMaxLimitVisible ? (
-                              <Eye className="h-4 w-4 opacity-80" />
-                            ) : (
-                              <EyeOff className="h-4 w-4 opacity-80" />
-                            )}
-                          </button>
-                        </div>
-                        {isRecalculating ? (
-                          <Skeleton className="h-7 w-32 bg-white/20" />
-                        ) : (
-                          <p className="text-xl font-semibold tracking-tight">
-                            {renderAmount(overallMaxLimit, isMaxLimitVisible)}
-                          </p>
-                        )}
-                      </div>
-                      <div className="text-right">
-                        <div className="flex items-center gap-2 justify-end">
-                          <p className="text-sm opacity-80 mb-1">Available</p>
-                          <button
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              setIsAvailableVisible((v) => !v);
-                            }}
-                            className="focus:outline-none"
-                          >
-                            {isAvailableVisible ? (
-                              <Eye className="h-4 w-4 opacity-80" />
-                            ) : (
-                              <EyeOff className="h-4 w-4 opacity-80" />
-                            )}
-                          </button>
-                        </div>
-                        {isRecalculating ? (
-                          <Skeleton className="h-7 w-32 bg-white/20" />
-                        ) : (
-                          <p className="text-xl font-semibold tracking-tight">
-                            {renderAmount(
-                              availableToBorrow,
-                              isAvailableVisible
-                            )}
-                          </p>
-                        )}
-                      </div>
-                    </div>
-                    {isUpdatingLimit && (
-                      <p className="mt-3 flex items-center gap-2 text-xs opacity-80">
-                        <Loader2 className="h-3 w-3 animate-spin" />
-                        Checking your account activity. Your limit will
-                        update shortly.
-                      </p>
-                    )}
-                  </CardContent>
-                </Card>
-              )}
-
-              <div className="flex justify-end mt-4">
-                <Link
-                  href={`/history?${searchParams.toString()}`}
-                  className="inline-flex items-center gap-2 rounded-md px-3 py-1.5 text-sm font-semibold transition-colors"
-                  style={{
-                    backgroundColor: selectedProvider
-                      ? `${selectedProvider.colorHex}20`
-                      : "#fdb91320",
-                    color: selectedProvider?.colorHex || "#fdb913",
-                  }}
-                >
-                  <span>Loan History</span>
-                  <ChevronRight className="h-4 w-4" />
-                </Link>
-              </div>
-
-              <div className="grid gap-8 grid-cols-1 mt-4">
-                <div className="md:col-span-2">
-                  {selectedProvider && (
-                    <Card>
-                      <CardHeader>
-                        <CardTitle>Available Loan Products</CardTitle>
-                        <CardDescription>
-                          Select a product from {selectedProvider.name} to
-                          apply.
-                        </CardDescription>
-                      </CardHeader>
-                      <CardContent className="space-y-4">
-                        {selectedProvider.products
-                          .filter((p) => p.status === "Active")
-                          .map((product) => {
-                            const productLimit =
-                              eligibility.limits[product.id] ?? 0;
-                            const isEligible = productLimit > 0;
-                            const reason =
-                              eligibility.reasons[product.id] || "";
-
-                            return (
-                              <ProductCard
-                                key={product.id}
-                                product={{
-                                  ...product,
-                                  availableLimit: productLimit,
-                                }}
-                                taxConfigs={taxConfigs}
-                                providerColor={selectedProvider.colorHex}
-                                activeLoan={activeLoansByProduct[product.id]}
-                                onApply={() => handleApply(product)}
-                                onRepay={handleRepay}
-                                IconDisplayComponent={IconDisplay}
-                                isEligible={isEligible}
-                                eligibilityReason={reason}
-                                availableToBorrow={availableToBorrow}
-                                asOfDate={asOfDate}
-                              />
-                            );
-                          })}
-                        {selectedProvider.products.filter(
-                          (p) => p.status === "Active"
-                        ).length === 0 && (
-                          <p className="text-sm text-muted-foreground text-center py-8">
-                            No active loan products available from this
-                            provider.
-                          </p>
-                        )}
-                      </CardContent>
-                    </Card>
-                  )}
-                </div>
-              </div>
-            </div>
+      <MiniAppShell brandColor={selectedProvider?.colorHex}>
+        {/* Who and where */}
+        <div className="flex items-center gap-3 pb-4">
+          <div
+            className="grid h-11 w-11 shrink-0 place-items-center overflow-hidden rounded-full border border-gray-200 bg-white"
+            aria-hidden
+          >
+            {selectedProvider ? (
+              <IconDisplay
+                iconName={selectedProvider.icon}
+                className="h-7 w-7 object-contain text-brand-ink"
+              />
+            ) : null}
           </div>
-        </main>
-      </div>
+          <div className="min-w-0 flex-1">
+            <p className="truncate text-xs font-medium text-gray-500">
+              {selectedProvider?.name ?? "Loans"}
+            </p>
+            <p className="truncate text-lg font-semibold leading-tight">
+              {greetingName ? `Hello, ${greetingName}` : "Welcome"}
+            </p>
+          </div>
+          <Link
+            href={historyHref}
+            className="inline-flex h-10 items-center gap-1.5 rounded-full border border-gray-200 bg-white px-3 text-sm font-medium text-gray-700 hover:bg-gray-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-ink"
+          >
+            <History className="h-4 w-4" aria-hidden />
+            My loans
+          </Link>
+        </div>
+
+        {/* Lender switcher: only when there is more than one lender */}
+        {providers.length > 1 && (
+          <div
+            role="tablist"
+            aria-label="Lenders"
+            className="no-scrollbar -mx-4 mb-4 flex gap-2 overflow-x-auto px-4"
+          >
+            {providers.map((provider) => {
+              const selected = selectedProvider?.id === provider.id;
+              return (
+                <button
+                  key={provider.id}
+                  type="button"
+                  role="tab"
+                  aria-selected={selected}
+                  onClick={() => !selected && handleProviderSelect(provider.id)}
+                  className={cn(
+                    "flex h-10 shrink-0 items-center gap-2 rounded-full border pl-1.5 pr-3.5 text-sm font-medium transition",
+                    selected
+                      ? "border-transparent bg-brand text-brand-fg shadow-sm"
+                      : "border-gray-200 bg-white text-gray-700 hover:bg-gray-50"
+                  )}
+                >
+                  <span className="grid h-7 w-7 place-items-center overflow-hidden rounded-full bg-white">
+                    {isRecalculating && selected ? (
+                      <Loader2 className="h-4 w-4 animate-spin text-gray-500" />
+                    ) : (
+                      <IconDisplay
+                        iconName={provider.icon}
+                        className="h-5 w-5 object-contain text-gray-600"
+                      />
+                    )}
+                  </span>
+                  {provider.name}
+                </button>
+              );
+            })}
+          </div>
+        )}
+
+        {/* Limit card */}
+        <section
+          aria-label="Your loan limit"
+          className="relative overflow-hidden rounded-3xl bg-brand p-5 text-brand-fg shadow-[0_12px_28px_-16px_rgba(0,0,0,0.45)]"
+        >
+          <div
+            aria-hidden
+            className="pointer-events-none absolute -right-12 -top-16 h-48 w-48 rounded-full bg-white/20"
+          />
+          <div
+            aria-hidden
+            className="pointer-events-none absolute -bottom-20 -left-8 h-44 w-44 rounded-full bg-black/5"
+          />
+          <div className="relative">
+            <div className="flex items-center justify-between gap-3">
+              <p className="text-sm font-medium opacity-80">
+                Available to borrow
+              </p>
+              <button
+                type="button"
+                onClick={toggleHideAmounts}
+                aria-pressed={hideAmounts}
+                aria-label={hideAmounts ? "Show amounts" : "Hide amounts"}
+                className="grid h-9 w-9 place-items-center rounded-full bg-black/5 hover:bg-black/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-current"
+              >
+                {hideAmounts ? (
+                  <EyeOff className="h-4 w-4" />
+                ) : (
+                  <Eye className="h-4 w-4" />
+                )}
+              </button>
+            </div>
+
+            {isRecalculating ? (
+              <>
+                <Skeleton className="mt-2 h-9 w-52 bg-black/10" />
+                <Skeleton className="mt-3 h-4 w-40 bg-black/10" />
+              </>
+            ) : (
+              <>
+                <Amount
+                  value={amount(availableToBorrow)}
+                  className="mt-1 block text-[34px] leading-tight"
+                />
+                {overallMaxLimit > 0 ? (
+                  <p className="mt-1 text-sm opacity-80">
+                    Your limit {amount(overallMaxLimit)} ETB
+                  </p>
+                ) : limitReason ? (
+                  <p className="mt-2 flex items-start gap-1.5 text-sm leading-snug opacity-90">
+                    <Info className="mt-0.5 h-4 w-4 shrink-0" aria-hidden />
+                    {limitReason}
+                  </p>
+                ) : null}
+              </>
+            )}
+
+            {isUpdatingLimit && (
+              <p className="mt-3 flex items-center gap-2 text-xs opacity-80">
+                <Loader2 className="h-3 w-3 animate-spin" aria-hidden />
+                Checking your account activity. Your limit will update
+                shortly.
+              </p>
+            )}
+
+            {selectedAccount && (
+              <button
+                type="button"
+                onClick={() => setShowAccountModal(true)}
+                className="mt-4 flex w-full items-center gap-3 rounded-2xl bg-white/30 px-3 py-2.5 text-left transition hover:bg-white/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-current"
+              >
+                <Landmark className="h-5 w-5 shrink-0 opacity-80" aria-hidden />
+                <span className="min-w-0 flex-1">
+                  <span className="block text-xs opacity-75">
+                    Loans are paid into
+                  </span>
+                  <span className="block truncate text-sm font-semibold">
+                    {maskAccount(selectedAccount.accountNumber)}
+                    {selectedAccount.customerName
+                      ? ` · ${titleCaseName(selectedAccount.customerName)}`
+                      : ""}
+                  </span>
+                </span>
+                <span className="flex items-center text-xs font-semibold">
+                  Change
+                  <ChevronRight className="h-4 w-4" aria-hidden />
+                </span>
+              </button>
+            )}
+          </div>
+        </section>
+
+        {selectedProvider && productsWithLoans.length > 0 && (
+          <>
+            <SectionTitle>Your loans</SectionTitle>
+            <div className="space-y-3">
+              {productsWithLoans.map((product) => (
+                <ProductCard
+                  key={product.id}
+                  product={product}
+                  taxConfigs={taxConfigs}
+                  activeLoan={activeLoansByProduct[product.id]}
+                  onApply={() => handleApply(product)}
+                  onRepay={handleRepay}
+                  IconDisplayComponent={IconDisplay}
+                  isEligible={false}
+                  eligibilityReason=""
+                  availableToBorrow={availableToBorrow}
+                  asOfDate={asOfDate}
+                  hideAmounts={hideAmounts}
+                />
+              ))}
+            </div>
+          </>
+        )}
+
+        {selectedProvider && (
+          <>
+            {(productsToBorrow.length > 0 || activeProducts.length === 0) && (
+              <SectionTitle>Borrow</SectionTitle>
+            )}
+            <div className="space-y-3">
+              {productsToBorrow.map((product) => {
+                const productLimit = eligibility.limits[product.id] ?? 0;
+                return (
+                  <ProductCard
+                    key={product.id}
+                    product={{ ...product, availableLimit: productLimit }}
+                    taxConfigs={taxConfigs}
+                    onApply={() => handleApply(product)}
+                    onRepay={handleRepay}
+                    IconDisplayComponent={IconDisplay}
+                    isEligible={productLimit > 0}
+                    eligibilityReason={eligibility.reasons[product.id] || ""}
+                    availableToBorrow={availableToBorrow}
+                    asOfDate={asOfDate}
+                    isLoadingLimit={isRecalculating}
+                    isApplying={applyingProductId === product.id}
+                    hideAmounts={hideAmounts}
+                  />
+                );
+              })}
+              {activeProducts.length === 0 && (
+                <Panel className="py-8 text-center text-sm text-gray-500">
+                  {selectedProvider.name} has no loans available right now.
+                </Panel>
+              )}
+            </div>
+          </>
+        )}
+
+        <Link
+          href={historyHref}
+          className="mt-6 flex items-center gap-3 rounded-2xl border border-gray-200/80 bg-white p-4 text-left hover:bg-gray-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-ink"
+        >
+          <span className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-gray-100 text-gray-600">
+            <History className="h-5 w-5" aria-hidden />
+          </span>
+          <span className="min-w-0 flex-1">
+            <span className="block text-sm font-semibold">Loan history</span>
+            <span className="block text-xs text-gray-500">
+              Past loans and repayments
+            </span>
+          </span>
+          <ChevronRight className="h-5 w-5 text-gray-400" aria-hidden />
+        </Link>
+      </MiniAppShell>
+
       {repayingLoanInfo && (
         <RepaymentDialog
           isOpen={isRepayDialogOpen}
@@ -874,126 +939,58 @@ export function DashboardClient({
           asOfDate={asOfDate}
         />
       )}
-      <Dialog
+
+      <BottomSheet
         open={isAgreementDialogOpen}
         onOpenChange={setIsAgreementDialogOpen}
-      >
-        <DialogContent className="sm:max-w-2xl">
-          <DialogHeader>
-            <DialogTitle>Terms &amp; Conditions</DialogTitle>
-            <DialogDescription>
-              Please read and accept the terms and conditions of{" "}
-              {selectedProvider?.name} to proceed.
-            </DialogDescription>
-          </DialogHeader>
-          <ScrollArea className="h-96 border rounded-md p-4 whitespace-pre-wrap">
-            {agreementState.terms?.content}
-          </ScrollArea>
-          <div className="flex items-center space-x-2 mt-4">
-            <Checkbox
-              id="terms"
-              checked={agreementChecked}
-              onCheckedChange={(checked) => setAgreementChecked(!!checked)}
-            />
+        title="Terms and conditions"
+        description={`Please read and accept the terms of ${selectedProvider?.name ?? "the lender"} to continue.`}
+        closeOnOutsideTap={false}
+        footer={
+          <div className="space-y-3">
             <label
               htmlFor="terms"
-              className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70"
+              className="flex cursor-pointer items-start gap-3 text-sm leading-snug"
             >
+              <Checkbox
+                id="terms"
+                checked={agreementChecked}
+                onCheckedChange={(checked) => setAgreementChecked(!!checked)}
+                className="mt-0.5 h-5 w-5 border-gray-400 data-[state=checked]:border-brand-ink data-[state=checked]:bg-brand-ink data-[state=checked]:text-white"
+              />
               I have read and agree to the terms and conditions.
             </label>
-          </div>
-          <DialogFooter>
-            <DialogClose asChild>
-              <Button variant="outline">Cancel</Button>
-            </DialogClose>
-            <Button
+            <BrandButton
+              block
+              size="lg"
               onClick={handleAcceptAgreement}
-              style={{ backgroundColor: selectedProvider?.colorHex }}
-              className="text-white"
               disabled={!agreementChecked}
+              loading={isSavingAgreement}
             >
-              I Agree
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-      <Dialog
-        open={showAccountModal}
-        onOpenChange={(open) => {
-          if (!open && !selectedAccount) return;
-          setShowAccountModal(open);
-        }}
+              Agree and continue
+            </BrandButton>
+          </div>
+        }
       >
-        <DialogContent className="sm:max-w-2xl">
-          <DialogHeader>
-            <DialogTitle>Select disbursement account</DialogTitle>
-            <DialogDescription>
-              Please choose the account to receive disbursements for this loan.
-              This selection is required.
-            </DialogDescription>
-          </DialogHeader>
-          {borrowerId && (
-            <div className="mt-4">
-              <AccountSelector
-                phoneNumber={borrowerId}
-                onSelected={(acc) => {
-                  (async () => {
-                    setSelectedAccount(acc);
-                    try {
-                      const providerIdToUse =
-                        selectedProviderId ||
-                        providerIdFromUrl ||
-                        providers[0]?.id;
-                      const res = await fetch(
-                        "/api/phone-accounts/fetch-customer",
-                        {
-                          method: "POST",
-                          headers: { "Content-Type": "application/json" },
-                          body: JSON.stringify({
-                            phoneNumber: borrowerId,
-                            accountNumber: acc.accountNumber,
-                            providerId: providerIdToUse,
-                          }),
-                        }
-                      );
-                      const data = await res.json();
-                      if (!res.ok) {
-                        toast({
-                          title: "Provisioning failed",
-                          description: data?.error || JSON.stringify(data),
-                          variant: "destructive",
-                        });
-                      } else {
-                        toast(
-                          data?.pending && !data?.saved && !data?.reused
-                            ? {
-                                title: "Fetching your details",
-                                description:
-                                  "Your limit will update in a moment.",
-                              }
-                            : {
-                                title: "Customer data saved",
-                                description:
-                                  "Customer details were saved for scoring.",
-                              }
-                        );
-                        followDataFetch(acc.accountNumber, data);
-                      }
-                    } catch (err: any) {
-                      toast({
-                        title: "Provisioning error",
-                        description: String(err?.message ?? err),
-                        variant: "destructive",
-                      });
-                    }
-                    setShowAccountModal(false);
-                  })();
-                }}
-              />
-            </div>
-          )}
-        </DialogContent>
-      </Dialog>
+        <div className="whitespace-pre-wrap rounded-xl bg-gray-50 p-4 text-sm leading-relaxed text-gray-700">
+          {agreementState.terms?.content}
+        </div>
+      </BottomSheet>
+
+      <BottomSheet
+        open={showAccountModal}
+        onOpenChange={setShowAccountModal}
+        dismissible={!!selectedAccount}
+        title="Choose your account"
+        description="Your loan is paid into this account, and your limit is based on its activity."
+      >
+        {borrowerId && (
+          <AccountSelector
+            phoneNumber={borrowerId}
+            onSelected={handleAccountSelected}
+          />
+        )}
+      </BottomSheet>
     </>
   );
 }

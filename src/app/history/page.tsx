@@ -11,6 +11,7 @@ import { calculateInstallmentPenalty } from '@/lib/installment-penalty';
 import { getAsOfDate } from '@/lib/date-utils';
 import { ensureInstallmentRollover } from '@/lib/installment-rollover';
 import { getPhoneNumbersForAccount } from '@/lib/account-utils';
+import { forBorrower } from '@/lib/miniapp/payload';
 
 
 const safeJsonParse = (jsonString: string | null | undefined, defaultValue: any) => {
@@ -26,7 +27,8 @@ async function getProviders(): Promise<LoanProvider[]> {
     const providers = await prisma.loanProvider.findMany({
         orderBy: { displayOrder: 'asc' }
     });
-    return providers as LoanProvider[];
+    // Only names and colours are used here; uploaded icons are large inline images.
+    return providers.map((p) => ({ ...p, icon: '' })) as LoanProvider[];
 }
 
 
@@ -77,7 +79,7 @@ async function getLoanHistory(borrowerId: string): Promise<LoanDetails[]> {
 
         return loans.map(loan => {
             const parsedProduct = {
-                ...loan.product,
+                ...forBorrower(loan.product),
                 serviceFee: safeJsonParse(loan.product.serviceFee as string, { type: 'percentage', value: 0 }),
                 dailyFee: safeJsonParse(loan.product.dailyFee as string, { type: 'percentage', value: 0, calculationBase: 'principal' }),
                 penaltyRules: safeJsonParse(loan.product.penaltyRules as string, []),

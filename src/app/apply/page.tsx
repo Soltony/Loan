@@ -1,10 +1,10 @@
 
-import { Logo } from '@/components/icons';
-import { Button } from '@/components/ui/button';
 import type { LoanProvider, FeeRule, PenaltyRule, Tax } from '@/lib/types';
 import { ApplyClient } from './client';
 import prisma from '@/lib/prisma';
 import { notFound } from 'next/navigation';
+import { MiniAppShell } from '@/components/miniapp/shell';
+import { forBorrower } from '@/lib/miniapp/payload';
 
 const safeJsonParse = (jsonString: string | null | undefined, defaultValue: any) => {
     if (!jsonString) return defaultValue;
@@ -32,10 +32,11 @@ async function getProvider(providerId: string): Promise<LoanProvider | null> {
 
     if (!provider) return null;
 
+    // Icons are not drawn on this page, and uploaded ones are large inline images.
     return {
         id: provider.id,
         name: provider.name,
-        icon: provider.icon,
+        icon: '',
         colorHex: provider.colorHex,
         displayOrder: provider.displayOrder,
         accountNumber: provider.accountNumber,
@@ -44,7 +45,7 @@ async function getProvider(providerId: string): Promise<LoanProvider | null> {
         allowCrossProviderLoans: provider.allowCrossProviderLoans,
         nplThresholdDays: provider.nplThresholdDays,
         products: provider.products.map(prod => ({
-            ...prod,
+            ...forBorrower(prod),
             serviceFee: safeJsonParse(prod.serviceFee, { type: 'percentage', value: 0 }) as FeeRule,
             dailyFee: safeJsonParse(prod.dailyFee, { type: 'percentage', value: 0 }) as FeeRule,
             penaltyRules: safeJsonParse(prod.penaltyRules, []) as PenaltyRule[],
@@ -74,16 +75,20 @@ export default async function ApplyPage({ searchParams }: { searchParams: Promis
 
     if (!selectedProvider) {
         return (
-             <div className="flex flex-col min-h-screen bg-background items-center justify-center">
-                <div className="flex flex-col items-center gap-4 text-center">
-                    <Logo className="h-12 w-12 text-destructive" />
-                    <h2 className="text-xl font-semibold">Provider Not Found</h2>
-                    <p className="text-muted-foreground max-w-sm">The loan provider you selected could not be found. It may no longer be available.</p>
-                    <Button asChild>
-                        <a href="/loan">Go Back to Dashboard</a>
-                    </Button>
+            <MiniAppShell title="Apply" backHref="/loan">
+                <div className="flex flex-col items-center px-4 pt-16 text-center">
+                    <h2 className="text-lg font-semibold">This lender is not available</h2>
+                    <p className="mt-2 max-w-sm text-sm text-gray-500">
+                        The lender you chose could not be found. It may no longer offer loans here.
+                    </p>
+                    <a
+                        href="/loan"
+                        className="mt-6 inline-flex h-11 items-center rounded-xl bg-brand px-5 text-sm font-semibold text-brand-fg"
+                    >
+                        Back to loans
+                    </a>
                 </div>
-            </div>
+            </MiniAppShell>
         )
     }
 

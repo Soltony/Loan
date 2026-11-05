@@ -12,6 +12,7 @@ import { getAsOfDate } from '@/lib/date-utils';
 import { ensureInstallmentRollover } from '@/lib/installment-rollover';
 import { syncCbsDeletionForBorrower } from '@/actions/cbs-npl';
 import { repaymentBehaviorFor } from '@/lib/credit-history';
+import { forBorrower } from '@/lib/miniapp/payload';
 
 const paymentSchema = z.object({
     loanId: z.string(),
@@ -474,7 +475,8 @@ export async function POST(req: NextRequest) {
         // their account from CBS NPL monitoring (best-effort, non-blocking).
         void syncCbsDeletionForBorrower(loan.borrowerId, { source: 'MANUAL' });
 
-        return NextResponse.json(updatedLoan, { status: 200 });
+        // The borrower gets their loan back, not the product's list of every customer's salary.
+        return NextResponse.json({ ...updatedLoan, product: forBorrower(updatedLoan.product) }, { status: 200 });
 
     } catch (error: any) {
         if (error instanceof MiniAppAuthError) {

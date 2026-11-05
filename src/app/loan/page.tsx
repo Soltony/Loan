@@ -10,6 +10,7 @@ import { calculateInstallmentPenalty } from '@/lib/installment-penalty';
 import { getAsOfDate } from '@/lib/date-utils';
 import { ensureInstallmentRollover } from '@/lib/installment-rollover';
 import { getPhoneNumbersForAccount } from '@/lib/account-utils';
+import { forBorrower } from '@/lib/miniapp/payload';
 
 // Helper function to safely parse JSON from DB
 const safeJsonParse = (jsonString: string | null | undefined, defaultValue: any) => {
@@ -65,6 +66,11 @@ async function getProviders(): Promise<LoanProvider[]> {
                 requiredDocuments: safeJsonParse(prod.requiredDocuments, []) as any,
                 status: prod.status as 'Active' | 'Disabled',
                 allowConcurrentLoans: prod.allowConcurrentLoans,
+                // The fee switches the loan calculator honours, so the dashboard lists only
+                // the fees that are charged.
+                serviceFeeEnabled: prod.serviceFeeEnabled,
+                dailyFeeEnabled: prod.dailyFeeEnabled,
+                penaltyRulesEnabled: prod.penaltyRulesEnabled,
             }))
         })) as unknown as LoanProvider[];
     } catch(e) {
@@ -129,7 +135,7 @@ async function getLoanHistory(borrowerId: string): Promise<LoanDetails[]> {
             repaidAmount: loan.repaidAmount || 0,
             penaltyAmount: loan.penaltyAmount,
             product: {
-                ...loan.product,
+                ...forBorrower(loan.product),
                 id: loan.product.id,
                 providerId: loan.product.providerId,
                 serviceFee: safeJsonParse(loan.product.serviceFee, { type: 'percentage', value: 0 }),

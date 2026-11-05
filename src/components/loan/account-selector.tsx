@@ -1,6 +1,11 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { Check, Landmark, RefreshCw } from "lucide-react";
+import { cn } from "@/lib/utils";
+import { maskAccount, titleCaseName } from "@/lib/miniapp/format";
+import { BrandButton, Notice } from "@/components/miniapp/ui";
+import { Skeleton } from "@/components/ui/skeleton";
 
 type ExternalAccount = {
   AccountNumber: number | string;
@@ -21,84 +26,93 @@ type Props = {
   onSelected?: (account: PhoneAccount) => void;
 };
 
+/** One row of the picker: a bank account, saved for this phone or not yet. */
+type AccountOption = {
+  accountNumber: string;
+  name: string;
+  status?: string;
+  association?: PhoneAccount;
+};
+
+// Refusals the server words for customers (ownership checks); anything else is generic.
+async function customerMessage(res: Response, fallback: string): Promise<string> {
+  const text = await res.text().catch(() => "");
+  console.warn(`[AccountSelector] ${res.status} ${text}`);
+  if (res.status === 403 || res.status === 503) {
+    try {
+      const body = JSON.parse(text);
+      if (typeof body?.error === "string" && body.error !== "Forbidden") return body.error;
+    } catch {
+      // not JSON
+    }
+  }
+  return fallback;
+}
+
 export default function AccountSelector({ phoneNumber, onSelected }: Props) {
   const [externalAccounts, setExternalAccounts] = useState<
     ExternalAccount[] | null
   >(null);
   const [associations, setAssociations] = useState<PhoneAccount[]>([]);
-  const [loading, setLoading] = useState(false);
+  const [associationsLoaded, setAssociationsLoaded] = useState(false);
+  const [loadFailed, setLoadFailed] = useState(false);
+  const [busyAccount, setBusyAccount] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [selected, setSelected] = useState<string | null>(null);
 
   useEffect(() => {
     if (!phoneNumber) return;
-    console.info(`[AccountSelector] phoneNumber set: ${phoneNumber}`);
     fetchAssociations();
     fetchExternalAccounts();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [phoneNumber]);
 
   async function fetchExternalAccounts() {
-    setError(null);
+    setLoadFailed(false);
     setExternalAccounts(null);
     try {
-      console.info(
-        `[AccountSelector] fetching external accounts for ${phoneNumber}`
-      );
       const res = await fetch("/api/loan-accounts", {
         method: "POST",
         body: JSON.stringify({ phoneNumber }),
         headers: { "Content-Type": "application/json" },
       });
       if (!res.ok) {
-        const txt = await res.text();
+        const txt = await res.text().catch(() => "");
         console.warn(
           `[AccountSelector] external service returned ${res.status} ${txt}`
         );
-        setError(`External service error: ${res.status} ${txt}`);
+        setLoadFailed(true);
+        setExternalAccounts([]);
         return;
       }
       const data = await res.json();
       // upstream returns { details: [...] }
-      const list = data?.details ?? [];
-      console.info(
-        `[AccountSelector] external accounts fetched: ${list.length}`
-      );
-      setExternalAccounts(list);
+      setExternalAccounts(data?.details ?? []);
     } catch (err: any) {
       console.error("[AccountSelector] fetchExternalAccounts error", err);
-      setError(String(err?.message ?? err));
+      setLoadFailed(true);
+      setExternalAccounts([]);
     }
   }
 
   async function fetchAssociations() {
     try {
-      console.info(
-        `[AccountSelector] fetching associations for ${phoneNumber}`
-      );
       const url = `/api/phone-accounts?phoneNumber=${encodeURIComponent(
         phoneNumber
       )}`;
       const res = await fetch(url);
       if (!res.ok) return;
       const items = await res.json();
-      console.info(
-        `[AccountSelector] associations fetched: ${items?.length ?? 0}`
-      );
-      setAssociations(items);
-      const active = items.find((i: PhoneAccount) => i.isActive);
-      if (active) setSelected(active.accountNumber);
+      setAssociations(Array.isArray(items) ? items : []);
     } catch (err) {
       console.error("[AccountSelector] fetchAssociations error", err);
-      // ignore
+    } finally {
+      setAssociationsLoaded(true);
     }
   }
 
   async function handleSave(accountNumber: string, customerName?: string) {
-    setLoading(true);
+    setBusyAccount(accountNumber);
     setError(null);
-    console.info(
-      `[AccountSelector] saving association ${accountNumber} for ${phoneNumber}`
-    );
     try {
       const res = await fetch("/api/phone-accounts", {
         method: "POST",
@@ -111,32 +125,30 @@ export default function AccountSelector({ phoneNumber, onSelected }: Props) {
         }),
       });
       if (!res.ok) {
-        const txt = await res.text();
-        console.warn(`[AccountSelector] save failed ${res.status} ${txt}`);
-        setError(`Save failed: ${res.status} ${txt}`);
+        setError(
+          await customerMessage(
+            res,
+            "We could not select this account. Please try again."
+          )
+        );
         return;
       }
       const saved = await res.json();
-      console.info("[AccountSelector] association saved", saved);
-      // refresh
       await fetchAssociations();
-      setSelected(saved.accountNumber);
       // The parent's onSelected calls /api/phone-accounts/fetch-customer, which also
       // refreshes the account's statement figures in the background.
       onSelected?.(saved);
     } catch (err: any) {
       console.error("[AccountSelector] handleSave error", err);
-      setError(String(err?.message ?? err));
+      setError("We could not reach the bank. Check your connection and try again.");
     } finally {
-      setLoading(false);
+      setBusyAccount(null);
     }
   }
 
   async function handleSetActive(accountNumber: string) {
-    setLoading(true);
-    console.info(
-      `[AccountSelector] setting active account ${accountNumber} for ${phoneNumber}`
-    );
+    setBusyAccount(accountNumber);
+    setError(null);
     try {
       const res = await fetch("/api/phone-accounts", {
         method: "PATCH",
@@ -144,113 +156,160 @@ export default function AccountSelector({ phoneNumber, onSelected }: Props) {
         body: JSON.stringify({ phoneNumber, accountNumber }),
       });
       if (!res.ok) {
-        console.warn(`[AccountSelector] setActive failed ${res.status}`);
-        setError(`Set active failed: ${res.status}`);
-      } else {
-        const updated = await res.json();
-        console.info("[AccountSelector] active set", updated);
-        await fetchAssociations();
-        setSelected(updated.accountNumber);
-        onSelected?.(updated);
+        setError(
+          await customerMessage(
+            res,
+            "We could not switch to this account. Please try again."
+          )
+        );
+        return;
       }
+      const updated = await res.json();
+      await fetchAssociations();
+      onSelected?.(updated);
     } catch (err: any) {
       console.error("[AccountSelector] handleSetActive error", err);
-      setError(String(err?.message ?? err));
+      setError("We could not reach the bank. Check your connection and try again.");
     } finally {
-      setLoading(false);
+      setBusyAccount(null);
     }
   }
 
+  // The bank's list first, then saved accounts the bank did not return (e.g. when the
+  // bank's service is down), so the customer can still switch between them.
+  const options = useMemo<AccountOption[]>(() => {
+    const byNumber = new Map<string, AccountOption>();
+    for (const ea of externalAccounts ?? []) {
+      const accountNumber = String(ea.AccountNumber);
+      byNumber.set(accountNumber, {
+        accountNumber,
+        name: ea.Name,
+        status: ea.Status,
+        association: associations.find((a) => a.accountNumber === accountNumber),
+      });
+    }
+    for (const a of associations) {
+      if (!byNumber.has(a.accountNumber)) {
+        byNumber.set(a.accountNumber, {
+          accountNumber: a.accountNumber,
+          name: a.customerName ?? "",
+          association: a,
+        });
+      }
+    }
+    return [...byNumber.values()];
+  }, [externalAccounts, associations]);
+
+  const isLoading = externalAccounts === null || !associationsLoaded;
+
+  const choose = (option: AccountOption) => {
+    if (busyAccount) return;
+    if (option.association?.isActive) {
+      onSelected?.(option.association);
+      return;
+    }
+    if (option.association) handleSetActive(option.accountNumber);
+    else handleSave(option.accountNumber, option.name);
+  };
+
   return (
     <div className="space-y-3">
-      <div>
-        <strong>Phone:</strong> <span className="font-mono">{phoneNumber}</span>
-      </div>
+      {error && <Notice tone="danger">{error}</Notice>}
 
-      <div>
-        <h4 className="font-medium">Existing associations</h4>
-        {associations.length === 0 ? (
-          <div className="text-sm text-muted-foreground">No saved accounts</div>
-        ) : (
-          <ul className="space-y-2 overflow-y-auto max-h-56 pr-2">
-            {associations.map((a) => (
-              <li key={a.id} className="flex items-center justify-between">
-                <div>
-                  <div className="font-mono">{a.accountNumber}</div>
-                  <div className="text-sm">{a.customerName}</div>
-                </div>
-                <div>
-                  {a.isActive ? (
-                    <span className="text-green-600 font-medium">Active</span>
-                  ) : (
-                    <button
-                      className="btn"
-                      onClick={() => handleSetActive(a.accountNumber)}
-                      disabled={loading}
-                    >
-                      Set Active
-                    </button>
+      {isLoading ? (
+        <div className="space-y-2" aria-busy="true" aria-label="Loading your accounts">
+          {[0, 1].map((i) => (
+            <div key={i} className="flex items-center gap-3 rounded-2xl border border-gray-200 p-3">
+              <Skeleton className="h-10 w-10 rounded-xl bg-gray-100" />
+              <div className="flex-1 space-y-2">
+                <Skeleton className="h-4 w-28 bg-gray-100" />
+                <Skeleton className="h-3 w-40 bg-gray-100" />
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : options.length === 0 ? (
+        <div className="rounded-2xl border border-dashed border-gray-300 px-4 py-6 text-center">
+          <p className="text-sm font-medium text-gray-900">
+            {loadFailed ? "We could not load your accounts" : "No accounts found"}
+          </p>
+          <p className="mt-1 text-sm text-gray-500">
+            {loadFailed
+              ? "The bank did not respond. Please try again in a moment."
+              : "We found no bank accounts registered to your phone number."}
+          </p>
+          <BrandButton
+            variant="outline"
+            size="sm"
+            className="mt-4"
+            onClick={() => {
+              fetchAssociations();
+              fetchExternalAccounts();
+            }}
+          >
+            <RefreshCw className="h-4 w-4" aria-hidden />
+            Try again
+          </BrandButton>
+        </div>
+      ) : (
+        <ul className="space-y-2" role="radiogroup" aria-label="Your bank accounts">
+          {options.map((option) => {
+            const active = !!option.association?.isActive;
+            const busy = busyAccount === option.accountNumber;
+            return (
+              <li key={option.accountNumber}>
+                <button
+                  type="button"
+                  role="radio"
+                  aria-checked={active}
+                  disabled={!!busyAccount && !busy}
+                  onClick={() => choose(option)}
+                  className={cn(
+                    "flex w-full items-center gap-3 rounded-2xl border p-3 text-left transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-ink disabled:opacity-60",
+                    active
+                      ? "border-brand-ink bg-brand-soft"
+                      : "border-gray-200 bg-white hover:bg-gray-50"
                   )}
-                </div>
-              </li>
-            ))}
-          </ul>
-        )}
-      </div>
-
-      <div>
-        <h4 className="font-medium">Accounts</h4>
-        {error && <div className="text-red-600 text-sm">{error}</div>}
-        {externalAccounts === null ? (
-          <div className="text-sm text-muted-foreground">Loading...</div>
-        ) : externalAccounts.length === 0 ? (
-          <div className="text-sm text-muted-foreground">
-            No accounts found for this phone
-          </div>
-        ) : (
-          <ul className="space-y-2 overflow-y-auto max-h-56 pr-2">
-            {externalAccounts.map((ea, idx) => {
-              const accNum = String(ea.AccountNumber);
-              const associated = associations.find(
-                (s) => s.accountNumber === accNum
-              );
-              return (
-                <li key={idx} className="flex items-center justify-between">
-                  <div>
-                    <div className="font-mono">{accNum}</div>
-                    <div className="text-sm">
-                      {ea.Name} {ea.Status ? `(${ea.Status})` : ""}
-                    </div>
-                  </div>
-                  <div>
-                    {associated ? (
-                      associated.isActive ? (
-                        <span className="text-green-600">Selected</span>
-                      ) : (
-                        <button
-                          className="btn"
-                          onClick={() => handleSetActive(accNum)}
-                          disabled={loading}
-                        >
-                          Use
-                        </button>
-                      )
-                    ) : (
-                      <button
-                        className="btn"
-                        onClick={() => handleSave(accNum, ea.Name)}
-                        disabled={loading}
-                      >
-                        Select
-                      </button>
+                >
+                  <span
+                    className={cn(
+                      "grid h-10 w-10 shrink-0 place-items-center rounded-xl",
+                      active ? "bg-white text-brand-ink" : "bg-gray-100 text-gray-600"
                     )}
-                  </div>
-                </li>
-              );
-            })}
-          </ul>
-        )}
-      </div>
+                    aria-hidden
+                  >
+                    <Landmark className="h-5 w-5" />
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block font-semibold tabular-nums">
+                      {maskAccount(option.accountNumber)}
+                    </span>
+                    <span className="block truncate text-sm text-gray-500">
+                      {titleCaseName(option.name) || "Bank account"}
+                      {option.status ? ` · ${option.status}` : ""}
+                    </span>
+                  </span>
+                  {busy ? (
+                    <span className="h-5 w-5 animate-spin rounded-full border-2 border-gray-300 border-t-brand-ink" aria-label="Saving" />
+                  ) : active ? (
+                    <span className="grid h-6 w-6 place-items-center rounded-full bg-brand-ink text-white">
+                      <Check className="h-4 w-4" aria-hidden />
+                    </span>
+                  ) : (
+                    <span className="h-6 w-6 rounded-full border-2 border-gray-300" aria-hidden />
+                  )}
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+
+      {!isLoading && loadFailed && options.length > 0 && (
+        <p className="text-xs text-gray-500">
+          The bank did not return your latest accounts, so only saved accounts are shown.
+        </p>
+      )}
     </div>
   );
 }

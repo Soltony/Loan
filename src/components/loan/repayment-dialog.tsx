@@ -1,22 +1,15 @@
-
 'use client';
 
 import { useState, useMemo, useEffect } from 'react';
-import type { LoanDetails, LoanProduct, Tax } from '@/lib/types';
-import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogClose } from '@/components/ui/dialog';
-import { Button } from '@/components/ui/button';
-import { X, Delete, Loader2 } from 'lucide-react';
-import { differenceInDays } from 'date-fns';
+import type { LoanDetails, Tax } from '@/lib/types';
+import { ChevronDown, Delete, Loader2 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { calculateInstallmentDueBreakdown, calculateTotalRepayableDetailed } from '@/lib/loan-calculator';
 import { useToast } from '@/hooks/use-toast';
-import { Alert, AlertDescription, AlertTitle } from '../ui/alert';
-import { AlertCircle } from 'lucide-react';
-
-const formatCurrency = (amount: number) => {
-    if (amount === null || amount === undefined || isNaN(amount)) return '0.00';
-    return new Intl.NumberFormat('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(amount) + ' ETB';
-};
+import { BottomSheet } from '@/components/miniapp/bottom-sheet';
+import { DetailRow } from '@/components/miniapp/ui';
+import { brandCssVars } from '@/lib/miniapp/brand';
+import { formatETB, formatMoney } from '@/lib/miniapp/format';
 
 interface RepaymentDialogProps {
     isOpen: boolean;
@@ -38,16 +31,32 @@ declare global {
   }
 }
 
-export function RepaymentDialog({ isOpen, onClose, onConfirm, loan, totalBalanceDue, providerColor = '#fdb913', taxConfigs, asOfDate }: RepaymentDialogProps) {
+const KEYS = ['1', '2', '3', '4', '5', '6', '7', '8', '9'];
+
+/** The typed amount with thousands separators: "10039.5" -> "10,039.5". */
+const groupDigits = (raw: string) => {
+    if (!raw) return '0';
+    const [whole, fraction] = raw.split('.');
+    const grouped = (whole || '0').replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+    return fraction !== undefined ? `${grouped}.${fraction}` : grouped;
+};
+
+export function RepaymentDialog({ isOpen, onClose, loan, totalBalanceDue, providerColor, taxConfigs, asOfDate }: RepaymentDialogProps) {
     const [amount, setAmount] = useState('');
+    // The amount is still the pre-filled one: the first key typed replaces it.
+    const [pristine, setPristine] = useState(true);
     const [error, setError] = useState('');
+    const [payError, setPayError] = useState('');
     const [isProcessing, setIsProcessing] = useState(false);
+    const [showBreakdown, setShowBreakdown] = useState(false);
     const { toast } = useToast();
 
     useEffect(() => {
         if (isOpen) {
             setAmount(totalBalanceDue.toFixed(2));
+            setPristine(true);
             setError('');
+            setPayError('');
             setIsProcessing(false);
         }
     }, [isOpen, totalBalanceDue, loan?.id]);
@@ -60,28 +69,42 @@ export function RepaymentDialog({ isOpen, onClose, onConfirm, loan, totalBalance
     const validateAmount = (value: string) => {
         const numericAmount = parseFloat(value);
         if (isNaN(numericAmount) || numericAmount <= 0) {
-            setError('Please enter a valid amount.');
+            setError('Enter an amount to pay.');
             return false;
         }
         if (numericAmount > totalBalanceDue + 1e-9) { // Use a small epsilon for float comparison
-            setError(`Amount cannot be more than the balance due of ${formatCurrency(totalBalanceDue)}.`);
+            setError(`You can pay at most ${formatETB(totalBalanceDue)}.`);
             return false;
         }
         setError('');
         return true;
     }
 
-    const handleNumberClick = (num: string) => {
-        if (num === '.' && amount.includes('.')) return;
-        const newAmount = amount + num;
-        setAmount(newAmount);
-        validateAmount(newAmount);
+    const updateAmount = (next: string) => {
+        setAmount(next);
+        setPayError('');
+        validateAmount(next);
+    };
+
+    const handleNumberClick = (key: string) => {
+        const base = pristine ? '' : amount;
+        setPristine(false);
+        if (key === '.' && base.includes('.')) return;
+        const dot = base.indexOf('.');
+        if (dot !== -1 && key !== '.' && base.length - dot > 2) return; // two decimals at most
+        let next = base === '' && key === '.' ? '0.' : base + key;
+        next = next.replace(/^0+(?=\d)/, ''); // no leading zeros
+        updateAmount(next);
     };
 
     const handleBackspace = () => {
-        const newAmount = amount.slice(0, -1);
-        setAmount(newAmount);
-        validateAmount(newAmount);
+        setPristine(false);
+        updateAmount(amount.slice(0, -1));
+    };
+
+    const payFullAmount = () => {
+        setPristine(true);
+        updateAmount(totalBalanceDue.toFixed(2));
     };
 
     const handleConfirm = async () => {
@@ -91,7 +114,7 @@ export function RepaymentDialog({ isOpen, onClose, onConfirm, loan, totalBalance
         }
 
         setIsProcessing(true);
-        setError('');
+        setPayError('');
 
         try {
             // Step 1: Call our backend to get the payment token
@@ -102,19 +125,19 @@ export function RepaymentDialog({ isOpen, onClose, onConfirm, loan, totalBalance
             });
 
             if (!initiateResponse.ok) {
-                const errorData = await initiateResponse.json();
-                throw new Error(errorData.error || 'Failed to initiate payment.');
+                const errorData = await initiateResponse.json().catch(() => ({}));
+                throw new Error(errorData.error || 'We could not start the payment. Please try again.');
             }
 
-            const { paymentToken, transactionId } = await initiateResponse.json();
+            const { paymentToken } = await initiateResponse.json();
 
             // Step 2: Post the payment token to the Super App via JS Channel
             if (typeof window !== 'undefined' && window.myJsChannel?.postMessage) {
               window.myJsChannel.postMessage(JSON.stringify({ token: paymentToken }));
-              
+
               toast({
-                  title: 'Processing Payment',
-                  description: 'Your payment request has been sent to the Super App for completion.',
+                  title: 'Complete your payment',
+                  description: 'Confirm the payment in the app to finish repaying.',
               });
 
               // NOTE: The actual loan update will happen when the callback is received.
@@ -123,17 +146,15 @@ export function RepaymentDialog({ isOpen, onClose, onConfirm, loan, totalBalance
 
             } else {
               console.error("NIB Super App channel (window.myJsChannel) not found.");
-              throw new Error("Could not communicate with the payment app.");
+              throw new Error("We couldn't open the payment screen. Please reopen Loans from the app and try again.");
             }
 
         } catch (err: any) {
-            setError(err.message || 'An unknown error occurred during payment.');
+            setPayError(err.message || 'Something went wrong with the payment. Please try again.');
         } finally {
             setIsProcessing(false);
         }
     };
-
-    const numberPadKeys = ['1', '2', '3', '4', '5', '6', '7', '8', '9'];
 
     const activeInstallment = useMemo(() => {
         const installments = Array.isArray((loan as any)?.installments) ? (loan as any).installments : [];
@@ -149,13 +170,13 @@ export function RepaymentDialog({ isOpen, onClose, onConfirm, loan, totalBalance
     }, [loan, activeInstallment]);
 
     const isInstallmentPayment = !!activeInstallment;
-    
+
     const breakdown = useMemo(() => {
         if (!loan || !loan.product) return { principal: 0, interest: 0, penalty: 0, serviceFee: 0, tax: 0 };
-        
+
         // Calculate totals with detailed breakdown of what's been paid
         const totals = calculateTotalRepayableDetailed(loan, loan.product, taxConfigs, asOfDate);
-        
+
         // For installment-based loans - principal is per installment, but interest/penalty on full loan
         if (isInstallmentPayment && activeInstallment) {
             const due = calculateInstallmentDueBreakdown({
@@ -174,24 +195,24 @@ export function RepaymentDialog({ isOpen, onClose, onConfirm, loan, totalBalance
                 tax: due.taxDue,
             };
         }
-        
+
         // For non-installment loans
         // Use the same payment priority estimation
         const alreadyRepaid = loan.repaidAmount || 0;
         let remaining = alreadyRepaid;
-        
+
         const penaltyPaid = Math.min(totals.penalty, remaining);
         remaining = Math.max(0, remaining - penaltyPaid);
-        
+
         const serviceFeePaid = Math.min(totals.serviceFee, remaining);
         remaining = Math.max(0, remaining - serviceFeePaid);
-        
+
         const interestPaid = Math.min(totals.interest, remaining);
         remaining = Math.max(0, remaining - interestPaid);
-        
+
         const taxPaid = Math.min(totals.tax, remaining);
         remaining = Math.max(0, remaining - taxPaid);
-        
+
         const principalPaid = remaining;
 
         return {
@@ -203,127 +224,118 @@ export function RepaymentDialog({ isOpen, onClose, onConfirm, loan, totalBalance
         };
     }, [loan, taxConfigs, isInstallmentPayment, activeInstallment, asOfDate]);
 
+    const breakdownRows = [
+        { label: 'Principal', value: breakdown.principal },
+        { label: 'Service fee', value: breakdown.serviceFee },
+        { label: 'Daily fee', value: breakdown.interest },
+        { label: 'Penalty', value: breakdown.penalty },
+        { label: 'Tax', value: breakdown.tax },
+    ].filter((row) => row.value > 0.004);
+
+    const isFullAmount = Math.abs((parseFloat(amount) || 0) - totalBalanceDue) < 0.005;
+    const keyClass = 'flex h-14 items-center justify-center bg-white text-2xl font-medium text-gray-900 transition active:bg-gray-100 focus-visible:relative focus-visible:z-10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-ink disabled:text-gray-300';
+
     return (
-        <Dialog open={isOpen} onOpenChange={(open) => !open && onClose()}>
-            <DialogContent className="sm:max-w-md p-0" onPointerDownOutside={(e) => e.preventDefault()}>
-                <DialogHeader className="p-6 pb-2 flex-row justify-between items-center">
-                    <DialogTitle className="text-center text-xl flex-1">Set Amount</DialogTitle>
-                    <DialogClose asChild>
-                         <Button
-                            variant="ghost"
-                            size="icon"
-                            className="h-8 w-8 rounded-full hover:bg-primary/10"
-                            style={{'--primary': providerColor} as React.CSSProperties}
-                        >
-                            <X className="h-5 w-5" style={{ color: providerColor }}/>
-                        </Button>
-                    </DialogClose>
-                </DialogHeader>
-                <div className="px-6 space-y-4">
-                    <div className="relative">
-                        <input
-                            type="text"
-                            readOnly
-                            value={amount}
-                            placeholder="0.00"
-                            className={cn(
-                                "w-full text-center text-4xl font-bold border-b-2 py-2 bg-transparent outline-none",
-                                error ? "border-destructive" : ""
-                            )}
-                            style={{ borderColor: error ? 'hsl(var(--destructive))' : providerColor }}
-                        />
-                         <span className="absolute right-0 top-1/2 -translate-y-1/2 text-muted-foreground">ETB</span>
-                    </div>
-                     {error ? (
-                         <Alert variant="destructive" className="p-2 text-center">
-                            <AlertCircle className="h-4 w-4" />
-                            <AlertDescription>{error}</AlertDescription>
-                         </Alert>
+        <BottomSheet
+            open={isOpen}
+            onOpenChange={(open) => !open && onClose()}
+            title="Repay loan"
+            description={`${loan?.productName ?? 'Loan'}${activeInstallment ? ` · Installment ${activeInstallment.installmentNumber}` : ''}`}
+            closeOnOutsideTap={false}
+            style={providerColor ? (brandCssVars(providerColor) as React.CSSProperties) : undefined}
+            bodyClassName="px-0 pb-0 pt-3"
+        >
+            <div className="px-5">
+                <div className="text-center">
+                    <p className="text-xs font-medium text-gray-500">Amount to pay</p>
+                    <p
+                        aria-live="polite"
+                        className={cn(
+                            'mt-1 truncate text-[40px] font-bold leading-tight tabular-nums tracking-tight',
+                            error ? 'text-red-600' : 'text-gray-900',
+                        )}
+                    >
+                        {groupDigits(amount)}
+                        <span className="ml-1.5 text-lg font-semibold text-gray-400">ETB</span>
+                    </p>
+                    <div aria-hidden className={cn('mx-auto mt-1 h-1 w-24 rounded-full', error ? 'bg-red-500' : 'bg-brand')} />
+                </div>
+
+                <div className="mt-3 flex justify-center">
+                    <button
+                        type="button"
+                        onClick={payFullAmount}
+                        aria-pressed={isFullAmount}
+                        className={cn(
+                            'rounded-full border px-3.5 py-1.5 text-sm font-medium transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-ink',
+                            isFullAmount ? 'border-transparent bg-brand-soft text-brand-ink' : 'border-gray-300 text-gray-700 hover:bg-gray-50',
+                        )}
+                    >
+                        {isInstallmentPayment ? 'Full amount due' : 'Full balance'} · {formatMoney(totalBalanceDue)}
+                    </button>
+                </div>
+
+                <div className="mt-3 min-h-[20px] text-center text-sm" aria-live="polite">
+                    {error ? (
+                        <p className="text-red-600">{error}</p>
+                    ) : payError ? (
+                        <p role="alert" className="text-red-600">{payError}</p>
                     ) : (
-                        <div className="text-center text-sm text-muted-foreground space-y-1">
-                            {isInstallmentPayment && activeInstallment && (
-                                <div className="text-xs space-y-1">
-                                    <p>
-                                        Paying installment {activeInstallment.installmentNumber} (penalty shown as of today)
-                                    </p>
-                                    {mergedNextInstallment && (
-                                        <p className="text-muted-foreground">
-                                            Installments merged: includes installment {mergedNextInstallment.installmentNumber}
-                                        </p>
-                                    )}
-                                </div>
-                            )}
-                            <div className="grid grid-cols-3 gap-2 text-xs text-left">
-                                <span className="col-span-2">Principal Due:</span>
-                                <span className="text-right font-medium text-foreground">{formatCurrency(breakdown.principal)}</span>
-
-                                <span className="col-span-2">Service Fee Due:</span>
-                                <span className="text-right font-medium text-foreground">{formatCurrency(breakdown.serviceFee)}</span>
-
-                                <span className="col-span-2">Interest Due:</span>
-                                <span className="text-right font-medium text-foreground">{formatCurrency(breakdown.interest)}</span>
-
-                                <span className="col-span-2">Penalty Due:</span>
-                                <span className="text-right font-medium text-foreground">{formatCurrency(breakdown.penalty)}</span>
-
-                                <span className="col-span-2">Tax Due:</span>
-                                <span className="text-right font-medium text-foreground">{formatCurrency(breakdown.tax)}</span>
-                            </div>
-                            <p className="font-bold text-foreground">Total amount to be repaid: {formatCurrency(totalBalanceDue)}</p>
-                            <p>Remaining after this payment: {formatCurrency(remainingAmount)}</p>
-                        </div>
+                        <p className="text-gray-500">
+                            Left to pay after this: <span className="font-semibold text-gray-900">{formatETB(Math.max(0, remainingAmount))}</span>
+                        </p>
                     )}
                 </div>
-                 <div className="grid grid-cols-4 gap-px bg-border rounded-b-lg overflow-hidden mt-4">
-                    <div className="col-span-3 grid grid-cols-3 grid-rows-4 gap-px">
-                        {numberPadKeys.map(key => (
-                            <Button
-                                key={key}
-                                variant="ghost"
-                                className="h-16 text-2xl rounded-none bg-background hover:bg-primary/10"
-                                onClick={() => handleNumberClick(key)}
-                                style={{'--primary': providerColor} as React.CSSProperties}
-                            >
-                                {key}
-                            </Button>
+
+                <button
+                    type="button"
+                    onClick={() => setShowBreakdown((v) => !v)}
+                    aria-expanded={showBreakdown}
+                    className="mx-auto mt-2 flex items-center gap-1 rounded-full px-3 py-1 text-xs font-medium text-gray-500 hover:bg-gray-100"
+                >
+                    What you owe
+                    <ChevronDown className={cn('h-3.5 w-3.5 transition-transform', showBreakdown && 'rotate-180')} />
+                </button>
+                {showBreakdown && (
+                    <div className="mt-2 rounded-xl bg-gray-50 px-3 py-1.5">
+                        {breakdownRows.map((row) => (
+                            <DetailRow key={row.label} label={row.label} value={formatMoney(row.value)} className="py-1" />
                         ))}
-                         <Button
-                            variant="ghost"
-                            className="h-16 text-2xl rounded-none bg-background col-span-2 hover:bg-primary/10"
-                            onClick={() => handleNumberClick('0')}
-                            style={{'--primary': providerColor} as React.CSSProperties}
-                        >
-                            0
-                        </Button>
-                        <Button
-                            variant="ghost"
-                            className="h-16 text-2xl rounded-none bg-background hover:bg-primary/10"
-                            onClick={() => handleNumberClick('.')}
-                             style={{'--primary': providerColor} as React.CSSProperties}
-                        >
-                            .
-                        </Button>
+                        <DetailRow label="Total due" value={formatETB(totalBalanceDue)} strong className="border-t border-gray-200 py-1.5" />
+                        {isInstallmentPayment && (
+                            <p className="pb-1 text-xs text-gray-500">
+                                For installment {activeInstallment.installmentNumber}, with any penalty as of today.
+                                {mergedNextInstallment && ` Includes installment ${mergedNextInstallment.installmentNumber}.`}
+                            </p>
+                        )}
                     </div>
-                    <div className="col-span-1 grid grid-rows-4 gap-px">
-                         <Button
-                                variant="ghost"
-                                className="h-16 text-2xl rounded-none bg-background flex items-center justify-center hover:bg-primary/10"
-                                onClick={handleBackspace}
-                                style={{'--primary': providerColor} as React.CSSProperties}
-                            >
-                            <Delete className="h-7 w-7" />
-                        </Button>
-                        <Button
-                            className="h-full text-2xl rounded-none text-primary-foreground row-span-3"
-                            onClick={handleConfirm}
-                            disabled={!!error || isProcessing}
-                            style={{ backgroundColor: providerColor }}
-                        >
-                            {isProcessing ? <Loader2 className="h-8 w-8 animate-spin"/> : 'OK'}
-                        </Button>
-                    </div>
-                </div>
-            </DialogContent>
-        </Dialog>
+                )}
+            </div>
+
+            <div className="mt-4 grid grid-cols-4 gap-px border-t border-gray-200 bg-gray-200 pb-[env(safe-area-inset-bottom)]">
+                {KEYS.slice(0, 3).map((key) => (
+                    <button key={key} type="button" className={keyClass} onClick={() => handleNumberClick(key)} disabled={isProcessing}>{key}</button>
+                ))}
+                <button type="button" className={keyClass} onClick={handleBackspace} disabled={isProcessing} aria-label="Delete">
+                    <Delete className="h-6 w-6" />
+                </button>
+                {KEYS.slice(3, 6).map((key) => (
+                    <button key={key} type="button" className={keyClass} onClick={() => handleNumberClick(key)} disabled={isProcessing}>{key}</button>
+                ))}
+                <button
+                    type="button"
+                    onClick={handleConfirm}
+                    disabled={!!error || isProcessing}
+                    className="row-span-3 flex flex-col items-center justify-center gap-1 bg-brand text-lg font-semibold text-brand-fg transition active:brightness-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-fg disabled:bg-gray-200 disabled:text-gray-400"
+                >
+                    {isProcessing ? <Loader2 className="h-7 w-7 animate-spin" aria-label="Processing" /> : 'Pay'}
+                </button>
+                {KEYS.slice(6, 9).map((key) => (
+                    <button key={key} type="button" className={keyClass} onClick={() => handleNumberClick(key)} disabled={isProcessing}>{key}</button>
+                ))}
+                <button type="button" className={cn(keyClass, 'col-span-2')} onClick={() => handleNumberClick('0')} disabled={isProcessing}>0</button>
+                <button type="button" className={keyClass} onClick={() => handleNumberClick('.')} disabled={isProcessing} aria-label="Decimal point">.</button>
+            </div>
+        </BottomSheet>
     );
 }

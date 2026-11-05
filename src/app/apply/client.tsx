@@ -3,21 +3,21 @@
 import { useState, useEffect, useMemo, useRef } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import type { LoanProvider, LoanDetails, Tax } from "@/lib/types";
-import { Loader2 } from "lucide-react";
+import { Landmark, Loader2 } from "lucide-react";
 import { LoanOfferAndCalculator } from "@/components/loan/loan-offer-and-calculator";
-import { LoanDetailsView } from "@/components/loan/loan-details-view";
+import {
+  LoanDetailsView,
+  type DisbursementState,
+} from "@/components/loan/loan-details-view";
 import { useToast } from "@/hooks/use-toast";
 import AccountSelector from "@/components/loan/account-selector";
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-  DialogDescription,
-} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Button } from "@/components/ui/button";
+import { Skeleton } from "@/components/ui/skeleton";
+import { MiniAppShell } from "@/components/miniapp/shell";
+import { BottomSheet } from "@/components/miniapp/bottom-sheet";
+import { BrandButton, Panel } from "@/components/miniapp/ui";
+import { maskAccount, titleCaseName } from "@/lib/miniapp/format";
 
 type Step = "calculator" | "details";
 
@@ -45,8 +45,14 @@ export function ApplyClient({
   const [step, setStep] = useState<Step>(initialStep);
   const [loanDetails, setLoanDetails] = useState<LoanDetails | null>(null);
   const [selectedAccount, setSelectedAccount] = useState<any | null>(null);
+  const [isCheckingAccount, setIsCheckingAccount] = useState(true);
   const [showAccountModal, setShowAccountModal] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [disbursement, setDisbursement] = useState<DisbursementState>("sending");
+  // What the customer was shown before confirming, for the result screen.
+  const [outcome, setOutcome] = useState<{ receive: number; total?: number }>({
+    receive: 0,
+  });
 
   // TIN (Tax Identification Number) collection state.
   const [storedTin, setStoredTin] = useState<string | null>(null);
@@ -62,7 +68,10 @@ export function ApplyClient({
     // When the super-app provides a borrowerId (phone), check for an active associated account.
     // If none exists, open a blocking modal to force the user to select one.
     const checkActive = async () => {
-      if (!borrowerId) return;
+      if (!borrowerId) {
+        setIsCheckingAccount(false);
+        return;
+      }
       try {
         const res = await fetch(
           `/api/phone-accounts?phoneNumber=${encodeURIComponent(borrowerId)}`,
@@ -100,10 +109,13 @@ export function ApplyClient({
         }
       } catch (err) {
         setShowAccountModal(true);
+      } finally {
+        setIsCheckingAccount(false);
       }
     };
 
     checkActive();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [borrowerId]);
 
   // Check whether the borrower already has a TIN Number on file so we know
@@ -216,8 +228,8 @@ export function ApplyClient({
   const handleLoanAccept = async (details: AcceptedDetails) => {
     if (!selectedProduct || !borrowerId) {
       toast({
-        title: "Error",
-        description: "Missing required information.",
+        title: "Something went wrong",
+        description: "Please go back and start your application again.",
         variant: "destructive",
       });
       return;
@@ -243,8 +255,8 @@ export function ApplyClient({
   const submitLoan = async (details: AcceptedDetails) => {
     if (!selectedProduct || !borrowerId) {
       toast({
-        title: "Error",
-        description: "Missing required information.",
+        title: "Something went wrong",
+        description: "Please go back and start your application again.",
         variant: "destructive",
       });
       return;
@@ -275,11 +287,29 @@ export function ApplyClient({
       });
 
       if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.error || "Failed to save the loan.");
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(
+          typeof errorData?.error === "string"
+            ? errorData.error
+            : "We could not create your loan. Please try again.",
+        );
       }
 
       const savedLoan = await response.json();
+
+      // The calculator's figures, as shown on the confirmation (the received amount
+      // includes the deduction core banking makes, which the loan record does not hold).
+      const shown = details as AcceptedDetails & {
+        netReceivedAmount?: number;
+        total?: number;
+      };
+      setOutcome({
+        receive:
+          shown.netReceivedAmount ??
+          savedLoan.netDisbursedAmount ??
+          savedLoan.loanAmount,
+        total: shown.total,
+      });
 
       const displayLoan: LoanDetails = {
         ...savedLoan,
@@ -290,9 +320,8 @@ export function ApplyClient({
         payments: [],
       };
       setLoanDetails(displayLoan);
+      setDisbursement("sending");
       setStep("details");
-      // Inform user and attempt to call external disbursement proxy if an account was selected
-      toast({ title: "Success!", description: "Your loan has been saved." });
 
       try {
         if (selectedAccount && selectedAccount.accountNumber) {
@@ -314,38 +343,21 @@ export function ApplyClient({
 
           if (!disRes.ok) {
             const err = await disRes.json().catch(() => null);
-            toast({
-              title: "Disbursement failed",
-              description:
-                err?.error ||
-                JSON.stringify(err) ||
-                "Upstream disbursement failed",
-              variant: "destructive",
-            });
+            console.error("[apply] disbursement failed", disRes.status, err);
+            setDisbursement("failed");
           } else {
-            toast({
-              title: "Disbursement sent",
-              description: "External disbursement request was sent.",
-            });
+            setDisbursement("sent");
           }
         } else {
-          toast({
-            title: "No account selected",
-            description:
-              "No disbursement account was selected; external transfer was not attempted.",
-            variant: "warning",
-          });
+          setDisbursement("skipped");
         }
       } catch (err: any) {
-        toast({
-          title: "Disbursement error",
-          description: String(err?.message ?? err),
-          variant: "destructive",
-        });
+        console.error("[apply] disbursement error", err);
+        setDisbursement("failed");
       }
     } catch (error: any) {
       toast({
-        title: "Error",
+        title: "Loan not created",
         description: error.message,
         variant: "destructive",
       });
@@ -368,6 +380,17 @@ export function ApplyClient({
     router.push(`/loan?${params.toString()}`);
   };
 
+  const handleViewLoan = () => {
+    if (!loanDetails) return;
+    const params = new URLSearchParams();
+    if (borrowerId) params.set("borrowerId", borrowerId);
+    router.push(`/history/${loanDetails.id}?${params.toString()}`);
+  };
+
+  const accountLabel = selectedAccount?.accountNumber
+    ? maskAccount(selectedAccount.accountNumber)
+    : undefined;
+
   const renderStep = () => {
     switch (step) {
       case "calculator":
@@ -379,29 +402,27 @@ export function ApplyClient({
               isLoading={false}
               eligibilityResult={eligibilityResult}
               onAccept={handleLoanAccept}
-              providerColor={provider.colorHex}
               isSubmitting={isSubmitting}
+              accountLabel={accountLabel}
             />
           );
         }
         if (productId && !selectedProduct) {
           return (
-            <div className="text-center">
-              Product not found. Please{" "}
-              <button
-                onClick={() => router.push("/loan")}
-                className="underline"
-                style={{ color: "hsl(var(--primary))" }}
-              >
-                start over
-              </button>
-              .
-            </div>
+            <Panel className="py-10 text-center">
+              <p className="font-semibold">This loan is no longer available</p>
+              <p className="mt-1 text-sm text-gray-500">
+                It may have been changed or withdrawn.
+              </p>
+              <BrandButton className="mt-5" onClick={handleBack}>
+                Back to loans
+              </BrandButton>
+            </Panel>
           );
         }
         return (
-          <div className="flex justify-center items-center h-48">
-            <Loader2 className="h-8 w-8 animate-spin" />
+          <div className="flex h-48 items-center justify-center">
+            <Loader2 className="h-8 w-8 animate-spin text-gray-400" />
           </div>
         );
 
@@ -410,15 +431,18 @@ export function ApplyClient({
           return (
             <LoanDetailsView
               details={loanDetails}
-              product={selectedProduct}
-              onReset={handleReset}
-              providerColor={provider.colorHex}
+              disbursement={disbursement}
+              amountToReceive={outcome.receive}
+              totalToRepay={outcome.total}
+              accountLabel={accountLabel}
+              onDone={handleReset}
+              onViewLoan={handleViewLoan}
             />
           );
         }
         return (
-          <div className="flex justify-center items-center h-48">
-            <Loader2 className="h-8 w-8 animate-spin" />
+          <div className="flex h-48 items-center justify-center">
+            <Loader2 className="h-8 w-8 animate-spin text-gray-400" />
           </div>
         );
       default:
@@ -426,156 +450,163 @@ export function ApplyClient({
     }
   };
 
+  const onCalculator = step === "calculator";
+
   return (
-    <div className="flex flex-col min-h-screen bg-background">
-      <main className="flex-1">
-        <div className="container py-8 md:py-12">
-          {/* If borrowerId is provided by the super-app, automatically show account selector */}
-          {/* Show selected account summary when available */}
-          {selectedAccount ? (
-            <div className="mb-6">
-              <div className="text-sm">Selected account for disbursement:</div>
-              <div className="font-mono">
-                {selectedAccount.accountNumber} — {selectedAccount.customerName}
-              </div>
-            </div>
-          ) : null}
-
-          {renderStep()}
-
-          {/* Blocking modal: forces account selection when there is no active account */}
-          <Dialog
-            open={showAccountModal}
-            onOpenChange={(open) => {
-              // prevent closing unless an account is selected
-              if (!open && !selectedAccount) return;
-              setShowAccountModal(open);
-            }}
-          >
-            <DialogContent>
-              <DialogHeader>
-                <DialogTitle>Select disbursement account</DialogTitle>
-                <DialogDescription>
-                  Please choose the account to receive disbursements for this
-                  loan. This selection is required.
-                </DialogDescription>
-              </DialogHeader>
-              {borrowerId && (
-                <div className="mt-4">
-                  <AccountSelector
-                    phoneNumber={borrowerId}
-                    onSelected={(acc) => {
-                      (async () => {
-                        setSelectedAccount(acc);
-                        try {
-                          const res = await fetch(
-                            "/api/phone-accounts/fetch-customer",
-                            {
-                              method: "POST",
-                              headers: { "Content-Type": "application/json" },
-                              body: JSON.stringify({
-                                phoneNumber: borrowerId,
-                                accountNumber: acc.accountNumber,
-                                providerId: provider?.id,
-                              }),
-                            },
-                          );
-                          const data = await res.json();
-                          if (!res.ok) {
-                            toast({
-                              title: "Provisioning failed",
-                              description: data?.error || JSON.stringify(data),
-                              variant: "destructive",
-                            });
-                          } else {
-                            // pending without a result: the details are still being
-                            // fetched in the background.
-                            toast(
-                              data?.pending && !data?.saved && !data?.reused
-                                ? {
-                                    title: "Fetching your details",
-                                    description:
-                                      "They will be ready in a moment.",
-                                  }
-                                : {
-                                    title: "Customer data saved",
-                                    description:
-                                      "Customer details were saved for scoring.",
-                                  },
-                            );
-                          }
-                        } catch (err: any) {
-                          toast({
-                            title: "Provisioning error",
-                            description: String(err?.message ?? err),
-                            variant: "destructive",
-                          });
-                        }
-                        setShowAccountModal(false);
-                      })();
-                    }}
-                  />
-                </div>
-              )}
-            </DialogContent>
-          </Dialog>
-
-          {/* Blocking modal: collects the borrower's TIN Number when none is on file */}
-          <Dialog
-            open={showTinModal}
-            onOpenChange={(open) => {
-              // Prevent closing while saving.
-              if (savingTin) return;
-              if (!open) pendingDetailsRef.current = null;
-              setShowTinModal(open);
-            }}
-          >
-            <DialogContent>
-              <DialogHeader>
-                <DialogTitle>Enter your TIN Number</DialogTitle>
-                <DialogDescription>
-                  A Tax Identification Number (TIN) is required before you can
-                  continue your loan application. We&apos;ll save it so you
-                  won&apos;t be asked again.
-                </DialogDescription>
-              </DialogHeader>
-              <div className="mt-4 space-y-3">
-                <Label htmlFor="tin-input">TIN Number</Label>
-                <Input
-                  id="tin-input"
-                  inputMode="numeric"
-                  autoFocus
-                  value={tinInput}
-                  onChange={(e) => setTinInput(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") {
-                      e.preventDefault();
-                      handleTinSubmit();
-                    }
-                  }}
-                  placeholder="Enter your TIN Number"
-                  disabled={savingTin}
-                />
-                <div className="flex justify-end">
-                  <Button
-                    onClick={handleTinSubmit}
-                    disabled={savingTin || !tinInput.trim()}
-                  >
-                    {savingTin ? (
-                      <>
-                        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                        Saving…
-                      </>
-                    ) : (
-                      "Save & Continue"
-                    )}
-                  </Button>
-                </div>
-              </div>
-            </DialogContent>
-          </Dialog>
+    <MiniAppShell
+      brandColor={provider.colorHex}
+      title={onCalculator ? selectedProduct?.name ?? "Apply" : undefined}
+      onBack={onCalculator ? handleBack : undefined}
+    >
+      {onCalculator && (
+        <div className="mb-3 flex items-center gap-3 rounded-2xl border border-gray-200/80 bg-white px-4 py-3">
+          <span className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-gray-100 text-gray-600" aria-hidden>
+            <Landmark className="h-5 w-5" />
+          </span>
+          <div className="min-w-0 flex-1">
+            <p className="text-xs text-gray-500">Paid into</p>
+            {isCheckingAccount ? (
+              <Skeleton className="mt-1 h-4 w-40 bg-gray-100" />
+            ) : selectedAccount ? (
+              <p className="truncate text-sm font-semibold">
+                {maskAccount(selectedAccount.accountNumber)}
+                {selectedAccount.customerName
+                  ? ` · ${titleCaseName(selectedAccount.customerName)}`
+                  : ""}
+              </p>
+            ) : (
+              <button
+                type="button"
+                onClick={() => setShowAccountModal(true)}
+                className="text-sm font-semibold text-brand-ink underline-offset-2 hover:underline"
+              >
+                Choose an account
+              </button>
+            )}
+          </div>
         </div>
-      </main>
-    </div>
+      )}
+
+      {renderStep()}
+
+      {/* While the loan is being created: block taps and say what is happening. */}
+      {isSubmitting && (
+        <div
+          role="status"
+          aria-live="assertive"
+          className="fixed inset-0 z-40 flex flex-col items-center justify-center gap-3 bg-white/85 px-8 text-center backdrop-blur-sm"
+        >
+          <Loader2 className="h-10 w-10 animate-spin text-brand-ink" aria-hidden />
+          <p className="text-base font-semibold">Setting up your loan…</p>
+          <p className="text-sm text-gray-500">Please keep the app open.</p>
+        </div>
+      )}
+
+      {/* Blocking: forces account selection when there is no active account */}
+      <BottomSheet
+        open={showAccountModal}
+        onOpenChange={setShowAccountModal}
+        dismissible={!!selectedAccount}
+        title="Choose your account"
+        description="Your loan is paid into this account."
+      >
+        {borrowerId && (
+          <AccountSelector
+            phoneNumber={borrowerId}
+            onSelected={(acc) => {
+              (async () => {
+                setSelectedAccount(acc);
+                setShowAccountModal(false);
+                try {
+                  const res = await fetch(
+                    "/api/phone-accounts/fetch-customer",
+                    {
+                      method: "POST",
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({
+                        phoneNumber: borrowerId,
+                        accountNumber: acc.accountNumber,
+                        providerId: provider?.id,
+                      }),
+                    },
+                  );
+                  const data = await res.json().catch(() => null);
+                  if (!res.ok) {
+                    console.error("[apply] fetch-customer failed", res.status, data);
+                    toast({
+                      title: "Account not checked",
+                      description:
+                        data?.error ||
+                        "We could not check this account right now. Please try again shortly.",
+                      variant: "destructive",
+                    });
+                  } else if (data?.pending && !data?.saved && !data?.reused) {
+                    // pending without a result: the details are still being
+                    // fetched in the background.
+                    toast({
+                      title: "Checking your account",
+                      description: "This takes a moment.",
+                    });
+                  }
+                } catch (err: any) {
+                  console.error("[apply] fetch-customer error", err);
+                  toast({
+                    title: "Account not checked",
+                    description:
+                      "We could not reach the bank to check this account. Please try again shortly.",
+                    variant: "destructive",
+                  });
+                }
+              })();
+            }}
+          />
+        )}
+      </BottomSheet>
+
+      {/* Collects the borrower's TIN Number when none is on file */}
+      <BottomSheet
+        open={showTinModal}
+        onOpenChange={(open) => {
+          // Prevent closing while saving.
+          if (savingTin) return;
+          if (!open) pendingDetailsRef.current = null;
+          setShowTinModal(open);
+        }}
+        title="Enter your TIN"
+        description="A Tax Identification Number (TIN) is needed before your loan can be paid out. We'll save it so you won't be asked again."
+        closeOnOutsideTap={false}
+        footer={
+          <BrandButton
+            block
+            size="lg"
+            onClick={handleTinSubmit}
+            disabled={!tinInput.trim()}
+            loading={savingTin}
+          >
+            {savingTin ? "Saving…" : "Save and continue"}
+          </BrandButton>
+        }
+      >
+        <div className="space-y-2">
+          <Label htmlFor="tin-input">TIN Number</Label>
+          <Input
+            id="tin-input"
+            inputMode="numeric"
+            autoFocus
+            value={tinInput}
+            onChange={(e) => setTinInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                handleTinSubmit();
+              }
+            }}
+            placeholder="Enter your TIN"
+            disabled={savingTin}
+            className="h-12 rounded-xl text-base focus-visible:ring-brand-ink"
+          />
+        </div>
+      </BottomSheet>
+    </MiniAppShell>
   );
 }

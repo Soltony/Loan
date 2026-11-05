@@ -82,3 +82,41 @@ body {
     @apply bg-background text-foreground;
   }
 }
+
+/* ---------- Customer mini-app ---------- */
+
+:root {
+  /* Defaults for the brand colours; MiniAppShell replaces them with the provider's
+     colour and the readable shades worked out from it (src/lib/miniapp/brand.ts). */
+  --brand: #fdb913;
+  --brand-fg: #2f2304;
+  --brand-ink: #946901;
+  --brand-soft: #fff5de;
+}
+
+/* Inter is never loaded (next/font would need network access at build time), so
+   `font-body` resolved to the browser's serif default. Mini-app pages use the phone's own
+   UI font instead; setting it on :root also reaches dialogs, which portal out to <body>. */
+:root:has(.miniapp) {
+  --font-inter: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans",
+    "Noto Sans Ethiopic", "Helvetica Neue", Arial, sans-serif;
+}
+
+.miniapp {
+  /* For browsers without :has(). */
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans",
+    "Noto Sans Ethiopic", "Helvetica Neue", Arial, sans-serif;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.miniapp-sheet-height {
+  max-height: 92vh;
+  max-height: 92dvh;
+}
+
+.no-scrollbar {
+  scrollbar-width: none;
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}

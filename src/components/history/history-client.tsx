@@ -1,26 +1,18 @@
-
 'use client';
 
 import React, { useState, useMemo, useEffect } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
-import { Badge } from '@/components/ui/badge';
 import type { LoanDetails, LoanProvider, Tax } from '@/lib/types';
-import { format } from 'date-fns';
-import { ArrowLeft, ChevronDown, ChevronUp } from 'lucide-react';
-import { cn } from '@/lib/utils';
-import { Button } from '@/components/ui/button';
+import { Check, ChevronRight, Wallet } from 'lucide-react';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
-import { calculateTotalRepayable, calculateInstallmentDueBreakdown } from '@/lib/loan-calculator';
+import { calculateInstallmentDueBreakdown } from '@/lib/loan-calculator';
 import { RepaymentDialog } from '@/components/loan/repayment-dialog';
 import { useToast } from '@/hooks/use-toast';
 import { getAsOfDate } from '@/lib/date-utils';
-
-const formatCurrency = (amount: number | null | undefined) => {
-  if (amount === null || amount === undefined) return '0.00';
-  return new Intl.NumberFormat('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(amount);
-};
-
+import { MiniAppShell } from '@/components/miniapp/shell';
+import { Amount, BrandButton, Panel, ProgressBar, StatusPill, dueTone } from '@/components/miniapp/ui';
+import { brandCssVars } from '@/lib/miniapp/brand';
+import { dueStatus, formatDate, formatETB, formatMoney, repaidShare } from '@/lib/miniapp/format';
 
 interface HistoryClientProps {
   initialLoanHistory: LoanDetails[];
@@ -28,28 +20,73 @@ interface HistoryClientProps {
   taxConfigs: Tax[];
 }
 
+const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
+
+type RepayInfo = { loan: LoanDetails, balanceDue: number, installmentId?: string };
+
+/** What the repay keypad opens with for a loan. */
+function repayInfoFor(loan: LoanDetails, taxConfigs: Tax[]): RepayInfo {
+  // If the loan has an active installment, default to the full amount due for that
+  // installment. This must include the loan-level interest, service fee and tax that
+  // are still owed (not just installment principal + penalty), otherwise the dialog's
+  // line-item breakdown and the "Total amount to be repaid" disagree and the borrower
+  // is blocked from settling outstanding interest/fees.
+  const activeInstallment = Array.isArray(loan.installments) ? loan.installments.find(i => i.isActive) : undefined;
+  if (activeInstallment && loan.product) {
+    const due = calculateInstallmentDueBreakdown({
+      loanDetails: loan,
+      loanProduct: loan.product,
+      taxConfigs,
+      activeInstallment,
+      asOfDate: getAsOfDate(),
+    });
+    return { loan, balanceDue: Math.max(0, due.totalDue), installmentId: activeInstallment.id };
+  }
+
+  const balanceDue = (loan.totalRepayableAmount ?? 0) - (loan.repaidAmount || 0);
+  return { loan, balanceDue: Math.max(0, balanceDue) };
+}
+
 export function HistoryClient({ initialLoanHistory, providers, taxConfigs }: HistoryClientProps) {
   const router = useRouter();
   const searchParams = useSearchParams();
   const { toast } = useToast();
-  
+
+  // The loan detail page's Repay button opens this page with ?repay=<loanId>: start with
+  // that loan's keypad open.
+  const repayParam = searchParams?.get('repay') ?? null;
   const [loanHistory, setLoanHistory] = useState(initialLoanHistory);
   const [activeTab, setActiveTab] = useState('active');
-  const [expandedLoan, setExpandedLoan] = useState<string | null>(null);
-  const [isRepayDialogOpen, setIsRepayDialogOpen] = useState(false);
-  const [repayingLoanInfo, setRepayingLoanInfo] = useState<{ loan: LoanDetails, balanceDue: number, installmentId?: string } | null>(null);
-  const [selectedLoanProviderColor, setSelectedLoanProviderColor] = useState<string>('#fdb913');
+  const [repayingLoanInfo, setRepayingLoanInfo] = useState<RepayInfo | null>(() => {
+    const loan = repayParam
+      ? initialLoanHistory.find((l) => l.id === repayParam && l.repaymentStatus === 'Unpaid')
+      : undefined;
+    return loan ? repayInfoFor(loan, taxConfigs) : null;
+  });
+  const [isRepayDialogOpen, setIsRepayDialogOpen] = useState(() => repayingLoanInfo !== null);
+  const asOf = useMemo(() => getAsOfDate(), []);
+
+  useEffect(() => {
+    if (!repayParam) return;
+    // Drop the parameter so going back or reloading does not open the keypad again.
+    const params = new URLSearchParams(searchParams?.toString() ?? '');
+    params.delete('repay');
+    window.history.replaceState(null, '', `/history?${params.toString()}`);
+  }, [repayParam, searchParams]);
 
   useEffect(() => {
     setLoanHistory(initialLoanHistory);
   }, [initialLoanHistory]);
 
   const handleBack = () => {
-    router.push(`/loan?${searchParams.toString()}`)
+    const params = new URLSearchParams(searchParams.toString());
+    params.delete('repay');
+    router.push(`/loan?${params.toString()}`)
   }
-  
+
   const handleViewDetails = (loanId: string) => {
     const params = new URLSearchParams(searchParams.toString());
+    params.delete('repay');
     router.push(`/history/${loanId}?${params.toString()}`);
   }
 
@@ -65,52 +102,17 @@ export function HistoryClient({ initialLoanHistory, providers, taxConfigs }: His
       return acc + Math.max(0, balance - (loan.repaidAmount || 0));
     }, 0);
   }, [activeLoans]);
-  
+
   const totalCreditAmount = useMemo(() => {
     return loanHistory.reduce((acc, loan) => acc + loan.loanAmount, 0);
   }, [loanHistory]);
-  
+
   const totalRepaidAmount = useMemo(() => {
     return loanHistory.reduce((acc, loan) => acc + (loan.repaidAmount || 0), 0);
   }, [loanHistory]);
-  
-  const handleToggleExpand = (loanId: string) => {
-      const newExpandedLoanId = expandedLoan === loanId ? null : loanId;
-      setExpandedLoan(newExpandedLoanId);
-      if (newExpandedLoanId) {
-          const loan = loanHistory.find(l => l.id === newExpandedLoanId);
-          const provider = providers.find(p => p.id === loan?.product.providerId);
-          setSelectedLoanProviderColor(provider?.colorHex || '#fdb913');
-      } else {
-          // Reset to default or first loan's color when all are collapsed
-           const firstLoanProvider = providers.find(p => p.id === loanHistory[0]?.product.providerId);
-           setSelectedLoanProviderColor(firstLoanProvider?.colorHex || '#fdb913');
-      }
-  }
-
 
   const handleRepay = (loan: LoanDetails) => {
-    // If the loan has an active installment, default to the full amount due for that
-    // installment. This must include the loan-level interest, service fee and tax that
-    // are still owed (not just installment principal + penalty), otherwise the dialog's
-    // line-item breakdown and the "Total amount to be repaid" disagree and the borrower
-    // is blocked from settling outstanding interest/fees.
-    const activeInstallment = Array.isArray(loan.installments) ? loan.installments.find(i => i.isActive) : undefined;
-    if (activeInstallment && loan.product) {
-      const due = calculateInstallmentDueBreakdown({
-        loanDetails: loan,
-        loanProduct: loan.product,
-        taxConfigs,
-        activeInstallment,
-        asOfDate: getAsOfDate(),
-      });
-      setRepayingLoanInfo({ loan, balanceDue: Math.max(0, due.totalDue), installmentId: activeInstallment.id });
-      setIsRepayDialogOpen(true);
-      return;
-    }
-
-    const balanceDue = (loan.totalRepayableAmount ?? 0) - (loan.repaidAmount || 0);
-    setRepayingLoanInfo({ loan, balanceDue: Math.max(0, balanceDue) });
+    setRepayingLoanInfo(repayInfoFor(loan, taxConfigs));
     setIsRepayDialogOpen(true);
   }
 
@@ -129,7 +131,7 @@ export function HistoryClient({ initialLoanHistory, providers, taxConfigs }: His
         const errorData = await response.json();
         throw new Error(errorData.error || 'Failed to process payment.');
       }
-      
+
       const updatedLoanData = await response.json();
 
       const finalLoanObject: LoanDetails = {
@@ -143,13 +145,13 @@ export function HistoryClient({ initialLoanHistory, providers, taxConfigs }: His
         payments: updatedLoanData.payments,
       };
 
-      setLoanHistory(prevHistory => 
+      setLoanHistory(prevHistory =>
         prevHistory.map(l => l.id === updatedLoanData.id ? finalLoanObject : l)
       );
 
       toast({
         title: 'Payment Successful',
-        description: `${formatCurrency(amount)} ETB has been paid towards your loan.`,
+        description: `${formatETB(amount)} has been paid towards your loan.`,
       });
 
       try {
@@ -208,100 +210,145 @@ export function HistoryClient({ initialLoanHistory, providers, taxConfigs }: His
     };
   }, []);
 
+  const colorFor = (loan: LoanDetails) =>
+    providers.find(p => p.id === loan.product.providerId)?.colorHex || undefined;
 
   const renderLoanCard = (loan: LoanDetails) => {
-    const balanceDue = (loan.totalRepayableAmount ?? 0) - (loan.repaidAmount || 0);
-    const provider = providers.find(p => p.id === loan.product.providerId);
-    const color = provider?.colorHex || '#fdb913';
+    const total = loan.totalRepayableAmount ?? 0;
+    const repaid = loan.repaidAmount || 0;
+    const balanceDue = total - repaid;
+    const isActive = loan.repaymentStatus === 'Unpaid';
+    const activeInstallment = Array.isArray(loan.installments) ? loan.installments.find(i => i.isActive) : undefined;
+    const due = dueStatus(activeInstallment?.dueDate ?? loan.dueDate, asOf);
 
     return (
-      <Card 
-        key={loan.id} 
-        className="shadow-md transition-all" 
-        style={{ borderLeft: `4px solid ${color}`}}
+      <Panel
+        key={loan.id}
+        className="overflow-hidden p-0"
+        style={brandCssVars(colorFor(loan)) as React.CSSProperties}
       >
-        <CardContent className="p-4">
-          <div className="flex justify-between items-center">
-            <div>
-              <p className="font-semibold text-gray-800">{loan.productName}</p>
-              <p className="text-lg font-bold" style={{color: color}}>{formatCurrency(balanceDue > 0 ? balanceDue : loan.loanAmount)} <span className="text-sm font-normal text-muted-foreground">(ETB)</span></p>
-              <p className="text-xs text-muted-foreground">{loan.id}</p>
-            </div>
-            <div className="flex gap-2">
-              <Button variant="outline" size="sm" onClick={() => handleViewDetails(loan.id)}>View</Button>
-              {loan.repaymentStatus === 'Unpaid' && <Button size="sm" style={{backgroundColor: color}} className="text-white" onClick={() => handleRepay(loan)}>Repay</Button>}
-            </div>
+        <button
+          type="button"
+          onClick={() => handleViewDetails(loan.id)}
+          className="block w-full p-4 text-left transition hover:bg-gray-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-ink"
+        >
+          <span className="flex items-start justify-between gap-3">
+            <span className="min-w-0">
+              <span className="block truncate font-semibold">{loan.productName}</span>
+              <span className="mt-0.5 block truncate text-xs text-gray-500">
+                {loan.providerName} · Taken {formatDate(loan.disbursedDate)}
+              </span>
+            </span>
+            {isActive ? (
+              <StatusPill tone={dueTone(due.tone)}>{due.label}</StatusPill>
+            ) : (
+              <StatusPill tone="success" icon={<Check className="h-3 w-3" aria-hidden />}>Paid</StatusPill>
+            )}
+          </span>
+
+          <span className="mt-3 flex items-end justify-between gap-3">
+            <span>
+              <span className="block text-xs text-gray-500">{isActive ? 'Outstanding' : 'Borrowed'}</span>
+              <Amount value={formatMoney(isActive && balanceDue > 0 ? balanceDue : loan.loanAmount)} className="text-xl" />
+            </span>
+            <span className="flex items-center text-sm font-medium text-gray-500">
+              Details
+              <ChevronRight className="h-4 w-4" aria-hidden />
+            </span>
+          </span>
+
+          {isActive ? (
+            <span className="mt-3 block">
+              <ProgressBar value={repaidShare(repaid, total)} label="Share of the loan repaid" />
+              <span className="mt-1.5 block text-xs text-gray-500">
+                Repaid {formatMoney(repaid)} of {formatMoney(total)} ETB · Due {formatDate(activeInstallment?.dueDate ?? loan.dueDate)}
+              </span>
+            </span>
+          ) : (
+            <span className="mt-1 block text-xs text-gray-500">Repaid {formatETB(repaid)}</span>
+          )}
+        </button>
+        {isActive && (
+          <div className="border-t border-gray-100 p-3">
+            <BrandButton block onClick={() => handleRepay(loan)}>Repay</BrandButton>
           </div>
-        </CardContent>
-      </Card>
+        )}
+      </Panel>
     );
   }
 
+  const emptyState = (title: string, body: string, withAction: boolean) => (
+    <Panel className="flex flex-col items-center px-6 py-10 text-center">
+      <span className="grid h-12 w-12 place-items-center rounded-2xl bg-gray-100 text-gray-500" aria-hidden>
+        <Wallet className="h-6 w-6" />
+      </span>
+      <p className="mt-3 font-semibold">{title}</p>
+      <p className="mt-1 text-sm text-gray-500">{body}</p>
+      {withAction && (
+        <BrandButton className="mt-5" onClick={handleBack}>Borrow now</BrandButton>
+      )}
+    </Panel>
+  );
+
+  const triggerClass =
+    'h-9 rounded-lg text-sm font-semibold text-gray-600 data-[state=active]:bg-white data-[state=active]:text-gray-900 data-[state=active]:shadow-sm';
+
   return (
-    <div className="flex flex-col min-h-screen bg-gray-50">
-        <main className="flex-1">
-            <div className="container py-6 md:py-10">
-                <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
-                    <TabsList className="grid w-full grid-cols-2 bg-gray-200">
-                        <TabsTrigger value="active">Active</TabsTrigger>
-                        <TabsTrigger value="closed">Closed</TabsTrigger>
-                    </TabsList>
-                    
-                    <div className="my-6">
-                      {activeTab === 'active' ? (
-                          <Card className="shadow-lg text-white transition-colors duration-300" style={{ backgroundColor: selectedLoanProviderColor }}>
-                            <CardContent className="p-4 flex justify-around items-center">
-                              <div className="text-center">
-                                <p className="text-2xl font-bold">{formatCurrency(totalOutstanding)}</p>
-                                <p className="text-xs opacity-90">Total Outstanding Amount (ETB)</p>
-                              </div>
-                               <div className="text-center">
-                                <p className="text-2xl font-bold">{formatCurrency(totalCreditAmount)}</p>
-                                <p className="text-xs opacity-90">Total Credit Amount (ETB)</p>
-                              </div>
-                            </CardContent>
-                          </Card>
-                      ) : (
-                          <Card className="shadow-lg text-white transition-colors duration-300" style={{ backgroundColor: selectedLoanProviderColor }}>
-                            <CardContent className="p-4 flex justify-around items-center">
-                              <div className="text-center">
-                                <p className="text-2xl font-bold">{formatCurrency(totalRepaidAmount)}</p>
-                                <p className="text-xs opacity-90">Total Amount Repaid (ETB)</p>
-                              </div>
-                              <div className="text-center">
-                                <p className="text-2xl font-bold">{closedLoans.length}</p>
-                                <p className="text-xs opacity-90">Total Loans Closed</p>
-                              </div>
-                            </CardContent>
-                          </Card>
-                      )}
-                    </div>
-                    
-                    <TabsContent value="active">
-                       <div className="space-y-4">
-                           {activeLoans.length > 0 ? activeLoans.map(renderLoanCard) : <p className="text-center text-muted-foreground py-8">No active loans.</p>}
-                       </div>
-                    </TabsContent>
-                    <TabsContent value="closed">
-                       <div className="space-y-4">
-                           {closedLoans.length > 0 ? closedLoans.map(renderLoanCard) : <p className="text-center text-muted-foreground py-8">No closed loans.</p>}
-                        </div>
-                    </TabsContent>
-                </Tabs>
-            </div>
-        </main>
-        {repayingLoanInfo && (
-            <RepaymentDialog
-                isOpen={isRepayDialogOpen}
-                onClose={() => setIsRepayDialogOpen(false)}
-                onConfirm={handleConfirmRepayment}
-                loan={repayingLoanInfo.loan}
-                totalBalanceDue={repayingLoanInfo.balanceDue}
-                providerColor={providers.find(p => p.id === repayingLoanInfo.loan.product.providerId)?.colorHex}
-                taxConfigs={taxConfigs}
-                asOfDate={getAsOfDate()}
-            />
-        )}
-    </div>
+    <MiniAppShell brandColor={providers[0]?.colorHex} title="My loans" onBack={handleBack}>
+      <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
+        <TabsList className="grid h-11 w-full grid-cols-2 rounded-xl bg-gray-200/70 p-1">
+          <TabsTrigger value="active" className={triggerClass}>Active ({activeLoans.length})</TabsTrigger>
+          <TabsTrigger value="closed" className={triggerClass}>Closed ({closedLoans.length})</TabsTrigger>
+        </TabsList>
+
+        <Panel className="mt-4">
+          {activeTab === 'active' ? (
+            <>
+              <p className="text-xs font-medium text-gray-500">Total outstanding</p>
+              <Amount value={formatMoney(totalOutstanding)} className="mt-0.5 block text-[28px] leading-tight" />
+              <p className="mt-1 text-sm text-gray-500">
+                {activeLoans.length === 0 ? 'Nothing to repay' : `Across ${plural(activeLoans.length, 'active loan', 'active loans')}`}
+              </p>
+            </>
+          ) : (
+            <>
+              <p className="text-xs font-medium text-gray-500">Repaid to date</p>
+              <Amount value={formatMoney(totalRepaidAmount)} className="mt-0.5 block text-[28px] leading-tight" />
+              <p className="mt-1 text-sm text-gray-500">
+                {plural(closedLoans.length, 'loan', 'loans')} closed · {formatETB(totalCreditAmount)} borrowed in total
+              </p>
+            </>
+          )}
+        </Panel>
+
+        <TabsContent value="active" className="mt-4">
+          <div className="space-y-3">
+            {activeLoans.length > 0
+              ? activeLoans.map(renderLoanCard)
+              : emptyState('No active loans', 'Loans you take will appear here.', true)}
+          </div>
+        </TabsContent>
+        <TabsContent value="closed" className="mt-4">
+          <div className="space-y-3">
+            {closedLoans.length > 0
+              ? closedLoans.map(renderLoanCard)
+              : emptyState('No closed loans yet', 'Loans you have fully repaid will appear here.', false)}
+          </div>
+        </TabsContent>
+      </Tabs>
+
+      {repayingLoanInfo && (
+        <RepaymentDialog
+          isOpen={isRepayDialogOpen}
+          onClose={() => setIsRepayDialogOpen(false)}
+          onConfirm={handleConfirmRepayment}
+          loan={repayingLoanInfo.loan}
+          totalBalanceDue={repayingLoanInfo.balanceDue}
+          providerColor={colorFor(repayingLoanInfo.loan)}
+          taxConfigs={taxConfigs}
+          asOfDate={asOf}
+        />
+      )}
+    </MiniAppShell>
   );
 }

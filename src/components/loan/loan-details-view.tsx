@@ -1,195 +1,119 @@
 "use client";
 
-import type { LoanDetails, LoanProduct, PenaltyRule } from "@/lib/types";
-import { format } from "date-fns";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardFooter,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
-import { Separator } from "@/components/ui/separator";
+import type { LoanDetails } from "@/lib/types";
+import { AlertTriangle, Check, Loader2 } from "lucide-react";
+import { cn } from "@/lib/utils";
+import { BrandButton, DetailRow, Panel } from "@/components/miniapp/ui";
+import { formatDate, formatETB } from "@/lib/miniapp/format";
+
+/** Where the money transfer stands once the loan has been created. */
+export type DisbursementState = "sending" | "sent" | "failed" | "skipped";
 
 interface LoanDetailsViewProps {
   details: LoanDetails;
-  product: LoanProduct;
-  onReset: () => void;
-  providerColor?: string;
+  disbursement: DisbursementState;
+  /** What reaches the customer's account after deductions. */
+  amountToReceive: number;
+  totalToRepay?: number;
+  /** e.g. "•••• 2237" */
+  accountLabel?: string;
+  onDone: () => void;
+  onViewLoan: () => void;
 }
 
-const formatCurrency = (amount: number) => {
-  return (
-    new Intl.NumberFormat("en-US", {
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 2,
-    }).format(amount) + " ETB"
-  );
-};
-
-const formatPenaltyRule = (rule: PenaltyRule): string => {
-  const value = rule.value === "" ? 0 : Number(rule.value);
-  let valueString = "";
-  let conditionString = "";
-
-  if (rule.type === "fixed") {
-    valueString = formatCurrency(value);
-  } else if (rule.type === "percentageOfPrincipal") {
-    valueString = `${value}% of principal`;
-  } else if (rule.type === "percentageOfCompound") {
-    valueString = `${value}% of outstanding balance`;
-  }
-
-  const fromDay = rule.fromDay === "" ? 1 : Number(rule.fromDay);
-  const toDay =
-    rule.toDay === "" || rule.toDay === null ? Infinity : Number(rule.toDay);
-
-  if (toDay === Infinity) {
-    conditionString = `from day ${fromDay} onwards`;
-  } else {
-    conditionString = `from day ${fromDay} to day ${toDay}`;
-  }
-
-  return `${valueString} ${conditionString}`;
+const copy: Record<
+  DisbursementState,
+  { title: string; body: (amount: string, account: string) => string }
+> = {
+  sending: {
+    title: "Sending your money",
+    body: (amount, account) =>
+      `Your loan is approved. We are sending ${amount} to ${account}.`,
+  },
+  sent: {
+    title: "Loan approved",
+    body: (amount, account) => `${amount} has been sent to ${account}.`,
+  },
+  failed: {
+    title: "Transfer not completed",
+    body: () =>
+      "Your loan was created, but the money could not be sent to your account. Please do not apply again. Contact the bank and quote the reference below.",
+  },
+  skipped: {
+    title: "Transfer not completed",
+    body: () =>
+      "Your loan was created, but no account was selected to receive it. Please do not apply again. Contact the bank and quote the reference below.",
+  },
 };
 
 export function LoanDetailsView({
   details,
-  product,
-  onReset,
-  providerColor = "hsl(var(--primary))",
+  disbursement,
+  amountToReceive,
+  totalToRepay,
+  accountLabel,
+  onDone,
+  onViewLoan,
 }: LoanDetailsViewProps) {
+  const { title, body } = copy[disbursement];
+  const problem = disbursement === "failed" || disbursement === "skipped";
+  const sending = disbursement === "sending";
+
   return (
-    <div className="max-w-2xl mx-auto">
-      <div className="text-center mb-8">
-        <h1
-          className="text-3xl font-bold tracking-tight md:text-4xl"
-          style={{ color: providerColor }}
+    <div className="pt-4">
+      <div className="flex flex-col items-center text-center" aria-live="polite">
+        <div
+          className={cn(
+            "grid h-20 w-20 place-items-center rounded-full",
+            sending && "bg-brand-soft text-brand-ink",
+            disbursement === "sent" && "bg-emerald-50 text-emerald-600",
+            problem && "bg-amber-50 text-amber-600"
+          )}
         >
-          Loan Disbursed Successfully!
-        </h1>
-        <p className="text-lg text-muted-foreground mt-2">
-          Here is a summary of your new loan.
+          {sending ? (
+            <Loader2 className="h-9 w-9 animate-spin" aria-hidden />
+          ) : problem ? (
+            <AlertTriangle className="h-9 w-9" aria-hidden />
+          ) : (
+            <span className="grid h-12 w-12 place-items-center rounded-full bg-emerald-600 text-white">
+              <Check className="h-7 w-7" strokeWidth={3} aria-hidden />
+            </span>
+          )}
+        </div>
+        <h2 className="mt-4 text-2xl font-bold tracking-tight">{title}</h2>
+        <p className="mt-2 max-w-sm text-sm leading-relaxed text-gray-600">
+          {body(formatETB(amountToReceive), accountLabel || "your account")}
         </p>
       </div>
-      <Card className="shadow-lg">
-        <CardHeader>
-          <CardTitle>{details.productName}</CardTitle>
-          <CardDescription>from {details.providerName}</CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          <div className="flex justify-between items-baseline p-4 bg-secondary rounded-lg">
-            <span className="text-muted-foreground">Loan Amount</span>
-            <span
-              className="text-4xl font-bold"
-              style={{ color: providerColor }}
-            >
-              {formatCurrency(details.loanAmount)}
-            </span>
-          </div>
 
-          {/* Inclusive Tax Breakdown */}
-          {details.taxDeducted != null && details.taxDeducted > 0 && (
-            <div className="space-y-2 text-sm bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800 p-4 rounded-lg">
-              <div className="font-medium text-amber-800 dark:text-amber-300 mb-2">
-                Tax Deduction at Disbursement
-              </div>
-              <div className="flex justify-between items-center">
-                <div className="text-muted-foreground">Gross Loan Amount</div>
-                <div className="text-right font-medium">
-                  {formatCurrency(details.loanAmount)}
-                </div>
-              </div>
-              <div className="flex justify-between items-center text-amber-700 dark:text-amber-400">
-                <div>Tax Deducted</div>
-                <div className="text-right font-medium">
-                  − {formatCurrency(details.taxDeducted)}
-                </div>
-              </div>
-              <div className="border-t border-amber-200 dark:border-amber-700 pt-2 flex justify-between items-center">
-                <div className="font-semibold">Net Amount Disbursed</div>
-                <div
-                  className="text-right font-bold"
-                  style={{ color: providerColor }}
-                >
-                  {formatCurrency(
-                    details.netDisbursedAmount ??
-                      details.loanAmount - details.taxDeducted,
-                  )}
-                </div>
-              </div>
-            </div>
-          )}
+      <Panel className="mt-6">
+        <DetailRow
+          label={problem ? "Amount to receive" : "You receive"}
+          value={formatETB(amountToReceive)}
+          strong
+        />
+        {accountLabel && <DetailRow label="Paid into" value={accountLabel} />}
+        <DetailRow label="Loan amount" value={formatETB(details.loanAmount)} />
+        {typeof totalToRepay === "number" && totalToRepay > 0 && (
+          <DetailRow label="Total to repay" value={formatETB(totalToRepay)} />
+        )}
+        <DetailRow label="Due date" value={formatDate(details.dueDate)} />
+        <div className="mt-1 border-t border-gray-100 pt-2">
+          <p className="text-xs text-gray-500">Reference</p>
+          <p className="mt-0.5 select-all break-all font-mono text-xs text-gray-700">
+            {details.id}
+          </p>
+        </div>
+      </Panel>
 
-          <Separator />
-
-          <div className="space-y-3 text-sm">
-            <div className="flex justify-between">
-              <div className="text-muted-foreground">Repayment Status</div>
-              <div className="text-right font-medium">
-                <Badge
-                  variant={
-                    details.repaymentStatus === "Unpaid"
-                      ? "destructive"
-                      : "default"
-                  }
-                >
-                  {details.repaymentStatus}
-                </Badge>
-              </div>
-            </div>
-
-            <div className="flex justify-between">
-              <div className="text-muted-foreground">Service Fee Applied</div>
-              <div className="text-right font-medium">
-                {formatCurrency(details.serviceFee)}
-              </div>
-            </div>
-
-            <div className="flex justify-between">
-              <div className="text-muted-foreground">Daily Fee Rule</div>
-              <div className="text-right font-medium">
-                {product.dailyFee.value
-                  ? `${product.dailyFee.value}${product.dailyFee.type === "percentage" ? "%" : ""}`
-                  : "N/A"}
-              </div>
-            </div>
-
-            <div>
-              <div className="text-muted-foreground mb-1">Penalty Rules</div>
-              {product.penaltyRulesEnabled &&
-              product.penaltyRules.length > 0 ? (
-                <div className="mt-1 space-y-1 text-xs text-muted-foreground/80 pl-4 bg-secondary p-2 rounded-md">
-                  {(product.penaltyRules || []).map((rule) => (
-                    <p key={rule.id}>- {formatPenaltyRule(rule)}</p>
-                  ))}
-                </div>
-              ) : (
-                <div className="text-right font-medium">N/A</div>
-              )}
-            </div>
-
-            <div className="flex justify-between">
-              <div className="text-muted-foreground">Due Date</div>
-              <div className="text-right font-medium">
-                {format(details.dueDate, "PPP")}
-              </div>
-            </div>
-          </div>
-        </CardContent>
-        <CardFooter>
-          <Button
-            className="w-full text-white"
-            onClick={onReset}
-            style={{ backgroundColor: providerColor }}
-          >
-            Start New Application
-          </Button>
-        </CardFooter>
-      </Card>
+      <div className="mt-6 space-y-2">
+        <BrandButton block size="lg" onClick={onDone} disabled={sending}>
+          Done
+        </BrandButton>
+        <BrandButton block variant="outline" size="lg" onClick={onViewLoan} disabled={sending}>
+          View loan
+        </BrandButton>
+      </div>
     </div>
   );
 }

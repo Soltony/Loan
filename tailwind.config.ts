@@ -55,6 +55,14 @@ export default {
           '4': 'hsl(var(--chart-4))',
           '5': 'hsl(var(--chart-5))',
         },
+        // Customer mini-app: the selected provider's colour and the readable shades derived
+        // from it (src/lib/miniapp/brand.ts). Plain var() colours: no opacity modifiers.
+        brand: {
+          DEFAULT: 'var(--brand)',
+          fg: 'var(--brand-fg)',
+          ink: 'var(--brand-ink)',
+          soft: 'var(--brand-soft)',
+        },
         sidebar: {
           DEFAULT: 'hsl(var(--sidebar-background))',
           foreground: 'hsl(var(--sidebar-foreground))',

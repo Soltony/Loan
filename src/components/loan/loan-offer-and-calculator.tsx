@@ -1,38 +1,35 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import type {
   LoanProduct,
   LoanDetails,
   CheckLoanEligibilityOutput,
-  FeeRule,
-  PenaltyRule,
   Tax,
 } from "@/lib/types";
-import { addDays, format, endOfDay } from "date-fns";
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import {
-  Card,
-  CardContent,
-  CardFooter,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { Skeleton } from "@/components/ui/skeleton";
-import { AlertCircle, ChevronDown } from "lucide-react";
+import { addDays, endOfDay } from "date-fns";
+import { AlertCircle, ChevronDown, Info } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
   calculateTotalRepayable,
   calculateInclusiveTax,
 } from "@/lib/loan-calculator";
+import { Skeleton } from "@/components/ui/skeleton";
+import { BottomSheet } from "@/components/miniapp/bottom-sheet";
 import {
-  Collapsible,
-  CollapsibleContent,
-  CollapsibleTrigger,
-} from "../ui/collapsible";
+  Amount,
+  BrandButton,
+  DetailRow,
+  Notice,
+  Panel,
+} from "@/components/miniapp/ui";
+import { formatDate, formatETB, formatMoney } from "@/lib/miniapp/format";
+import {
+  activePenaltyRules,
+  dailyFeeText,
+  describePenalty,
+  serviceFeeText,
+} from "@/lib/miniapp/fees";
 
 interface LoanOfferAndCalculatorProps {
   product: LoanProduct;
@@ -45,8 +42,9 @@ interface LoanOfferAndCalculatorProps {
       "id" | "providerName" | "productName" | "payments"
     >,
   ) => void;
-  providerColor?: string;
   isSubmitting?: boolean;
+  /** Where the money goes, e.g. "•••• 2237" (shown on the confirmation). */
+  accountLabel?: string;
 }
 
 /**
@@ -60,52 +58,16 @@ const CORE_DEDUCTED_TAX_RATE =
 
 const round2 = (value: number) => Math.round((value + Number.EPSILON) * 100) / 100;
 
-const formatCurrency = (amount: number) => {
-  if (amount === null || amount === undefined || isNaN(amount))
-    return "0.00 ETB";
-  return (
-    new Intl.NumberFormat("en-US", {
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 2,
-    }).format(amount) + " ETB"
-  );
-};
+const wholeAmount = new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 });
 
-const formatFee = (feeRule: FeeRule | undefined, suffix?: string): string => {
-  if (!feeRule || feeRule.value === "" || feeRule.value === null) return "N/A";
-  const numericValue = Number(feeRule.value);
-  if (isNaN(numericValue)) return "N/A";
-
-  if (feeRule.type === "percentage") {
-    return `${numericValue}%${suffix || ""}`;
+/** Keeps digits and one decimal point, with at most two decimals. */
+const sanitizeAmount = (raw: string) => {
+  let value = raw.replace(/[^\d.]/g, "");
+  const dot = value.indexOf(".");
+  if (dot !== -1) {
+    value = value.slice(0, dot + 1) + value.slice(dot + 1).replace(/\./g, "").slice(0, 2);
   }
-  return formatCurrency(numericValue);
-};
-
-const formatPenaltyRule = (rule: PenaltyRule): string => {
-  const value = rule.value === "" ? 0 : Number(rule.value);
-  let valueString = "";
-  let conditionString = "";
-
-  if (rule.type === "fixed") {
-    valueString = formatCurrency(value);
-  } else if (rule.type === "percentageOfPrincipal") {
-    valueString = `${value}% of principal`;
-  } else if (rule.type === "percentageOfCompound") {
-    valueString = `${value}% of outstanding balance`;
-  }
-
-  const fromDay = rule.fromDay === "" ? 1 : Number(rule.fromDay);
-  const toDay =
-    rule.toDay === "" || rule.toDay === null ? Infinity : Number(rule.toDay);
-
-  if (toDay === Infinity) {
-    conditionString = `from day ${fromDay} onwards after due date`;
-  } else {
-    conditionString = `from day ${fromDay} to day ${toDay} after due date`;
-  }
-
-  return `${valueString} ${conditionString}`;
+  return value;
 };
 
 export function LoanOfferAndCalculator({
@@ -114,13 +76,14 @@ export function LoanOfferAndCalculator({
   isLoading,
   eligibilityResult,
   onAccept,
-  providerColor = "hsl(var(--primary))",
   isSubmitting = false,
+  accountLabel,
 }: LoanOfferAndCalculatorProps) {
   const [loanAmount, setLoanAmount] = useState<number | string>("");
   const [amountError, setAmountError] = useState("");
   const [isPenaltyDetailsOpen, setIsPenaltyDetailsOpen] = useState(false);
   const [calculationResult, setCalculationResult] = useState<any>(null);
+  const [isConfirmOpen, setIsConfirmOpen] = useState(false);
 
   const { suggestedLoanAmountMin = 0, suggestedLoanAmountMax = 0 } =
     eligibilityResult || {};
@@ -176,6 +139,7 @@ export function LoanOfferAndCalculator({
 
       const tempLoan: LoanDetails = {
         id: "temp",
+        borrowerId: "",
         loanAmount: numericLoanAmount,
         serviceFee: serviceFee,
         disbursedDate,
@@ -228,18 +192,22 @@ export function LoanOfferAndCalculator({
     calculate();
   }, [loanAmount, eligibilityResult, product, taxConfigs]);
 
+  const rangeText =
+    minLoan > 0
+      ? `${formatETB(minLoan)} to ${formatETB(maxLoan)}`
+      : `up to ${formatETB(maxLoan)}`;
+
   const validateAmount = (amount: number | string) => {
     const numericAmount =
       typeof amount === "string" ? parseFloat(amount) : amount;
     if (
       isNaN(numericAmount) ||
+      numericAmount <= 0 ||
       numericAmount > maxLoan ||
       numericAmount < minLoan
     ) {
       setAmountError(
-        `Please enter an amount between ${formatCurrency(
-          minLoan,
-        )} and ${formatCurrency(maxLoan)}.`,
+        `Enter an amount between ${formatETB(minLoan)} and ${formatETB(maxLoan)}.`,
       );
       return false;
     }
@@ -248,29 +216,47 @@ export function LoanOfferAndCalculator({
   };
 
   const handleAmountChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const value = e.target.value;
-    if (value === "") {
-      setLoanAmount("");
-      setAmountError(
-        `Please enter an amount between ${formatCurrency(
-          minLoan,
-        )} and ${formatCurrency(maxLoan)}.`,
-      );
-    } else {
-      setLoanAmount(value);
-      validateAmount(value);
+    const value = sanitizeAmount(e.target.value);
+    setLoanAmount(value);
+    validateAmount(value);
+  };
+
+  const pickAmount = (value: number) => {
+    setLoanAmount(value);
+    validateAmount(value);
+  };
+
+  // Round shares of the limit, for quick taps on a phone.
+  const quickAmounts = useMemo(() => {
+    if (!Number.isFinite(maxLoan) || maxLoan <= 0) return [];
+    const step = maxLoan >= 1000 ? 100 : maxLoan >= 100 ? 10 : 1;
+    const picks = [0.25, 0.5, 0.75]
+      .map((share) => Math.floor((maxLoan * share) / step) * step)
+      .filter((v) => v > 0 && v >= minLoan && v < maxLoan);
+    return [...new Set(picks)].map((value) => ({
+      value,
+      label: wholeAmount.format(value),
+    }));
+  }, [minLoan, maxLoan]);
+
+  const numericAmount =
+    typeof loanAmount === "string" ? parseFloat(loanAmount) : loanAmount;
+
+  const openConfirm = () => {
+    if (calculationResult && !isNaN(numericAmount) && validateAmount(numericAmount)) {
+      setIsConfirmOpen(true);
     }
   };
 
   const handleAccept = () => {
-    const numericLoanAmount =
-      typeof loanAmount === "string" ? parseFloat(loanAmount) : loanAmount;
-    if (calculationResult && !isNaN(numericLoanAmount)) {
-      if (!validateAmount(numericLoanAmount)) {
+    if (calculationResult && !isNaN(numericAmount)) {
+      if (!validateAmount(numericAmount)) {
+        setIsConfirmOpen(false);
         return;
       }
+      setIsConfirmOpen(false);
       onAccept({
-        loanAmount: numericLoanAmount,
+        loanAmount: numericAmount,
         repaymentStatus: "Unpaid",
         repaidAmount: 0,
         ...calculationResult,
@@ -280,23 +266,9 @@ export function LoanOfferAndCalculator({
 
   if (isLoading) {
     return (
-      <div className="max-w-2xl mx-auto">
-        <Card>
-          <CardHeader>
-            <Skeleton className="h-8 w-3/4" />
-            <Skeleton className="h-4 w-1/2" />
-          </CardHeader>
-          <CardContent className="space-y-6">
-            <Skeleton className="h-10 w-full" />
-            <div className="space-y-2">
-              <Skeleton className="h-4 w-1/4" />
-              <Skeleton className="h-16 w-full" />
-            </div>
-          </CardContent>
-          <CardFooter>
-            <Skeleton className="h-10 w-32" />
-          </CardFooter>
-        </Card>
+      <div className="space-y-4">
+        <Skeleton className="h-28 w-full rounded-2xl bg-white" />
+        <Skeleton className="h-64 w-full rounded-2xl bg-white" />
       </div>
     );
   }
@@ -307,204 +279,217 @@ export function LoanOfferAndCalculator({
 
   if (!eligibilityResult.isEligible) {
     return (
-      <div className="max-w-2xl mx-auto">
-        <Alert variant="destructive">
-          <AlertCircle className="h-4 w-4" />
-          <AlertTitle>Not Eligible for Loan</AlertTitle>
-          <AlertDescription>
-            {eligibilityResult.reason ||
-              "We're sorry, but you are not eligible for this loan product at this time."}
-          </AlertDescription>
-        </Alert>
-      </div>
+      <Notice tone="danger" icon={<AlertCircle />}>
+        <p className="font-semibold">You can&apos;t take this loan right now</p>
+        <p className="mt-0.5">
+          {eligibilityResult.reason ||
+            "We're sorry, but you are not eligible for this loan product at this time."}
+        </p>
+      </Notice>
     );
   }
 
+  const penalties = activePenaltyRules(product);
+  const dailyFee = dailyFeeText(product);
+  const serviceFee = serviceFeeText(product);
+  const inclusiveTaxes = taxConfigs.filter((t) => t.isInclusive && t.rate > 0);
+  const duration = product.duration ?? 30;
+  const cannotBorrow = !(maxLoan > 0);
+
   return (
-    <div className="max-w-2xl mx-auto">
-      <Card className="shadow-lg">
-        <CardHeader className="text-center">
-          <CardTitle className="text-2xl font-bold font-headline">
-            {product.name}
-          </CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-6">
-          <div className="space-y-4">
-            <Label htmlFor="loanAmount" className="text-sm font-medium">
-              Enter Your Desired Loan Amount
-            </Label>
-            <Input
-              id="loanAmount"
-              type="number"
-              value={loanAmount}
-              onChange={handleAmountChange}
-              className={cn(
-                "w-full text-xl font-bold [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none",
-                amountError ? "border-destructive ring-destructive ring-2" : "",
-              )}
-              min={minLoan}
-              max={maxLoan}
-              style={
-                {
-                  "--ring": amountError
-                    ? "hsl(var(--destructive))"
-                    : providerColor,
-                } as React.CSSProperties
-              }
-            />
-            {amountError ? (
-              <p className="text-sm text-destructive">{amountError}</p>
-            ) : (
-              <p className="text-sm text-muted-foreground text-center">
-                Credit Limit: {formatCurrency(minLoan ?? 0)} -{" "}
-                {formatCurrency(maxLoan ?? 0)}
-              </p>
-            )}
+    <div>
+      <Panel>
+        <label htmlFor="loanAmount" className="text-sm font-medium text-gray-600">
+          How much do you need?
+        </label>
+        <div
+          className={cn(
+            "mt-2 flex items-baseline gap-2 rounded-2xl border-2 bg-white px-4 py-3 transition-colors focus-within:border-brand-ink",
+            amountError ? "border-red-500 focus-within:border-red-500" : "border-gray-200",
+          )}
+        >
+          <input
+            id="loanAmount"
+            type="text"
+            inputMode="decimal"
+            autoComplete="off"
+            value={loanAmount}
+            onChange={handleAmountChange}
+            disabled={cannotBorrow || isSubmitting}
+            aria-invalid={!!amountError}
+            aria-describedby="loanAmountHelp"
+            placeholder="0"
+            className="w-full min-w-0 bg-transparent text-[32px] font-bold tabular-nums tracking-tight text-gray-900 outline-none placeholder:text-gray-300"
+          />
+          <span className="text-lg font-semibold text-gray-400">ETB</span>
+        </div>
+        <p
+          id="loanAmountHelp"
+          className={cn("mt-2 text-sm", amountError ? "text-red-600" : "text-gray-500")}
+        >
+          {amountError || (cannotBorrow ? "No amount is available to borrow right now." : `You can borrow ${rangeText}.`)}
+        </p>
+
+        {!cannotBorrow && (
+          <div className="mt-3 flex flex-wrap gap-2">
+            {[...quickAmounts, { value: maxLoan, label: "Max" }].map((option) => {
+              const selected = Math.abs((numericAmount || 0) - option.value) < 0.005;
+              return (
+                <button
+                  key={option.label}
+                  type="button"
+                  onClick={() => pickAmount(option.value)}
+                  aria-pressed={selected}
+                  disabled={isSubmitting}
+                  className={cn(
+                    "h-9 rounded-full border px-3.5 text-sm font-medium tabular-nums transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-ink",
+                    selected
+                      ? "border-transparent bg-brand-soft text-brand-ink"
+                      : "border-gray-300 bg-white text-gray-700 hover:bg-gray-50",
+                  )}
+                >
+                  {option.label}
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </Panel>
+
+      {/* No figures for an amount that cannot be borrowed. */}
+      {calculationResult && !amountError && (
+        <Panel className="mt-3 overflow-hidden p-0">
+          <div className="grid grid-cols-2 divide-x divide-gray-100 border-b border-gray-100">
+            <div className="p-4">
+              <p className="text-xs font-medium text-gray-500">You&apos;ll receive</p>
+              <Amount value={formatMoney(calculationResult.netReceivedAmount)} className="mt-1 block text-xl" />
+              <p className="mt-0.5 text-xs text-gray-500">today</p>
+            </div>
+            <div className="p-4">
+              <p className="text-xs font-medium text-gray-500">You&apos;ll repay</p>
+              <Amount value={formatMoney(calculationResult.total)} className="mt-1 block text-xl text-brand-ink" />
+              <p className="mt-0.5 text-xs text-gray-500">by {formatDate(calculationResult.dueDate)}</p>
+            </div>
           </div>
 
-          {calculationResult && (
-            <div className="space-y-2">
-              <div className="space-y-4 text-sm bg-secondary p-4 rounded-lg">
-                {Number(product.serviceFee?.value) > 0 && (
-                  <div className="flex justify-between items-center">
-                    <div className="font-medium">Service Fee</div>
-                    <div className="text-right">
-                      {formatFee(product.serviceFee)}
-                    </div>
-                  </div>
-                )}
+          <div className="px-4 py-3">
+            <DetailRow label="Loan amount" value={formatMoney(calculationResult.principal)} />
+            {calculationResult.inclusiveTaxAmount > 0 && (
+              <DetailRow
+                label={
+                  inclusiveTaxes.length === 1
+                    ? `${inclusiveTaxes[0].name || "Tax"} (${inclusiveTaxes[0].rate}%)`
+                    : `Taxes (${inclusiveTaxes.reduce((s, t) => s + t.rate, 0)}%)`
+                }
+                hint="Deducted when the loan is paid out"
+                value={`− ${formatMoney(calculationResult.inclusiveTaxAmount)}`}
+              />
+            )}
+            {calculationResult.coreDeductedTaxAmount > 0 && (
+              <DetailRow
+                label={`Tax deducted (${CORE_DEDUCTED_TAX_RATE}%)`}
+                hint="Deducted by the bank when the loan is paid out"
+                value={`− ${formatMoney(calculationResult.coreDeductedTaxAmount)}`}
+              />
+            )}
+            <div className="my-1.5 border-t border-dashed border-gray-200" />
+            {calculationResult.serviceFee > 0 && (
+              <DetailRow label="Service fee" hint={serviceFee ?? undefined} value={`+ ${formatMoney(calculationResult.serviceFee)}`} />
+            )}
+            {calculationResult.interest > 0 && (
+              <DetailRow
+                label="Daily fee"
+                hint={dailyFee ? `${dailyFee} for ${duration} days` : undefined}
+                value={`+ ${formatMoney(calculationResult.interest)}`}
+              />
+            )}
+            {calculationResult.tax > 0 && (
+              <DetailRow label="Tax on fees" value={`+ ${formatMoney(calculationResult.tax)}`} />
+            )}
+            <DetailRow label="Total to repay" value={formatETB(calculationResult.total)} strong />
+            <DetailRow
+              label="Due date"
+              value={formatDate(calculationResult.dueDate)}
+              hint={duration > 0 ? `${duration} days from today` : "End of today"}
+            />
+          </div>
 
-                {Number(product.dailyFee?.value) > 0 && (
-                  <div className="flex justify-between items-center">
-                    <div className="font-medium">Daily Fee</div>
-                    <div className="text-right">
-                      {formatFee(product.dailyFee)}
-                    </div>
-                  </div>
-                )}
-
-                {calculationResult.tax > 0 && (
-                  <div className="flex justify-between items-center">
-                    <div className="font-medium">Tax</div>
-                    <div className="text-right">
-                      {formatCurrency(calculationResult.tax)}
-                    </div>
-                  </div>
-                )}
-
-                <Collapsible
-                  open={isPenaltyDetailsOpen}
-                  onOpenChange={setIsPenaltyDetailsOpen}
-                >
-                  {product.penaltyRules && product.penaltyRules.length > 0 && (
-                    <CollapsibleTrigger asChild>
-                      <button
-                        type="button"
-                        className={cn(
-                          "font-medium w-full flex justify-between items-center",
-                          product.penaltyRules &&
-                            product.penaltyRules.length > 0 &&
-                            "text-destructive",
-                        )}
-                      >
-                        <span className="flex items-center">
-                          Penalty Rules
-                          <ChevronDown
-                            className={cn(
-                              "h-4 w-4 ml-1 transition-transform",
-                              isPenaltyDetailsOpen && "rotate-180",
-                            )}
-                          />
-                        </span>
-                      </button>
-                    </CollapsibleTrigger>
-                  )}
-                  <CollapsibleContent>
-                    <div className="mt-2 space-y-1 text-xs text-muted-foreground/80 pl-4">
-                      {(product.penaltyRules || []).map((rule) => (
-                        <p key={rule.id}>- {formatPenaltyRule(rule)}</p>
-                      ))}
-                    </div>
-                  </CollapsibleContent>
-                </Collapsible>
-              </div>
-
-              {/* Tax Breakdown - shown whenever the borrower receives less than the
-                  loan amount, whether this system or core banking performs the deduction. */}
-              {calculationResult.totalDeductedAtDisbursement > 0 && (
-                <div className="space-y-2 text-sm bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800 p-4 rounded-lg">
-                  <div className="font-medium text-amber-800 dark:text-amber-300 mb-2">
-                    Tax Deduction at Disbursement
-                  </div>
-                  <div className="flex justify-between items-center">
-                    <div className="text-muted-foreground">
-                      Gross Loan Amount
-                    </div>
-                    <div className="text-right font-medium">
-                      {formatCurrency(calculationResult.principal)}
-                    </div>
-                  </div>
-                  <div className="flex justify-between items-center text-amber-700 dark:text-amber-400">
-                    <div>
-                      {[
-                        ...taxConfigs
-                          .filter((t) => t.isInclusive && t.rate > 0)
-                          .map((t) => t.name || `Tax (${t.rate}%)`),
-                        ...(calculationResult.coreDeductedTaxAmount > 0
-                          ? [`Tax Deducted (${CORE_DEDUCTED_TAX_RATE}%)`]
-                          : []),
-                      ].join(" + ")}
-                    </div>
-                    <div className="text-right font-medium">
-                      −{" "}
-                      {formatCurrency(
-                        calculationResult.totalDeductedAtDisbursement,
-                      )}
-                    </div>
-                  </div>
-                  <div className="border-t border-amber-200 dark:border-amber-700 pt-2 flex justify-between items-center">
-                    <div className="font-semibold">Net Amount Disbursed</div>
-                    <div
-                      className="text-right font-bold"
-                      style={{ color: providerColor }}
-                    >
-                      {formatCurrency(calculationResult.netReceivedAmount)}
-                    </div>
-                  </div>
-                </div>
-              )}
-
-              <div className="flex justify-between items-center p-4 rounded-lg border">
-                <div>
-                  <span className="text-base font-semibold">
-                    Total Repayable Amount
-                  </span>
-                  <p className="text-xs text-muted-foreground">
-                    on {format(calculationResult.dueDate, "PPP")}
-                  </p>
-                </div>
-                <span
-                  className="text-2xl font-bold"
-                  style={{ color: providerColor }}
-                >
-                  {formatCurrency(calculationResult.total)}
+          {penalties.length > 0 && (
+            <div className="border-t border-gray-100">
+              <button
+                type="button"
+                onClick={() => setIsPenaltyDetailsOpen((v) => !v)}
+                aria-expanded={isPenaltyDetailsOpen}
+                aria-controls="late-payment-rules"
+                className="flex w-full items-center justify-between px-4 py-3 text-sm font-medium text-gray-700 hover:bg-gray-50"
+              >
+                <span className="flex items-center gap-2">
+                  <Info className="h-4 w-4 text-amber-600" aria-hidden />
+                  If you pay late
                 </span>
-              </div>
+                <ChevronDown
+                  className={cn("h-4 w-4 transition-transform", isPenaltyDetailsOpen && "rotate-180")}
+                  aria-hidden
+                />
+              </button>
+              {isPenaltyDetailsOpen && (
+                <ul id="late-payment-rules" className="space-y-1.5 px-4 pb-4 text-sm text-gray-600">
+                  {penalties.map((rule) => (
+                    <li key={rule.id} className="flex gap-2">
+                      <span aria-hidden className="mt-2 h-1 w-1 shrink-0 rounded-full bg-gray-400" />
+                      {describePenalty(rule)}
+                    </li>
+                  ))}
+                </ul>
+              )}
             </div>
           )}
-        </CardContent>
-        <CardFooter>
-          <Button
-            size="lg"
-            className="w-full text-white"
-            onClick={handleAccept}
-            disabled={!!amountError || isSubmitting}
-            style={{ backgroundColor: providerColor }}
-          >
-            {isSubmitting ? "Processing..." : "Accept and Disburse Loan"}
-          </Button>
-        </CardFooter>
-      </Card>
+        </Panel>
+      )}
+
+      <div className="sticky bottom-0 -mx-4 mt-6 border-t border-gray-200 bg-white/95 px-4 pb-[max(env(safe-area-inset-bottom),12px)] pt-3 backdrop-blur">
+        <BrandButton
+          block
+          size="lg"
+          onClick={openConfirm}
+          disabled={!calculationResult || !!amountError || cannotBorrow}
+          loading={isSubmitting}
+        >
+          {isSubmitting ? "Processing…" : "Continue"}
+        </BrandButton>
+      </div>
+
+      <BottomSheet
+        open={isConfirmOpen}
+        onOpenChange={setIsConfirmOpen}
+        title="Confirm your loan"
+        description="Please check the details before we send the money."
+        footer={
+          <div className="space-y-2">
+            <BrandButton block size="lg" onClick={handleAccept} loading={isSubmitting}>
+              Confirm and get {calculationResult ? formatETB(calculationResult.netReceivedAmount) : ""}
+            </BrandButton>
+            <BrandButton block variant="ghost" onClick={() => setIsConfirmOpen(false)}>
+              Change amount
+            </BrandButton>
+          </div>
+        }
+      >
+        {calculationResult && (
+          <>
+            <div className="rounded-2xl bg-gray-50 px-4 py-2">
+              <DetailRow label="You'll receive" value={formatETB(calculationResult.netReceivedAmount)} strong />
+              {accountLabel && <DetailRow label="Paid into" value={accountLabel} />}
+              <DetailRow label="You'll repay" value={formatETB(calculationResult.total)} strong />
+              <DetailRow label="Due date" value={formatDate(calculationResult.dueDate)} />
+            </div>
+            <p className="mt-3 text-xs leading-relaxed text-gray-500">
+              By confirming, you take this {product.name} loan on the terms shown.
+              {penalties.length > 0 && " Paying after the due date adds a penalty."}
+            </p>
+          </>
+        )}
+      </BottomSheet>
     </div>
   );
 }

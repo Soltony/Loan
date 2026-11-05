@@ -10,6 +10,7 @@ import { calculateInstallmentPenalty } from '@/lib/installment-penalty';
 import { getAsOfDate } from '@/lib/date-utils';
 import { getPhoneNumbersForAccount } from '@/lib/account-utils';
 import { ensureInstallmentRollover } from '@/lib/installment-rollover';
+import { forBorrower } from '@/lib/miniapp/payload';
 
 // Ensure dashboard always renders dynamically and bypasses cache so rollover runs
 export const dynamic = 'force-dynamic';
@@ -45,7 +46,8 @@ async function getProviders(): Promise<LoanProvider[]> {
         return providers.map(p => ({
             ...p,
             products: p.products.map(prod => ({
-                ...prod,
+                // The dashboard draws product icons; other customers' salaries never leave the server.
+                ...forBorrower(prod, { keepIcon: true }),
                 serviceFee: safeJsonParse(prod.serviceFee, { type: 'percentage', value: 0 }) as FeeRule,
                 dailyFee: safeJsonParse(prod.dailyFee, { type: 'percentage', value: 0 }) as FeeRule,
                 penaltyRules: safeJsonParse(prod.penaltyRules, []) as PenaltyRule[],
@@ -98,7 +100,7 @@ async function getLoanHistory(borrowerId: string): Promise<LoanDetails[]> {
             repaidAmount: loan.repaidAmount || 0,
             penaltyAmount: loan.penaltyAmount,
             product: {
-              ...loan.product,
+              ...forBorrower(loan.product),
               serviceFee: safeJsonParse(loan.product.serviceFee, { type: 'percentage', value: 0 }),
               dailyFee: safeJsonParse(loan.product.dailyFee, { type: 'percentage', value: 0 }),
               penaltyRules: safeJsonParse(loan.product.penaltyRules, []),

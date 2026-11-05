@@ -11,6 +11,7 @@ import { requireMiniAppAuthContext } from '@/lib/miniapp-auth';
 import { getAsOfDate } from '@/lib/date-utils';
 import { startOfDay } from 'date-fns';
 import { getPhoneNumbersForAccount } from '@/lib/account-utils';
+import { forBorrower } from '@/lib/miniapp/payload';
 
 export const dynamic = 'force-dynamic';
 
@@ -53,7 +54,7 @@ async function getLoanDetails(loanId: string, borrowerId: string): Promise<LoanD
         if (!loan) return null;
         
         const parsedProduct = {
-            ...loan.product,
+            ...forBorrower(loan.product),
             serviceFee: safeJsonParse(loan.product.serviceFee, { type: 'percentage', value: 0 }),
             dailyFee: safeJsonParse(loan.product.dailyFee, { type: 'percentage', value: 0, calculationBase: 'principal' }),
             penaltyRules: safeJsonParse(loan.product.penaltyRules, []),
@@ -124,7 +125,7 @@ export default async function LoanDetailPage({ params }: { params: Promise<{ loa
                 </div>
             </div>
         }>
-            <LoanDetailClient loanDetails={loanDetails} />
+            <LoanDetailClient loanDetails={loanDetails} asOfDate={getAsOfDate()} />
         </Suspense>
     );
 }
