@@ -78,7 +78,19 @@ function sanitizeHeaders(headers?: Record<string, string> | Headers | null) {
     return out;
 }
 
-function sanitizeForAudit(value: any, opts?: { maxDepth?: number; maxArrayLen?: number; maxStringLen?: number }) {
+/**
+ * The client IP (first hop of x-forwarded-for) and user agent to record with an
+ * audit entry. Same rule as the manual-repayment module's `requestActorContext`.
+ */
+export function auditRequestContext(req: Request): { ipAddress: string; userAgent: string } {
+    const forwarded = req.headers.get('x-forwarded-for');
+    return {
+        ipAddress: (forwarded ? forwarded.split(',')[0].trim() : null) || req.headers.get('x-real-ip') || 'N/A',
+        userAgent: req.headers.get('user-agent') || 'N/A',
+    };
+}
+
+export function sanitizeForAudit(value: unknown, opts?: { maxDepth?: number; maxArrayLen?: number; maxStringLen?: number }) {
     const maxDepth = opts?.maxDepth ?? 6;
     const maxArrayLen = opts?.maxArrayLen ?? 50;
     const maxStringLen = opts?.maxStringLen ?? 4000;
@@ -234,5 +246,33 @@ export async function createAuditLog(data: AuditLogData) {
         console.error("Failed to create audit log:", error);
         // In a real application, you might want a fallback mechanism here,
         // like writing to a critical log file if the DB fails.
+    }
+}
+
+// 8 bound columns per row; 200 rows stays under SQL Server's 2100-parameter limit.
+const AUDIT_BULK_CHUNK = 200;
+
+/**
+ * Writes many audit entries in a few statements, e.g. one per borrower a batch job
+ * flags. Never throws, like `createAuditLog`.
+ */
+export async function createAuditLogs(entries: AuditLogData[]) {
+    if (entries.length === 0) return;
+    try {
+        for (let i = 0; i < entries.length; i += AUDIT_BULK_CHUNK) {
+            await prisma.auditLog.createMany({
+                data: entries.slice(i, i + AUDIT_BULK_CHUNK).map((data) => ({
+                    actorId: data.actorId,
+                    action: data.action,
+                    entity: data.entity,
+                    entityId: data.entityId,
+                    ipAddress: data.ipAddress,
+                    userAgent: data.userAgent,
+                    details: data.details ? JSON.stringify(data.details) : null,
+                })),
+            });
+        }
+    } catch (error) {
+        console.error("Failed to create audit logs:", error);
     }
 }

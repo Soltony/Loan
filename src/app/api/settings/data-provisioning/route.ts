@@ -5,6 +5,7 @@ import prisma from '@/lib/prisma';
 import { getSession } from '@/lib/session';
 import { getUserFromSession } from '@/lib/user';
 import { hasPermissionForEntity } from '@/lib/require-permission';
+import { auditRequestContext, createAuditLog, sanitizeForAudit } from '@/lib/audit-log';
 
 // Helper to safely parse JSON strings
 const safeJsonParse = (jsonString: string | null | undefined, defaultValue: any) => {
@@ -91,6 +92,15 @@ export async function POST(req: NextRequest) {
             }
         });
 
+        await createAuditLog({
+            actorId: user.id,
+            action: 'DATA_PROVISIONING_CONFIG_CREATED',
+            entity: 'DataProvisioningConfig',
+            entityId: newConfig.id,
+            details: sanitizeForAudit({ providerId, name, columns }),
+            ...auditRequestContext(req),
+        });
+
         return NextResponse.json({ ...newConfig, columns: columns }, { status: 201 });
     } catch (error) {
         console.error('Error creating data provisioning config:', error);
@@ -117,6 +127,7 @@ export async function PUT(req: NextRequest) {
         const body = await req.json();
         const { id, name, columns } = body;
 
+        const previous = await prisma.dataProvisioningConfig.findUnique({ where: { id }, select: { name: true, columns: true } });
         const updatedConfig = await prisma.dataProvisioningConfig.update({
             where: { id },
             data: {
@@ -124,7 +135,20 @@ export async function PUT(req: NextRequest) {
                 columns: JSON.stringify(columns)
             }
         });
-        
+
+        await createAuditLog({
+            actorId: user.id,
+            action: 'DATA_PROVISIONING_CONFIG_UPDATED',
+            entity: 'DataProvisioningConfig',
+            entityId: id,
+            details: sanitizeForAudit({
+                providerId: updatedConfig.providerId,
+                before: previous ? { name: previous.name, columns: safeJsonParse(previous.columns, []) } : null,
+                after: { name, columns },
+            }),
+            ...auditRequestContext(req),
+        });
+
         return NextResponse.json({ ...updatedConfig, columns: columns });
     } catch (error) {
         console.error('Error updating data provisioning config:', error);
@@ -169,7 +193,9 @@ export async function DELETE(req: NextRequest) {
             return NextResponse.json({ error: `Cannot delete. This data source is currently used by ${productCount} product(s) via an eligibility list.` }, { status: 409 });
         }
 
-        await prisma.$transaction(async (tx) => {
+        const config = await prisma.dataProvisioningConfig.findUnique({ where: { id }, select: { name: true, providerId: true } });
+
+        const deleted = await prisma.$transaction(async (tx) => {
              // Find any products that are linked to uploads from this config
             const uploadsToDelete = await tx.dataProvisioningUpload.findMany({
                 where: { configId: id },
@@ -186,7 +212,7 @@ export async function DELETE(req: NextRequest) {
             }
 
             // Delete all provisioned data associated with this config
-            await tx.provisionedData.deleteMany({
+            const rows = await tx.provisionedData.deleteMany({
                 where: { configId: id }
             });
 
@@ -194,8 +220,22 @@ export async function DELETE(req: NextRequest) {
             await tx.dataProvisioningConfig.delete({
                 where: { id },
             });
+            return { uploadCount: uploadIds.length, rowCount: rows.count };
         });
 
+        await createAuditLog({
+            actorId: user.id,
+            action: 'DATA_PROVISIONING_CONFIG_DELETED',
+            entity: 'DataProvisioningConfig',
+            entityId: id,
+            details: {
+                name: config?.name ?? null,
+                providerId: config?.providerId ?? null,
+                deletedUploads: deleted.uploadCount,
+                deletedRows: deleted.rowCount,
+            },
+            ...auditRequestContext(req),
+        });
 
         return NextResponse.json({ message: 'Config deleted successfully' });
 

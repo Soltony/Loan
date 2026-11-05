@@ -20,6 +20,27 @@ const roleSchema = z.object({
   permissions: permissionsSchema,
 });
 
+type PermissionMap = Record<string, Record<string, boolean>>;
+
+/** Every granted permission as "module.action", so audit entries say exactly what a role can do. */
+function grantedPermissions(permissions: PermissionMap | null | undefined): string[] {
+  const out: string[] = [];
+  for (const [module, actions] of Object.entries(permissions ?? {})) {
+    for (const [action, allowed] of Object.entries(actions ?? {})) {
+      if (allowed) out.push(`${module}.${action}`);
+    }
+  }
+  return out.sort();
+}
+
+function parseStoredPermissions(raw: string | null | undefined): PermissionMap {
+  try {
+    return raw ? JSON.parse(raw) : {};
+  } catch {
+    return {};
+  }
+}
+
 
 export async function GET() {
     const user = await getUserFromSession();
@@ -81,7 +102,7 @@ export async function POST(req: NextRequest) {
             },
         });
         
-        const successLogDetails = { roleId: newRole.id, roleName: newRole.name };
+        const successLogDetails = { roleId: newRole.id, roleName: newRole.name, permissions: grantedPermissions(permissions) };
         await createAuditLog({ actorId: user.id, action: 'ROLE_CREATE_SUCCESS', entity: 'ROLE', entityId: newRole.id, details: successLogDetails, ipAddress, userAgent });
 
         return NextResponse.json({ ...newRole, permissions }, { status: 201 });
@@ -140,14 +161,25 @@ export async function PUT(req: NextRequest) {
 
                 // Privilege update control: if a role's permissions change, invalidate sessions
                 // for all users assigned to that role so new permissions take effect immediately.
+                let affectedUserCount: number | null = null;
                 try {
                     const users = await prisma.user.findMany({ where: { roleId: id }, select: { id: true } });
+                    affectedUserCount = users.length;
                     await Promise.all(users.map((u) => revokeAllUserSessions(u.id)));
                 } catch (e) {
                     console.error('Failed to revoke sessions after role permission update:', e);
                 }
-        
-        const successLogDetails = { roleId: updatedRole.id, roleName: updatedRole.name };
+
+        const previous = new Set(grantedPermissions(parseStoredPermissions(roleToEdit?.permissions)));
+        const next = new Set(grantedPermissions(permissions));
+        const successLogDetails = {
+            roleId: updatedRole.id,
+            roleName: updatedRole.name,
+            ...(roleToEdit && roleToEdit.name !== updatedRole.name ? { renamedFrom: roleToEdit.name } : {}),
+            granted: [...next].filter((p) => !previous.has(p)),
+            revoked: [...previous].filter((p) => !next.has(p)),
+            affectedUserCount,
+        };
         await createAuditLog({ actorId: user.id, action: 'ROLE_UPDATE_SUCCESS', entity: 'ROLE', entityId: updatedRole.id, details: successLogDetails, ipAddress, userAgent });
 
 

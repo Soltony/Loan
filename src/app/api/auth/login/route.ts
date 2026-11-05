@@ -12,6 +12,17 @@ export async function POST(req: NextRequest) {
   const userAgent = req.headers.get('user-agent') || 'N/A';
   const GENERIC_AUTH_ERROR = 'Invalid phone number or password.';
 
+  // One entry when a failed attempt trips the lockout. Requests refused while the
+  // lock is active are not logged, so a brute-force run cannot flood the table.
+  const auditLockout = (actorId: string, attemptedPhoneNumber: string, lockMs: number) =>
+    createAuditLog({
+      actorId,
+      action: 'USER_LOGIN_LOCKED',
+      ipAddress,
+      userAgent,
+      details: { attemptedPhoneNumber, maxAttempts: MAX_ATTEMPTS, windowMs: WINDOW_MS, lockedForSeconds: Math.ceil(lockMs / 1000) },
+    });
+
   try {
     const body = await req.json().catch(() => ({}));
     const phoneNumberRaw = typeof (body as any)?.phoneNumber === 'string' ? (body as any).phoneNumber.trim() : '';
@@ -36,6 +47,7 @@ export async function POST(req: NextRequest) {
       recordFailedAttempt(rateKey);
       if (isBlocked(rateKey)) {
         const lockMs = getLockRemainingMs(rateKey);
+        await auditLockout('anonymous', phoneNumberRaw, lockMs);
         const retryAfterSeconds = Math.ceil(lockMs / 1000) || 1;
         const remaining = getRemainingAttempts(rateKey);
         const backoff = getBackoffSeconds(rateKey);
@@ -77,6 +89,7 @@ export async function POST(req: NextRequest) {
       // If this attempt caused a lockout, inform client
       if (isBlocked(validatedRateKey)) {
         const lockMs = getLockRemainingMs(validatedRateKey);
+        await auditLockout('anonymous', phoneNumber, lockMs);
         const retryAfterSeconds = Math.ceil(lockMs / 1000) || 1;
         const remaining = getRemainingAttempts(validatedRateKey);
         const backoff = getBackoffSeconds(validatedRateKey);
@@ -109,6 +122,7 @@ export async function POST(req: NextRequest) {
        // If we hit lockout after this attempt, respond with 429
        if (isBlocked(validatedRateKey)) {
          const lockMs = getLockRemainingMs(validatedRateKey);
+         await auditLockout(user.id, phoneNumber, lockMs);
          const retryAfterSeconds = Math.ceil(lockMs / 1000) || 1;
          const remaining = getRemainingAttempts(validatedRateKey);
          const backoff = getBackoffSeconds(validatedRateKey);

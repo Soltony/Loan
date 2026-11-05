@@ -4,6 +4,7 @@ import prisma from '@/lib/prisma';
 import { getSession } from '@/lib/session';
 import { requiredDocumentSchema } from '@/lib/schemas';
 import { z } from 'zod';
+import { auditRequestContext, createAuditLog } from '@/lib/audit-log';
 
 // GET all required documents for a product
 export async function GET(req: NextRequest) {
@@ -51,6 +52,15 @@ export async function POST(req: NextRequest) {
             },
         });
 
+        await createAuditLog({
+            actorId: session.userId,
+            action: 'REQUIRED_DOCUMENT_CREATED',
+            entity: 'RequiredDocument',
+            entityId: newDocument.id,
+            details: { productId: newDocument.productId, name: newDocument.name, description: newDocument.description },
+            ...auditRequestContext(req),
+        });
+
         return NextResponse.json(newDocument, { status: 201 });
     } catch (error) {
         if (error instanceof z.ZodError) {
@@ -72,12 +82,26 @@ export async function PUT(req: NextRequest) {
         const body = await req.json();
         const data = requiredDocumentSchema.extend({ id: z.string() }).parse(body);
 
+        const previous = await prisma.requiredDocument.findUnique({ where: { id: data.id }, select: { name: true, description: true } });
         const updatedDocument = await prisma.requiredDocument.update({
             where: { id: data.id },
             data: {
                 name: data.name,
                 description: data.description || null,
             },
+        });
+
+        await createAuditLog({
+            actorId: session.userId,
+            action: 'REQUIRED_DOCUMENT_UPDATED',
+            entity: 'RequiredDocument',
+            entityId: updatedDocument.id,
+            details: {
+                productId: updatedDocument.productId,
+                before: previous,
+                after: { name: updatedDocument.name, description: updatedDocument.description },
+            },
+            ...auditRequestContext(req),
         });
 
         return NextResponse.json(updatedDocument);
@@ -105,8 +129,16 @@ export async function DELETE(req: NextRequest) {
     }
 
     try {
-        await prisma.requiredDocument.delete({
+        const deleted = await prisma.requiredDocument.delete({
             where: { id },
+        });
+        await createAuditLog({
+            actorId: session.userId,
+            action: 'REQUIRED_DOCUMENT_DELETED',
+            entity: 'RequiredDocument',
+            entityId: id,
+            details: { productId: deleted.productId, name: deleted.name, description: deleted.description },
+            ...auditRequestContext(req),
         });
         return NextResponse.json({ message: 'Document deleted successfully' });
     } catch (error) {

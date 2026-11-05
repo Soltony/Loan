@@ -1,6 +1,15 @@
 import { NextRequest, NextResponse } from 'next/server';
 import prisma from '@/lib/prisma';
 import { getSession } from '@/lib/session';
+import { auditRequestContext, createAuditLog, sanitizeForAudit } from '@/lib/audit-log';
+
+const parseJson = (value: string | null | undefined) => {
+  try {
+    return value ? JSON.parse(value) : null;
+  } catch {
+    return value ?? null;
+  }
+};
 
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
@@ -43,6 +52,17 @@ export async function PUT(req: NextRequest) {
     } else {
       result = await prisma.loanCycleConfig.create({ data: { productId, metric, enabled: enabled ?? true, cycleRanges: cycleRanges ? JSON.stringify(cycleRanges) : JSON.stringify([]), grades: grades ? JSON.stringify(grades) : JSON.stringify([]) } });
     }
+
+    const snapshot = (c: typeof result | null) =>
+      c ? { metric: c.metric, enabled: c.enabled, cycleRanges: parseJson(c.cycleRanges), grades: parseJson(c.grades) } : null;
+    await createAuditLog({
+      actorId: session.userId,
+      action: existing ? 'LOAN_CYCLE_CONFIG_UPDATED' : 'LOAN_CYCLE_CONFIG_CREATED',
+      entity: 'LoanProduct',
+      entityId: productId,
+      details: sanitizeForAudit({ loanCycleConfigId: result.id, before: snapshot(existing), after: snapshot(result) }),
+      ...auditRequestContext(req),
+    });
 
     return NextResponse.json(result);
   } catch (error: any) {

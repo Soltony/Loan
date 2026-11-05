@@ -359,10 +359,19 @@ export async function syncCbsDeletionForBorrower(
 
     // Out of NPL. Opening the app used to reset every borrower to Active, which
     // un-flagged borrowers who still owed; repayment is now what clears it.
-    await prisma.borrower.updateMany({
+    const cleared = await prisma.borrower.updateMany({
       where: { id: borrowerId, status: "NPL" },
       data: { status: "Active" },
     });
+    if (cleared.count > 0) {
+      await createAuditLog({
+        actorId: opts?.actorId ?? "system",
+        action: "BORROWER_NPL_CLEARED",
+        entity: "Borrower",
+        entityId: borrowerId,
+        details: { from: "NPL", to: "Active", reason: "No unpaid loans remain", source: opts?.source ?? "AUTO" },
+      });
+    }
 
     const accounts = await resolveAccountNumbersForBorrower(borrowerId);
     if (accounts.length === 0) return;
@@ -1794,15 +1803,17 @@ async function recordCbsRepayment(args: {
     });
 
     // Clear NPL flag if borrower has no remaining unpaid loans.
+    let nplCleared = false;
     if (isFullyPaid) {
       const remaining = await tx.loan.count({
         where: { borrowerId: loan.borrowerId, repaymentStatus: "Unpaid" },
       });
       if (remaining === 0) {
-        await tx.borrower.updateMany({
+        const cleared = await tx.borrower.updateMany({
           where: { id: loan.borrowerId, status: "NPL" },
           data: { status: "Active" },
         });
+        nplCleared = cleared.count > 0;
       }
     }
 
@@ -1817,6 +1828,7 @@ async function recordCbsRepayment(args: {
       },
       remainingBalance: Math.max(0, totals.total - newRepaid),
       isFullyPaid,
+      nplCleared,
     };
   }, {
     // Every posting updates the same provider ledger-account rows, so postings
@@ -1832,6 +1844,24 @@ async function recordCbsRepayment(args: {
     applied: paymentRecord.applied,
     remainingBalance: paymentRecord.remainingBalance,
   });
+
+  // Audited after commit so a rolled-back posting never leaves a "cleared" entry.
+  if (paymentRecord.nplCleared) {
+    await createAuditLog({
+      actorId: "cbs-webhook",
+      action: "BORROWER_NPL_CLEARED",
+      entity: "Borrower",
+      entityId: loan.borrowerId,
+      details: {
+        from: "NPL",
+        to: "Active",
+        reason: "CBS collection fully repaid the last unpaid loan",
+        loanId,
+        paymentId: paymentRecord.payment.id,
+        correlationId,
+      },
+    });
+  }
 
   return {
     paymentId: paymentRecord.payment.id,

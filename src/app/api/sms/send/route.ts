@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getUserFromSession } from '@/lib/user';
 import { hasPermission } from '@/lib/permissions';
 import { sendSmsToLoan, sendSingleSms, resolveMessagePlaceholders } from '@/actions/sms';
+import { auditRequestContext, createAuditLog } from '@/lib/audit-log';
 
 export async function POST(request: NextRequest) {
     try {
@@ -11,6 +12,16 @@ export async function POST(request: NextRequest) {
         }
 
         const data = await request.json();
+        // A manual send from the admin UI; campaign sends are audited when the campaign starts.
+        const auditSend = (result: { success: boolean; smsLogId: string; status: string; error?: string }, extra: Record<string, unknown>) =>
+            createAuditLog({
+                actorId: user.id,
+                action: result.success ? 'SMS_SENT' : 'SMS_SEND_FAILED',
+                entity: 'SmsLog',
+                entityId: result.smsLogId,
+                details: { ...extra, templateId: data.templateId ?? null, status: result.status, error: result.error ?? null },
+                ...auditRequestContext(request),
+            });
 
         // Send to specific loan
         if (data.loanId) {
@@ -19,6 +30,7 @@ export async function POST(request: NextRequest) {
                 templateId: data.templateId,
                 customMessage: data.customMessage,
             });
+            await auditSend(result, { loanId: data.loanId, customMessage: data.customMessage ?? null });
             return NextResponse.json(result);
         }
 
@@ -34,6 +46,7 @@ export async function POST(request: NextRequest) {
                 messageContent: resolvedContent,
                 templateId: data.templateId,
             });
+            await auditSend(result, { recipientPhone: data.recipientPhone, messageContent: resolvedContent });
             return NextResponse.json(result);
         }
 

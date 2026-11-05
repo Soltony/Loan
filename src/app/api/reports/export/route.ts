@@ -5,6 +5,7 @@ import { loanStatusFilter } from '@/lib/reports/borrowers';
 import { buildReportWorkbook, EXPORT_SHEETS, exportFileName, parseSheets } from '@/lib/reports/export';
 import { canSeeFundUtilization, reportBorrowerScope, reportContext } from '@/lib/reports/http';
 import { localDay, reportPeriod, reportProvider, reportTzOffset } from '@/lib/reports/params';
+import { auditRequestContext, createAuditLog } from '@/lib/audit-log';
 
 export const dynamic = 'force-dynamic';
 
@@ -49,6 +50,21 @@ export async function GET(req: NextRequest) {
 
     const buffer = Buffer.from(await workbook.xlsx.writeBuffer());
     const filename = exportFileName(sheets, params.get('timeframe') || 'overall', localDay(new Date(), tzOffset));
+
+    // Bulk customer and loan data leaving the system: record who took what.
+    await createAuditLog({
+      actorId: user.id,
+      action: 'REPORT_EXPORTED',
+      entity: 'Report',
+      details: {
+        filename,
+        sheets: workbook.worksheets.map((ws) => ({ name: ws.name, rows: Math.max(0, ws.rowCount - 1) })),
+        providerId: providerId ?? null,
+        filters: Object.fromEntries(params.entries()),
+      },
+      ...auditRequestContext(req),
+    });
+
     return new NextResponse(buffer, {
       status: 200,
       headers: {

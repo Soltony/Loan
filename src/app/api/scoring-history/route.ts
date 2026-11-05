@@ -3,6 +3,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import prisma from '@/lib/prisma';
 import { getSession } from '@/lib/session';
+import { auditRequestContext, createAuditLog } from '@/lib/audit-log';
 
 const safeParseJson = (jsonString: string, defaultValue: any = []) => {
     try {
@@ -101,7 +102,21 @@ export async function POST(req: NextRequest) {
             ...newHistory,
             parameters: parameters, // Return the object, not the string
         };
-        
+
+        // The parameters themselves are kept on the history record; the entry says who applied them where.
+        await createAuditLog({
+            actorId: session.userId,
+            action: 'SCORING_HISTORY_SAVED',
+            entity: 'ScoringConfigurationHistory',
+            entityId: newHistory?.id,
+            details: {
+                providerId,
+                appliedProductIds: appliedProductIds ?? [],
+                parameterCount: Array.isArray(parameters) ? parameters.length : null,
+            },
+            ...auditRequestContext(req),
+        });
+
         return NextResponse.json(formattedHistory, { status: 201 });
     } catch (error) {
         console.error('Error creating scoring history:', error);
@@ -124,6 +139,16 @@ export async function DELETE(req: NextRequest) {
     }
     
     try {
+        const existing = await prisma.scoringConfigurationHistory.findUnique({
+            where: { id },
+            select: {
+                providerId: true,
+                savedAt: true,
+                parameters: true,
+                appliedProducts: { select: { productId: true } },
+            },
+        });
+
         // Use a transaction to delete the related products first, then the history item
         await prisma.$transaction(async (tx) => {
             await tx.scoringConfigurationProduct.deleteMany({
@@ -132,6 +157,21 @@ export async function DELETE(req: NextRequest) {
             await tx.scoringConfigurationHistory.delete({
                 where: { id },
             });
+        });
+
+        // The record is gone, so its parameters are kept here.
+        await createAuditLog({
+            actorId: session.userId,
+            action: 'SCORING_HISTORY_DELETED',
+            entity: 'ScoringConfigurationHistory',
+            entityId: id,
+            details: {
+                providerId: existing?.providerId ?? null,
+                savedAt: existing?.savedAt ?? null,
+                appliedProductIds: existing?.appliedProducts.map((p) => p.productId) ?? [],
+                parameters: existing ? safeParseJson(existing.parameters, []) : null,
+            },
+            ...auditRequestContext(req),
         });
 
         return NextResponse.json({ message: 'History record deleted successfully' });

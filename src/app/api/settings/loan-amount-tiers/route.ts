@@ -3,6 +3,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import prisma from '@/lib/prisma';
 import { getSession } from '@/lib/session';
 import { z } from 'zod';
+import { auditRequestContext, createAuditLog } from '@/lib/audit-log';
 
 const tierSchema = z.object({
   id: z.string().optional(),
@@ -26,6 +27,10 @@ export async function POST(req: NextRequest) {
         const body = await req.json();
         const { productId, tiers } = saveTiersSchema.parse(body);
 
+        const tierView = (t: { fromScore: number; toScore: number; loanAmount: number }) =>
+            ({ fromScore: t.fromScore, toScore: t.toScore, loanAmount: t.loanAmount });
+        const previousTiers = await prisma.loanAmountTier.findMany({ where: { productId }, orderBy: { fromScore: 'asc' } });
+
         // Use a transaction to delete old tiers and create new ones
         const savedTiers = await prisma.$transaction(async (tx) => {
             // Delete all existing tiers for this product
@@ -45,6 +50,15 @@ export async function POST(req: NextRequest) {
 
             // Return the newly created tiers
             return await tx.loanAmountTier.findMany({ where: { productId } });
+        });
+
+        await createAuditLog({
+            actorId: session.userId,
+            action: 'LOAN_AMOUNT_TIERS_UPDATED',
+            entity: 'LoanProduct',
+            entityId: productId,
+            details: { before: previousTiers.map(tierView), after: tiers.map(tierView) },
+            ...auditRequestContext(req),
         });
 
         return NextResponse.json(savedTiers, { status: 201 });

@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import prisma from '@/lib/prisma';
 import { getSession } from '@/lib/session';
+import { auditRequestContext, createAuditLog } from '@/lib/audit-log';
 
 // GET the latest active T&C for a provider
 export async function GET(req: NextRequest) {
@@ -71,6 +72,15 @@ export async function POST(req: NextRequest) {
             });
             
             return newTerms;
+        });
+
+        await createAuditLog({
+            actorId: session.userId,
+            action: 'TERMS_PUBLISHED',
+            entity: 'TermsAndConditions',
+            entityId: newVersion.id,
+            details: { providerId, version: newVersion.version, contentLength: String(content).length },
+            ...auditRequestContext(req),
         });
 
         return NextResponse.json(newVersion, { status: 201 });

@@ -3,6 +3,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import prisma from '@/lib/prisma';
 import { z } from 'zod';
 import { MiniAppAuthError, requireMiniAppAuthContext, assertBorrowerMatches } from '@/lib/miniapp-auth';
+import { auditRequestContext, createAuditLog } from '@/lib/audit-log';
 
 // GET checks the agreement status for a borrower and a provider
 export async function GET(req: NextRequest) {
@@ -66,6 +67,11 @@ export async function POST(req: NextRequest) {
 
         assertBorrowerMatches(borrowerId, ctx);
 
+        const alreadyAgreed = await prisma.borrowerAgreement.findUnique({
+            where: { borrowerId_termsId: { borrowerId, termsId } },
+            select: { id: true },
+        });
+
         // Use upsert to avoid creating duplicate agreements
         const agreement = await prisma.borrowerAgreement.upsert({
             where: {
@@ -80,6 +86,22 @@ export async function POST(req: NextRequest) {
                 termsId,
             }
         });
+
+        // Consent evidence: who accepted which version, when, and from where.
+        if (!alreadyAgreed) {
+            const terms = await prisma.termsAndConditions.findUnique({
+                where: { id: termsId },
+                select: { providerId: true, version: true },
+            });
+            await createAuditLog({
+                actorId: borrowerId,
+                action: 'TERMS_ACCEPTED',
+                entity: 'BorrowerAgreement',
+                entityId: agreement.id,
+                details: { borrowerId, termsId, providerId: terms?.providerId, version: terms?.version },
+                ...auditRequestContext(req),
+            });
+        }
 
         return NextResponse.json(agreement, { status: 201 });
 

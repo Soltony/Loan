@@ -1,6 +1,7 @@
 
 import { NextRequest, NextResponse } from 'next/server';
 import { createSession, createLegacySession } from '@/lib/session';
+import { auditRequestContext, createAuditLog } from '@/lib/audit-log';
 
 function snippet(text: string, maxLen = 300) {
     const normalized = text.replace(/\s+/g, ' ').trim();
@@ -19,8 +20,15 @@ export async function POST(req: NextRequest) {
         const requestId = `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
         const { superAppToken } = await req.json();
 
-        const ipAddress = req.headers.get('x-forwarded-for') || 'N/A';
-        const userAgent = req.headers.get('user-agent') || 'N/A';
+        const { ipAddress, userAgent } = auditRequestContext(req);
+        const auditFailure = (reason: string, extra?: Record<string, unknown>) =>
+            createAuditLog({
+                actorId: 'anonymous',
+                action: 'BORROWER_CONNECT_FAILED',
+                ipAddress,
+                userAgent,
+                details: { reason, ...extra },
+            });
 
         if (!superAppToken || !superAppToken.startsWith('Bearer ')) {
             return NextResponse.json({ error: "Super App Token is missing or malformed." }, { status: 400 });
@@ -47,6 +55,7 @@ export async function POST(req: NextRequest) {
                 TOKEN_VALIDATION_API_URL,
                 tokenLength: token?.length,
             });
+            await auditFailure('Token validation request failed', { error: message });
 
             return NextResponse.json(
                 { error: `Token validation request failed: ${message}` },
@@ -83,6 +92,7 @@ export async function POST(req: NextRequest) {
                     errorMessage = `${errorMessage} Upstream content-type: ${contentType}`;
                 }
             }
+            await auditFailure('Super app token rejected', { upstreamStatus: externalResponse.status });
 
             return NextResponse.json(
                 {
@@ -106,6 +116,7 @@ export async function POST(req: NextRequest) {
         });
         
         if (!phone) {
+            await auditFailure('Phone number missing from token validation response');
             return NextResponse.json({ error: "Phone number not found in validation response." }, { status: 400 });
         }
         
@@ -121,10 +132,29 @@ export async function POST(req: NextRequest) {
             // No local user exists — create a legacy session cookie so the mini-app
             // can log in using only the super app token (no provisioning required).
             await createLegacySession(phone, token);
+            await createAuditLog({
+                actorId: String(phone),
+                action: 'BORROWER_CONNECT_SUCCESS',
+                entity: 'Borrower',
+                entityId: String(phone),
+                ipAddress,
+                userAgent,
+            });
             return NextResponse.json({ borrowerId: phone, userId: null, legacy: true }, { status: 200 });
         }
 
         await createSession(user.id, token); // Pass DB user id and raw token to session
+        // A super-app token whose phone matches a staff account opens a full user
+        // session with no password, so it gets its own action to stand out.
+        await createAuditLog({
+            actorId: user.id,
+            action: 'USER_LOGIN_VIA_SUPERAPP',
+            entity: 'USER',
+            entityId: user.id,
+            ipAddress,
+            userAgent,
+            details: { phoneNumber: phone },
+        });
 
         return NextResponse.json({ borrowerId: phone, userId: user.id }, { status: 200 });
 

@@ -71,10 +71,10 @@ export async function createSmsTemplate(data: {
 
   await createAuditLog({
     actorId: user.id,
-    action: "CREATE",
+    action: "SMS_TEMPLATE_CREATED",
     entity: "SmsTemplate",
     entityId: template.id,
-    details: JSON.stringify({ name: data.name }),
+    details: { name: data.name, description: data.description ?? null, content: data.content },
   });
 
   return template;
@@ -92,17 +92,26 @@ export async function updateSmsTemplate(
   const user = await getUserFromSession();
   if (!user) throw new Error("Unauthorized");
 
+  const previous = await prisma.smsTemplate.findUnique({
+    where: { id },
+    select: { name: true, content: true, description: true, isActive: true },
+  });
   const template = await prisma.smsTemplate.update({
     where: { id },
     data,
   });
 
+  // Only the fields this update touched, as before → after.
+  const changes: Record<string, { from: unknown; to: unknown }> = {};
+  for (const key of Object.keys(data) as (keyof typeof data)[]) {
+    if (previous?.[key] !== template[key]) changes[key] = { from: previous?.[key] ?? null, to: template[key] ?? null };
+  }
   await createAuditLog({
     actorId: user.id,
-    action: "UPDATE",
+    action: "SMS_TEMPLATE_UPDATED",
     entity: "SmsTemplate",
     entityId: template.id,
-    details: JSON.stringify(data),
+    details: { name: template.name, changes },
   });
 
   return template;
@@ -112,13 +121,14 @@ export async function deleteSmsTemplate(id: string) {
   const user = await getUserFromSession();
   if (!user) throw new Error("Unauthorized");
 
-  await prisma.smsTemplate.delete({ where: { id } });
+  const deleted = await prisma.smsTemplate.delete({ where: { id } });
 
   await createAuditLog({
     actorId: user.id,
-    action: "DELETE",
+    action: "SMS_TEMPLATE_DELETED",
     entity: "SmsTemplate",
     entityId: id,
+    details: { name: deleted.name, content: deleted.content },
   });
 
   return { success: true };
@@ -413,10 +423,10 @@ export async function resendFailedSms(smsLogId: string) {
 
       await createAuditLog({
         actorId: user.id,
-        action: "RESEND",
+        action: "SMS_RESENT",
         entity: "SmsLog",
         entityId: newSmsLog.id,
-        details: JSON.stringify({ originalSmsId: smsLogId }),
+        details: { originalSmsId: smsLogId, recipientPhone: newSmsLog.recipientPhone },
       });
 
       return { success: true, smsLogId: newSmsLog.id };
@@ -487,13 +497,17 @@ export async function createSmsCampaign(data: {
 
   await createAuditLog({
     actorId: user.id,
-    action: "CREATE",
+    action: "SMS_CAMPAIGN_CREATED",
     entity: "SmsCampaign",
     entityId: campaign.id,
-    details: JSON.stringify({
+    details: {
       name: data.name,
       scheduleType: data.scheduleType,
-    }),
+      scheduledAt: data.scheduledAt ?? null,
+      templateId: data.templateId ?? null,
+      customMessage: data.customMessage ?? null,
+      targetCriteria: data.targetCriteria,
+    },
   });
 
   // If immediate, start processing
@@ -786,9 +800,10 @@ export async function cancelCampaign(campaignId: string) {
 
   await createAuditLog({
     actorId: user.id,
-    action: "CANCEL",
+    action: "SMS_CAMPAIGN_CANCELLED",
     entity: "SmsCampaign",
     entityId: campaignId,
+    details: { name: campaign.name, previousStatus: campaign.status },
   });
 
   return { success: true };
@@ -809,16 +824,25 @@ export async function deleteCampaign(campaignId: string) {
   }
 
   // Delete associated SMS logs first
-  await prisma.smsLog.deleteMany({ where: { campaignId } });
+  const deletedLogs = await prisma.smsLog.deleteMany({ where: { campaignId } });
 
   // Delete the campaign
   await prisma.smsCampaign.delete({ where: { id: campaignId } });
 
+  // The campaign's send records are deleted with it, so keep its totals here.
   await createAuditLog({
     actorId: user.id,
-    action: "DELETE",
+    action: "SMS_CAMPAIGN_DELETED",
     entity: "SmsCampaign",
     entityId: campaignId,
+    details: {
+      name: campaign.name,
+      status: campaign.status,
+      totalRecipients: campaign.totalRecipients,
+      sentCount: campaign.sentCount,
+      failedCount: campaign.failedCount,
+      deletedSmsLogs: deletedLogs.count,
+    },
   });
 
   return { success: true };

@@ -7,6 +7,7 @@ import {
   processCampaign,
   deleteCampaign,
 } from "@/actions/sms";
+import { auditRequestContext, createAuditLog } from "@/lib/audit-log";
 
 export async function GET(
   request: NextRequest,
@@ -57,6 +58,13 @@ export async function POST(
     }
 
     if (action === "process") {
+      await createAuditLog({
+        actorId: user.id,
+        action: "SMS_CAMPAIGN_STARTED",
+        entity: "SmsCampaign",
+        entityId: id,
+        ...auditRequestContext(request),
+      });
       // Fire and forget
       processCampaign(id).catch(console.error);
       return NextResponse.json({

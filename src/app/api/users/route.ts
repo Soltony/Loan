@@ -280,7 +280,11 @@ export async function PUT(req: NextRequest) {
 
     const existingUser = await prisma.user.findUnique({
       where: { id },
-      select: { roleId: true, status: true },
+      select: {
+        roleId: true, status: true, fullName: true, email: true, phoneNumber: true,
+        loanProviderId: true, branchCode: true, managedBranchCodes: true,
+        role: { select: { name: true } },
+      },
     });
     if (!existingUser) {
       return NextResponse.json({ error: 'User not found.' }, { status: 404 });
@@ -366,15 +370,38 @@ export async function PUT(req: NextRequest) {
     // - role changes => revoke sessions (permissions may change)
     // - account deactivation => revoke sessions
     // - password reset / forced password change => revoke sessions
-    if (roleChanged || statusChanged || passwordWasReset || dataToUpdate.passwordChangeRequired === true) {
+    const sessionsRevoked = roleChanged || statusChanged || passwordWasReset || dataToUpdate.passwordChangeRequired === true;
+    if (sessionsRevoked) {
       try {
         await revokeAllUserSessions(id);
       } catch (e) {
         console.error('Failed to revoke user sessions after privilege change:', e);
       }
     }
-    
-    const successLogDetails = { updatedUserId: id, updatedFields: Object.keys(dataToUpdate) };
+
+    // Before → after for every field that changed (the password hash never goes in).
+    const before: Record<string, unknown> = {
+      role: existingUser.role?.name, status: existingUser.status, fullName: existingUser.fullName,
+      email: existingUser.email, phoneNumber: existingUser.phoneNumber, loanProviderId: existingUser.loanProviderId,
+      branchCode: existingUser.branchCode, managedBranchCodes: existingUser.managedBranchCodes,
+    };
+    const after: Record<string, unknown> = {
+      role: roleName ?? existingUser.role?.name, status: updatedUser.status, fullName: updatedUser.fullName,
+      email: updatedUser.email, phoneNumber: updatedUser.phoneNumber, loanProviderId: updatedUser.loanProviderId,
+      branchCode: updatedUser.branchCode, managedBranchCodes: updatedUser.managedBranchCodes,
+    };
+    const changes: Record<string, { from: unknown; to: unknown }> = {};
+    for (const key of Object.keys(before)) {
+      if ((before[key] ?? null) !== (after[key] ?? null)) changes[key] = { from: before[key] ?? null, to: after[key] ?? null };
+    }
+
+    const successLogDetails = {
+      updatedUserId: id,
+      updatedFields: Object.keys(dataToUpdate).filter((k) => k !== 'password'),
+      changes,
+      passwordReset: passwordWasReset,
+      sessionsRevoked,
+    };
     await createAuditLog({ actorId: user.id, action: 'USER_UPDATE_SUCCESS', entity: 'USER', entityId: id, details: successLogDetails, ipAddress, userAgent });
 
     // Never return password hashes (or other auth secrets) in API responses.

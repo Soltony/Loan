@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { MiniAppAuthError, requireMiniAppAuthContext } from '@/lib/miniapp-auth';
 import { readTinForBorrower, writeTinForBorrower } from '@/lib/borrower-tin';
+import { auditRequestContext, createAuditLog } from '@/lib/audit-log';
 
 /**
  * GET /api/borrower-tin
@@ -38,7 +39,18 @@ export async function POST(req: Request) {
     const providerId =
       body?.providerId && String(body.providerId).trim() !== '' ? String(body.providerId) : null;
 
+    const previousTin = await readTinForBorrower(ctx.borrowerId).catch(() => null);
     const { tin } = await writeTinForBorrower(ctx.borrowerId, String(rawTin), providerId);
+    if (previousTin !== tin) {
+      await createAuditLog({
+        actorId: ctx.borrowerId,
+        action: 'BORROWER_TIN_UPDATED',
+        entity: 'Borrower',
+        entityId: ctx.borrowerId,
+        details: { providerId, previousTin, tin },
+        ...auditRequestContext(req),
+      });
+    }
     return NextResponse.json({ ok: true, tin });
   } catch (err: any) {
     if (err instanceof MiniAppAuthError) {

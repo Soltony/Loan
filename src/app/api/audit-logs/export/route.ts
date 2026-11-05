@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import prisma from '@/lib/prisma';
 import { getUserFromSession } from '@/lib/user';
+import { auditRequestContext, createAuditLog } from '@/lib/audit-log';
 
 const MAX_DAYS = 31;
 const MAX_ROWS = 50000;
@@ -105,12 +106,26 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: `Too many rows. Narrow date range (max ${MAX_ROWS} rows).` }, { status: 400 });
   }
 
+  // Borrower-side entries use phone numbers as actors, so a month can hold thousands
+  // of distinct actors; chunk to stay under SQL Server's 2100-parameter limit.
   const actorIds = Array.from(new Set(logs.map((l) => l.actorId).filter(Boolean)));
-  const actors = await prisma.user.findMany({
-    where: { id: { in: actorIds } },
-    select: { id: true, fullName: true, email: true },
-  });
+  const actors: { id: string; fullName: string; email: string }[] = [];
+  for (let i = 0; i < actorIds.length; i += 1000) {
+    actors.push(...await prisma.user.findMany({
+      where: { id: { in: actorIds.slice(i, i + 1000) } },
+      select: { id: true, fullName: true, email: true },
+    }));
+  }
   const actorById = new Map(actors.map((a) => [a.id, a] as const));
+
+  // Exporting the trail is itself an auditable action.
+  await createAuditLog({
+    actorId: user.id,
+    action: 'AUDIT_LOG_EXPORTED',
+    entity: 'AuditLog',
+    details: { from: fromStr, to: toStr, tz, format, rowCount: logs.length, includesDetails: privileged },
+    ...auditRequestContext(req),
+  });
 
   const exported = logs.map((log) => {
     const base: any = {

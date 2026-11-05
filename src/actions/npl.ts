@@ -10,8 +10,9 @@ import prisma from '@/lib/prisma';
 import { subDays } from 'date-fns';
 import sendSms from '@/lib/sms';
 import { getUserFromSession } from '@/lib/user';
+import { createAuditLog, createAuditLogs } from '@/lib/audit-log';
 
-async function updateNplStatusInternal(): Promise<{ success: boolean; message: string; updatedCount: number }> {
+async function updateNplStatusInternal(actorId = 'system'): Promise<{ success: boolean; message: string; updatedCount: number }> {
     // NPL status update started (log removed to reduce console noise)
     
     // Get all providers and their NPL thresholds
@@ -63,10 +64,10 @@ async function updateNplStatusInternal(): Promise<{ success: boolean; message: s
             // Find borrowers to flag (exclude those already NPL). Chunk the id
             // list to stay under SQL Server's ~2100 query-parameter limit.
             const CHUNK_SIZE = 1000;
-            const borrowersToFlag: { id: string }[] = [];
+            const borrowersToFlag: { id: string; status: string }[] = [];
             for (let i = 0; i < borrowerIdsToFlag.length; i += CHUNK_SIZE) {
                 const chunk = borrowerIdsToFlag.slice(i, i + CHUNK_SIZE);
-                const found = await prisma.borrower.findMany({ where: { id: { in: chunk }, status: { not: 'NPL' } }, select: { id: true } });
+                const found = await prisma.borrower.findMany({ where: { id: { in: chunk }, status: { not: 'NPL' } }, select: { id: true, status: true } });
                 borrowersToFlag.push(...found);
             }
             if (borrowersToFlag.length === 0) continue;
@@ -77,6 +78,15 @@ async function updateNplStatusInternal(): Promise<{ success: boolean; message: s
                 const { count } = await prisma.borrower.updateMany({ where: { id: { in: chunk } }, data: { status: 'NPL' } });
                 totalUpdatedCount += count;
             }
+
+            // One entry per borrower, so a borrower's history shows when and why they became NPL.
+            await createAuditLogs(borrowersToFlag.map((b) => ({
+                actorId,
+                action: 'BORROWER_FLAGGED_NPL',
+                entity: 'Borrower',
+                entityId: b.id,
+                details: { providerId: provider.id, nplThresholdDays: provider.nplThresholdDays, from: b.status, to: 'NPL' },
+            })));
 
             // Send SMS notification to each borrower updated
             for (const b of borrowersToFlag) {
@@ -99,6 +109,12 @@ async function updateNplStatusInternal(): Promise<{ success: boolean; message: s
     }
 
     // NPL status update finished (log removed to reduce console noise)
+    await createAuditLog({
+        actorId,
+        action: 'NPL_STATUS_RUN_FINISHED',
+        entity: 'Borrower',
+        details: { flaggedCount: totalUpdatedCount, providerCount: providers.length },
+    });
     return { success: true, message: `Successfully updated a total of ${totalUpdatedCount} borrowers to NPL status.`, updatedCount: totalUpdatedCount };
 }
 
@@ -117,5 +133,5 @@ export async function updateNplStatus(): Promise<{ success: boolean; message: st
         return { success: false, message: 'Not authorized', updatedCount: 0 };
     }
 
-    return updateNplStatusInternal();
+    return updateNplStatusInternal(user.id);
 }

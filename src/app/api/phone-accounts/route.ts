@@ -2,16 +2,28 @@ import { NextResponse } from 'next/server';
 import prisma from '../../../lib/prisma';
 import { MiniAppAuthError, requireMiniAppAuthContext } from '@/lib/miniapp-auth';
 import { accountBelongsToPhone } from '@/lib/bank-accounts';
+import { auditRequestContext, createAuditLog } from '@/lib/audit-log';
+
+type RequestContext = ReturnType<typeof auditRequestContext>;
 
 /**
  * Only accounts the bank lists under the borrower's phone number may be linked or made active:
  * scoring reads the active account's customer info and statement, and loans are paid into it.
  * Returns the refusal to send, or null when the account is theirs.
  */
-async function refuseUnlessOwnAccount(phoneNumber: string, accountNumber: string) {
+async function refuseUnlessOwnAccount(phoneNumber: string, accountNumber: string, context: RequestContext) {
   const ownership = await accountBelongsToPhone(phoneNumber, accountNumber);
   if (ownership === 'yes') return null;
   if (ownership === 'no') {
+    // Someone tried to receive loans into an account that is not theirs.
+    await createAuditLog({
+      actorId: phoneNumber,
+      action: 'BORROWER_ACCOUNT_LINK_REFUSED',
+      entity: 'Borrower',
+      entityId: phoneNumber,
+      details: { accountNumber, reason: 'Account is not registered to this phone number' },
+      ...context,
+    });
     return NextResponse.json({ error: 'This account is not registered to your phone number.' }, { status: 403 });
   }
   return NextResponse.json(
@@ -64,11 +76,14 @@ export async function POST(req: Request) {
     }
 
     const accNum = String(accountNumber).trim();
-    const refusal = await refuseUnlessOwnAccount(String(phoneNumber), accNum);
+    const context = auditRequestContext(req);
+    const refusal = await refuseUnlessOwnAccount(String(phoneNumber), accNum, context);
     if (refusal) return refusal;
 
     // If setting active, deactivate others for this phone first
-    return await prisma.$transaction(async (tx) => {
+    const { upserted, previousActive, wasLinked } = await prisma.$transaction(async (tx) => {
+      const previousActive = await tx.phoneAccount.findFirst({ where: { phoneNumber, isActive: true }, select: { accountNumber: true } });
+      const wasLinked = (await tx.phoneAccount.count({ where: { phoneNumber, accountNumber: accNum } })) > 0;
       if (isActive) {
         console.info(`[phone-accounts][POST] deactivating other accounts for ${phoneNumber}`);
         await tx.phoneAccount.updateMany({ where: { phoneNumber }, data: { isActive: false } });
@@ -82,8 +97,21 @@ export async function POST(req: Request) {
 
       console.info('[phone-accounts][POST] upserted=', upserted);
 
-      return NextResponse.json(upserted);
+      return { upserted, previousActive: previousActive?.accountNumber ?? null, wasLinked };
     });
+
+    if (!wasLinked || (upserted.isActive && previousActive !== accNum)) {
+      await createAuditLog({
+        actorId: String(phoneNumber),
+        action: !wasLinked ? 'BORROWER_ACCOUNT_LINKED' : 'BORROWER_ACTIVE_ACCOUNT_CHANGED',
+        entity: 'Borrower',
+        entityId: String(phoneNumber),
+        details: { accountNumber: accNum, isActive: upserted.isActive, previousActiveAccount: previousActive },
+        ...context,
+      });
+    }
+
+    return NextResponse.json(upserted);
   } catch (err: any) {
     if (err instanceof MiniAppAuthError) {
       return NextResponse.json({ error: err.message }, { status: err.status });
@@ -108,11 +136,13 @@ export async function PATCH(req: Request) {
     }
 
     const accNum = String(accountNumber).trim();
+    const context = auditRequestContext(req);
     // Links made before ownership was checked are checked when they are made active.
-    const refusal = await refuseUnlessOwnAccount(String(phoneNumber), accNum);
+    const refusal = await refuseUnlessOwnAccount(String(phoneNumber), accNum, context);
     if (refusal) return refusal;
 
-    const result = await prisma.$transaction(async (tx) => {
+    const { updated: result, previousActive } = await prisma.$transaction(async (tx) => {
+      const previousActive = await tx.phoneAccount.findFirst({ where: { phoneNumber, isActive: true }, select: { accountNumber: true } });
       console.info(`[phone-accounts][PATCH] deactivating others for ${phoneNumber}`);
       await tx.phoneAccount.updateMany({ where: { phoneNumber }, data: { isActive: false } });
       const updated = await tx.phoneAccount.update({
@@ -120,8 +150,19 @@ export async function PATCH(req: Request) {
         data: { isActive: true },
       });
       console.info('[phone-accounts][PATCH] updated=', updated);
-      return updated;
+      return { updated, previousActive: previousActive?.accountNumber ?? null };
     });
+
+    if (previousActive !== accNum) {
+      await createAuditLog({
+        actorId: String(phoneNumber),
+        action: 'BORROWER_ACTIVE_ACCOUNT_CHANGED',
+        entity: 'Borrower',
+        entityId: String(phoneNumber),
+        details: { accountNumber: accNum, previousActiveAccount: previousActive },
+        ...context,
+      });
+    }
 
     return NextResponse.json(result);
   } catch (err: any) {

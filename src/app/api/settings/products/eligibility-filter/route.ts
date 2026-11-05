@@ -2,6 +2,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import prisma from '@/lib/prisma';
 import { getSession } from '@/lib/session';
+import { auditRequestContext, createAuditLog } from '@/lib/audit-log';
 
 export async function DELETE(req: NextRequest) {
     const session = await getSession();
@@ -25,7 +26,12 @@ export async function DELETE(req: NextRequest) {
             return NextResponse.json({ message: 'No filter to delete.' }, { status: 200 });
         }
 
-        await prisma.$transaction(async (tx) => {
+        const upload = await prisma.dataProvisioningUpload.findUnique({
+            where: { id: product.eligibilityUploadId },
+            select: { fileName: true, rowCount: true, uploadedBy: true, uploadedAt: true },
+        });
+
+        const deletedRows = await prisma.$transaction(async (tx) => {
             // First, nullify the link on the product
             await tx.loanProduct.update({
                 where: { id: productId },
@@ -41,13 +47,31 @@ export async function DELETE(req: NextRequest) {
             // unique constraint that includes uploadId, setting uploadId to NULL
             // can produce duplicate rows (two rows with same borrowerId+configId+NULL)
             // which causes a unique-constraint failure. So delete the rows explicitly.
-            await tx.provisionedData.deleteMany({ where: { uploadId: product.eligibilityUploadId! } });
+            const deletedRows = await tx.provisionedData.deleteMany({ where: { uploadId: product.eligibilityUploadId! } });
 
             // Then, delete the now-orphaned upload record (use deleteMany to avoid P2025 if already removed)
             const deletedUploads = await tx.dataProvisioningUpload.deleteMany({ where: { id: product.eligibilityUploadId! } });
             if (deletedUploads.count === 0) {
                 console.warn(`Eligibility upload ${product.eligibilityUploadId} for product ${productId} was not found (may have been already deleted).`);
             }
+            return deletedRows.count;
+        });
+
+        await createAuditLog({
+            actorId: session.userId,
+            action: 'ELIGIBILITY_LIST_DELETED',
+            entity: 'LoanProduct',
+            entityId: productId,
+            details: {
+                productName: product.name,
+                uploadId: product.eligibilityUploadId,
+                fileName: upload?.fileName ?? null,
+                uploadedBy: upload?.uploadedBy ?? null,
+                uploadedAt: upload?.uploadedAt ?? null,
+                deletedRows,
+                previousFilter: product.eligibilityFilter ?? null,
+            },
+            ...auditRequestContext(req),
         });
 
         return NextResponse.json({ message: 'Eligibility filter and list deleted successfully.' });
