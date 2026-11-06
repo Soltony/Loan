@@ -19,7 +19,7 @@ export function ConnectProblem({
     onRetry?: () => void;
 }) {
     return (
-        <MiniAppShell>
+        <MiniAppShell watchRepayments={false}>
             <div className="flex flex-col items-center px-2 pt-20 text-center">
                 <span className="grid h-16 w-16 place-items-center rounded-full bg-amber-50 text-amber-600">
                     <AlertTriangle className="h-8 w-8" aria-hidden />
@@ -109,7 +109,7 @@ export function ConnectClient({ superAppToken }: { superAppToken: string }) {
     }
 
     return (
-        <MiniAppShell>
+        <MiniAppShell watchRepayments={false}>
             <div className="flex flex-col items-center pt-32 text-center" role="status" aria-live="polite">
                 <Loader2 className="h-10 w-10 animate-spin text-brand-ink" aria-hidden />
                 <h1 className="mt-4 text-lg font-semibold">Opening Loans…</h1>

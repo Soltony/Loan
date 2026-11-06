@@ -8,6 +8,7 @@ import Link from 'next/link';
 import { ArrowLeft } from 'lucide-react';
 import { brandCssVars } from '@/lib/miniapp/brand';
 import { cn } from '@/lib/utils';
+import { RepaymentWatcher } from './repayment-watcher';
 
 /**
  * Puts the brand colours on :root, so sheets and toasts (which portal out of the page)
@@ -36,6 +37,11 @@ export interface MiniAppShellProps {
   /** Sticky bottom bar, e.g. the screen's main button. */
   footer?: React.ReactNode;
   mainClassName?: string;
+  /**
+   * false: do not raise the repayment status screen here. For screens with no borrower
+   * session (connect), where a resumed wait could only poll into a 401.
+   */
+  watchRepayments?: boolean;
   children: React.ReactNode;
 }
 
@@ -48,6 +54,7 @@ export function MiniAppShell({
   headerRight,
   footer,
   mainClassName,
+  watchRepayments = true,
   children,
 }: MiniAppShellProps) {
   const hasHeader = title !== undefined || !!onBack || !!backHref || !!headerRight;
@@ -79,6 +86,7 @@ export function MiniAppShell({
           <div className="mx-auto w-full max-w-md px-4 pb-[max(env(safe-area-inset-bottom),12px)] pt-3">{footer}</div>
         </div>
       )}
+      {watchRepayments && <RepaymentWatcher />}
     </div>
   );
 }

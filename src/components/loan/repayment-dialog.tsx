@@ -5,8 +5,8 @@ import type { LoanDetails, Tax } from '@/lib/types';
 import { ChevronDown, Delete, Loader2 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { calculateInstallmentDueBreakdown, calculateTotalRepayableDetailed } from '@/lib/loan-calculator';
-import { useToast } from '@/hooks/use-toast';
 import { BottomSheet } from '@/components/miniapp/bottom-sheet';
+import { abortPendingRepayment, nextPaint, startPendingRepayment } from '@/lib/miniapp/pending-repayment';
 import { DetailRow } from '@/components/miniapp/ui';
 import { brandCssVars } from '@/lib/miniapp/brand';
 import { formatETB, formatMoney } from '@/lib/miniapp/format';
@@ -49,7 +49,6 @@ export function RepaymentDialog({ isOpen, onClose, loan, totalBalanceDue, provid
     const [payError, setPayError] = useState('');
     const [isProcessing, setIsProcessing] = useState(false);
     const [showBreakdown, setShowBreakdown] = useState(false);
-    const { toast } = useToast();
 
     useEffect(() => {
         if (isOpen) {
@@ -113,46 +112,66 @@ export function RepaymentDialog({ isOpen, onClose, loan, totalBalanceDue, provid
             return;
         }
 
+        // Checked before the gateway is asked for anything: without the super app's
+        // channel no one can approve the payment, and asking first would only leave a
+        // PENDING payment behind that never settles.
+        if (typeof window === 'undefined' || typeof window.myJsChannel?.postMessage !== 'function') {
+            console.error('NIB Super App channel (window.myJsChannel) not found.');
+            setPayError("We couldn't open the payment screen. Please reopen Loans from the app and try again.");
+            return;
+        }
+
         setIsProcessing(true);
         setPayError('');
 
+        let started: { paymentToken: string; transactionId: string };
         try {
-            // Step 1: Call our backend to get the payment token
+            // Step 1: our backend registers the payment with the gateway and returns its token.
             const initiateResponse = await fetch('/api/initiate-payment', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ amount: numericAmount, loanId: loan.id }),
             });
 
+            const data = await initiateResponse.json().catch(() => ({}));
             if (!initiateResponse.ok) {
-                const errorData = await initiateResponse.json().catch(() => ({}));
-                throw new Error(errorData.error || 'We could not start the payment. Please try again.');
+                throw new Error(data.error || 'We could not start the payment. Please try again.');
             }
-
-            const { paymentToken } = await initiateResponse.json();
-
-            // Step 2: Post the payment token to the Super App via JS Channel
-            if (typeof window !== 'undefined' && window.myJsChannel?.postMessage) {
-              window.myJsChannel.postMessage(JSON.stringify({ token: paymentToken }));
-
-              toast({
-                  title: 'Complete your payment',
-                  description: 'Confirm the payment in the app to finish repaying.',
-              });
-
-              // NOTE: The actual loan update will happen when the callback is received.
-              // For a better UX, we optimistically close the dialog.
-              onClose();
-
-            } else {
-              console.error("NIB Super App channel (window.myJsChannel) not found.");
-              throw new Error("We couldn't open the payment screen. Please reopen Loans from the app and try again.");
+            if (!data.paymentToken || !data.transactionId) {
+                throw new Error('We could not start the payment. Please try again.');
             }
-
-        } catch (err: any) {
-            setPayError(err.message || 'Something went wrong with the payment. Please try again.');
-        } finally {
+            started = { paymentToken: data.paymentToken, transactionId: data.transactionId };
+        } catch (err) {
+            // Nothing has been charged yet, so the keypad stays open to try again.
+            setPayError((err instanceof Error && err.message) || 'Something went wrong with the payment. Please try again.');
             setIsProcessing(false);
+            return;
+        }
+
+        // Step 2: raise the payment status screen and let it paint *before* the token goes
+        // to the super app, so the borrower comes back from the PIN sheet to the wait (and
+        // then the verdict) instead of to this keypad. The loan is only updated when the
+        // gateway's callback lands; the status screen polls for that.
+        startPendingRepayment({
+            transactionId: started.transactionId,
+            loanId: loan.id,
+            amount: numericAmount,
+            productName: loan.productName ?? 'Loan',
+            providerName: loan.providerName ?? null,
+            providerColor: providerColor ?? null,
+        });
+        onClose();
+        setIsProcessing(false);
+        await nextPaint();
+
+        try {
+            window.myJsChannel!.postMessage(JSON.stringify({ token: started.paymentToken }));
+        } catch (err) {
+            console.error('Super app channel rejected the payment token', err);
+            abortPendingRepayment(
+                started.transactionId,
+                "We couldn't open the payment screen, so nothing was charged. Please reopen Loans from the app and try again.",
+            );
         }
     };
 
