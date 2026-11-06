@@ -132,6 +132,25 @@ export async function statementScoringData(
   return statementFiguresForScoring(figures, customIsCurrent);
 }
 
+/**
+ * Whether stored figures can stay as they are: computed within the refresh interval, with the
+ * statement parameters and the number of months the Scoring Engine has now. Otherwise the next
+ * refresh fetches the statement again.
+ */
+export function figuresAreCurrent(
+  figures: StatementFigures | null,
+  settings: Pick<DataFetchSettings, 'statementRefreshDays' | 'statementMonths'>,
+  version: string,
+  now = Date.now()
+): boolean {
+  return Boolean(
+    figures &&
+      now - Date.parse(figures.computedAt) < settings.statementRefreshDays * DAY_MS &&
+      figures.definitionsVersion === version &&
+      figures.derived?.monthsConsidered?.length === settings.statementMonths
+  );
+}
+
 function ymd(d: Date) {
   return `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`;
 }
@@ -225,13 +244,8 @@ async function refresh(borrowerId: string, accountNumber: string, key: string): 
   const [settings, definitions] = await Promise.all([loadDataFetchSettings(), loadStatementParameters()]);
   const version = definitionsVersion(definitions);
   const current = figuresForAccount(payloads, accountNumber);
-  const currentIsFresh =
-    current &&
-    Date.now() - Date.parse(current.computedAt) < settings.statementRefreshDays * DAY_MS &&
-    current.definitionsVersion === version &&
-    current.derived?.monthsConsidered?.length === settings.statementMonths;
-  if (currentIsFresh) {
-    return { ok: true, outcome: 'fresh', figures: current! };
+  if (current && figuresAreCurrent(current, settings, version)) {
+    return { ok: true, outcome: 'fresh', figures: current };
   }
 
   const failedAt = state.lastFailure.get(key);

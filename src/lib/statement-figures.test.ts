@@ -1,5 +1,11 @@
 import { describe, it, expect, afterEach } from 'vitest';
-import { figuresForAccount, statementFiguresEnabled, statementFiguresForScoring, type StatementFigures } from './statement-figures';
+import {
+  figuresAreCurrent,
+  figuresForAccount,
+  statementFiguresEnabled,
+  statementFiguresForScoring,
+  type StatementFigures,
+} from './statement-figures';
 
 const figures = (accountNumber: string, computedAt: string, extra: Partial<StatementFigures> = {}) =>
   ({ accountNumber, computedAt, avgMonthlyDeposit: 100, derived: { monthsConsidered: [] }, ...extra }) as StatementFigures;
@@ -34,6 +40,29 @@ describe('statementFiguresForScoring and custom values', () => {
     expect(statementFiguresForScoring(withCustom).telebirrTransactions).toBe(2.5);
     expect(statementFiguresForScoring(withCustom, false)).not.toHaveProperty('telebirrTransactions');
     expect(statementFiguresForScoring(withCustom, false).avgMonthlyDeposit).toBe(100);
+  });
+});
+
+describe('figuresAreCurrent', () => {
+  const NOW = Date.parse('2026-11-06T12:00:00.000Z');
+  const settings = { statementRefreshDays: 7, statementMonths: 6 };
+  const six = ['202605', '202606', '202607', '202608', '202609', '202610'];
+  const saved = (computedAt: string) =>
+    ({ ...figures('7000101737506', computedAt), definitionsVersion: 'v1', derived: { monthsConsidered: six } }) as StatementFigures;
+
+  it('keeps figures saved within the refresh interval with the same statement settings', () => {
+    expect(figuresAreCurrent(saved('2026-11-01T12:00:00.000Z'), settings, 'v1', NOW)).toBe(true);
+  });
+
+  it('asks for a new fetch when nothing is saved, or the figures are past the refresh interval', () => {
+    expect(figuresAreCurrent(null, settings, 'v1', NOW)).toBe(false);
+    expect(figuresAreCurrent(saved('2026-10-30T12:00:00.000Z'), settings, 'v1', NOW)).toBe(false);
+    expect(figuresAreCurrent(saved('not a date'), settings, 'v1', NOW)).toBe(false);
+  });
+
+  it('asks for a new fetch when the statement parameters or the number of months changed', () => {
+    expect(figuresAreCurrent(saved('2026-11-05T12:00:00.000Z'), settings, 'v2', NOW)).toBe(false);
+    expect(figuresAreCurrent(saved('2026-11-05T12:00:00.000Z'), { ...settings, statementMonths: 3 }, 'v1', NOW)).toBe(false);
   });
 });
 
