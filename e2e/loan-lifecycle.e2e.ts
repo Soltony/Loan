@@ -531,7 +531,9 @@ function configureEnvironment() {
     TOKEN_VALIDATION_API_URL: `${STUB.superApp}/api/Authenticate/Validate`,
     NIB_PAYMENT_URL: `${STUB.superApp}/api/Authenticate/Payment`,
     NIB_PAYMENT_KEY: PAYMENT_KEY,
-    ACCOUNT_NO: COLLECTION_ACCOUNT,
+    // Only a fallback: repayments go into the provider's Collection Account, which the
+    // checkout assertion expects in place of this one.
+    ACCOUNT_NO: '1000000000000',
     CALLBACK_URL,
     COMPANY_NAME,
     SMS_URL: STUB.sms,
@@ -619,6 +621,7 @@ async function createFixtures() {
       icon: 'Building2',
       colorHex: '#0f766e',
       displayOrder: 999,
+      collectionAccount: COLLECTION_ACCOUNT,
       startingCapital: PROVIDER_FUND,
       initialBalance: PROVIDER_FUND,
       status: 'Active',

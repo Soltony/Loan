@@ -14,7 +14,8 @@ export async function POST(req: NextRequest) {
     // initiate payment request received (log removed to reduce console noise)
 
     // --- Step 1: Environment Validation ---
-    const ACCOUNT_NO = process.env.ACCOUNT_NO;
+    // The account the repayment is paid into is the loan provider's Collection Account
+    // (Step 3); ACCOUNT_NO is only the fallback for a provider that has none set.
     const CALLBACK_URL = process.env.CALLBACK_URL;
     const COMPANY_NAME = process.env.COMPANY_NAME;
     const NIB_PAYMENT_KEY = process.env.NIB_PAYMENT_KEY;
@@ -22,7 +23,7 @@ export async function POST(req: NextRequest) {
 
     // environment variables check (log removed to reduce console noise)
 
-    if (!ACCOUNT_NO || !CALLBACK_URL || !COMPANY_NAME || !NIB_PAYMENT_KEY || !NIB_PAYMENT_URL) {
+    if (!CALLBACK_URL || !COMPANY_NAME || !NIB_PAYMENT_KEY || !NIB_PAYMENT_URL) {
         console.error('❌ Missing payment gateway environment variables.');
         return NextResponse.json(
             { error: 'Payment gateway is not configured on the server.' },
@@ -58,6 +59,7 @@ export async function POST(req: NextRequest) {
                             penaltyRules: true,
                             penaltyRulesEnabled: true,
                             penaltyPerInstallment: true,
+                            provider: { select: { name: true, collectionAccount: true } },
                         },
                     },
                     payments: { select: { amount: true, date: true } },
@@ -69,6 +71,16 @@ export async function POST(req: NextRequest) {
 
         if (!loan) {
             return NextResponse.json({ error: 'Loan not found.' }, { status: 404 });
+        }
+
+        // Repayments go into the collection account of the provider that lent the money.
+        const ACCOUNT_NO = loan.product.provider.collectionAccount?.trim() || process.env.ACCOUNT_NO?.trim();
+        if (!ACCOUNT_NO) {
+            console.error(`❌ Loan provider "${loan.product.provider.name}" has no Collection Account.`);
+            return NextResponse.json(
+                { error: 'Repayments are not set up for this loan provider yet. Please try again later.' },
+                { status: 500 }
+            );
         }
 
         // The gateway debits the customer before our callback runs, and the callback
