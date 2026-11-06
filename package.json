@@ -9,6 +9,7 @@
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "test:e2e": "vitest run --config vitest.e2e.config.ts",
     "run:worker": "tsx -r tsconfig-paths/register src/worker.ts",
     "build:worker": "esbuild src/worker.ts --bundle --platform=node --target=node18 --format=cjs --outfile=dist/worker.cjs --external:@prisma/client --external:.prisma/client",
     "start:worker": "node dist/worker.cjs",
