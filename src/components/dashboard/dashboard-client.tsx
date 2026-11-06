@@ -933,22 +933,6 @@ export function DashboardClient({
             </div>
           </>
         )}
-
-        <Link
-          href={historyHref}
-          className="mt-6 flex items-center gap-3 rounded-2xl border border-gray-200/80 bg-white p-4 text-left hover:bg-gray-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-ink"
-        >
-          <span className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-gray-100 text-gray-600">
-            <History className="h-5 w-5" aria-hidden />
-          </span>
-          <span className="min-w-0 flex-1">
-            <span className="block text-sm font-semibold">Loan history</span>
-            <span className="block text-xs text-gray-500">
-              Past loans and repayments
-            </span>
-          </span>
-          <ChevronRight className="h-5 w-5 text-gray-400" aria-hidden />
-        </Link>
       </MiniAppShell>
 
       {repayingLoanInfo && (

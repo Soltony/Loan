@@ -144,45 +144,36 @@ export function ProductCard({
     const minLoan = product.minLoan ?? 0;
     const termsId = `product-terms-${product.id}`;
 
+    // One compact row: icon, name, amount and term, with Apply on the right.
     return (
-        <Panel className="overflow-hidden p-0">
-            <div className="p-4">
-                <div className="flex items-start gap-3">
-                    <div className="grid h-11 w-11 shrink-0 place-items-center overflow-hidden rounded-xl bg-brand-soft text-brand-ink" aria-hidden>
-                        <IconDisplayComponent iconName={product.icon} className="h-6 w-6 object-contain" />
-                    </div>
-                    <div className="min-w-0 flex-1">
-                        <p className="truncate font-semibold">{product.name}</p>
-                        {isLoadingLimit ? (
-                            <Skeleton className="mt-1.5 h-4 w-36 bg-gray-100" />
-                        ) : canApply ? (
-                            <p className="mt-0.5 text-sm font-medium text-brand-ink">
-                                {minLoan > 0 ? `${money(minLoan)} – ` : 'Up to '}
-                                {money(trueAvailableLimit)} ETB
-                            </p>
-                        ) : (
-                            <p className="mt-0.5 text-sm text-gray-500">Not available right now</p>
-                        )}
-                        {(product.duration ?? 0) > 0 && (
-                            <p className="mt-0.5 text-xs text-gray-500">Repay within {product.duration} days</p>
-                        )}
-                    </div>
+        <Panel className="p-3">
+            <div className="flex items-center gap-3">
+                <div className="grid h-10 w-10 shrink-0 place-items-center overflow-hidden rounded-xl bg-brand-soft text-brand-ink" aria-hidden>
+                    <IconDisplayComponent iconName={product.icon} className="h-6 w-6 object-contain" />
                 </div>
-
-                {!isLoadingLimit && !canApply && (
-                    <Notice icon={<Info />} className="mt-3">
-                        {/* Eligible but nothing left to borrow: the eligibility reason would read
-                            "Congratulations! You are eligible" next to a disabled button. */}
-                        {isEligible
-                            ? 'You have used your available limit. Repay your active loans to borrow again.'
-                            : eligibilityReason || 'This loan is not available for your account right now.'}
-                    </Notice>
-                )}
-
+                <div className="min-w-0 flex-1">
+                    <p className="truncate text-[15px] font-semibold leading-tight">{product.name}</p>
+                    {isLoadingLimit ? (
+                        <Skeleton className="mt-1 h-4 w-32 bg-gray-100" />
+                    ) : (
+                        <p className="mt-0.5 truncate text-[13px] leading-snug">
+                            {canApply ? (
+                                <span className="font-semibold text-brand-ink">
+                                    {minLoan > 0 ? `${money(minLoan)} – ` : 'Up to '}
+                                    {money(trueAvailableLimit)} ETB
+                                </span>
+                            ) : (
+                                <span className="text-gray-500">Not available now</span>
+                            )}
+                            {(product.duration ?? 0) > 0 && (
+                                <span className="text-gray-500"> · {product.duration} days</span>
+                            )}
+                        </p>
+                    )}
+                </div>
                 <BrandButton
-                    block
-                    size="lg"
-                    className="mt-4"
+                    size="sm"
+                    className="h-10 shrink-0 px-5"
                     onClick={onApply}
                     disabled={!canApply || isLoadingLimit}
                     loading={isApplying}
@@ -191,20 +182,30 @@ export function ProductCard({
                 </BrandButton>
             </div>
 
+            {!isLoadingLimit && !canApply && (
+                <Notice icon={<Info />} className="mt-2.5 py-2 text-[13px]">
+                    {/* Eligible but nothing left to borrow: the eligibility reason would read
+                        "Congratulations! You are eligible" next to a disabled button. */}
+                    {isEligible
+                        ? 'You have used your available limit. Repay your active loans to borrow again.'
+                        : eligibilityReason || 'This loan is not available for your account right now.'}
+                </Notice>
+            )}
+
             {hasTerms && (
-                <div className="border-t border-gray-100">
+                <div className="mt-1.5 pl-[52px]">
                     <button
                         type="button"
                         onClick={() => setShowTerms((v) => !v)}
                         aria-expanded={showTerms}
                         aria-controls={termsId}
-                        className="flex w-full items-center justify-between px-4 py-3 text-sm font-medium text-gray-600 hover:bg-gray-50"
+                        className="-ml-1 inline-flex items-center gap-0.5 rounded-md px-1 py-0.5 text-xs font-medium text-gray-500 hover:bg-gray-100 hover:text-gray-700"
                     >
                         Fees and terms
-                        <ChevronDown className={cn('h-4 w-4 transition-transform', showTerms && 'rotate-180')} />
+                        <ChevronDown className={cn('h-3.5 w-3.5 transition-transform', showTerms && 'rotate-180')} aria-hidden />
                     </button>
                     {showTerms && (
-                        <div id={termsId} className="px-4 pb-4">
+                        <div id={termsId} className="pb-1 pt-1">
                             {(product.duration ?? 0) > 0 && <DetailRow label="Loan term" value={`${product.duration} days`} />}
                             {serviceFee && <DetailRow label="Service fee" value={serviceFee} />}
                             {dailyFee && <DetailRow label="Daily fee" value={dailyFee} />}
