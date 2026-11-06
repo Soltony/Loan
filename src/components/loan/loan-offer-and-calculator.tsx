@@ -298,13 +298,20 @@ export function LoanOfferAndCalculator({
 
   return (
     <div>
-      <Panel>
-        <label htmlFor="loanAmount" className="text-sm font-medium text-gray-600">
-          How much do you need?
-        </label>
+      <Panel className="p-3.5">
+        <div className="flex items-baseline justify-between gap-3">
+          <label htmlFor="loanAmount" className="text-sm font-medium text-gray-600">
+            How much do you need?
+          </label>
+          {!cannotBorrow && (
+            <span className="shrink-0 text-xs text-gray-500">
+              {minLoan > 0 ? `${formatMoney(minLoan)} – ${formatMoney(maxLoan)}` : `Up to ${formatMoney(maxLoan)}`}
+            </span>
+          )}
+        </div>
         <div
           className={cn(
-            "mt-2 flex items-baseline gap-2 rounded-2xl border-2 bg-white px-4 py-3 transition-colors focus-within:border-brand-ink",
+            "mt-1.5 flex items-baseline gap-2 rounded-xl border-2 bg-white px-3 py-1.5 transition-colors focus-within:border-brand-ink",
             amountError ? "border-red-500 focus-within:border-red-500" : "border-gray-200",
           )}
         >
@@ -319,19 +326,23 @@ export function LoanOfferAndCalculator({
             aria-invalid={!!amountError}
             aria-describedby="loanAmountHelp"
             placeholder="0"
-            className="w-full min-w-0 bg-transparent text-[32px] font-bold tabular-nums tracking-tight text-gray-900 outline-none placeholder:text-gray-300"
+            className="w-full min-w-0 bg-transparent text-[26px] font-bold tabular-nums tracking-tight text-gray-900 outline-none placeholder:text-gray-300"
           />
-          <span className="text-lg font-semibold text-gray-400">ETB</span>
+          <span className="text-base font-semibold text-gray-400">ETB</span>
         </div>
+        {/* Only problems are spelled out here; the range sits next to the label. */}
         <p
           id="loanAmountHelp"
-          className={cn("mt-2 text-sm", amountError ? "text-red-600" : "text-gray-500")}
+          className={cn(
+            "text-xs",
+            amountError || cannotBorrow ? "mt-1.5 text-red-600" : "sr-only",
+          )}
         >
           {amountError || (cannotBorrow ? "No amount is available to borrow right now." : `You can borrow ${rangeText}.`)}
         </p>
 
         {!cannotBorrow && (
-          <div className="mt-3 flex flex-wrap gap-2">
+          <div className="mt-2 flex flex-wrap gap-1.5">
             {[...quickAmounts, { value: maxLoan, label: "Max" }].map((option) => {
               const selected = Math.abs((numericAmount || 0) - option.value) < 0.005;
               return (
@@ -342,7 +353,7 @@ export function LoanOfferAndCalculator({
                   aria-pressed={selected}
                   disabled={isSubmitting}
                   className={cn(
-                    "h-9 rounded-full border px-3.5 text-sm font-medium tabular-nums transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-ink",
+                    "h-8 rounded-full border px-3 text-[13px] font-medium tabular-nums transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-ink",
                     selected
                       ? "border-transparent bg-brand-soft text-brand-ink"
                       : "border-gray-300 bg-white text-gray-700 hover:bg-gray-50",
@@ -360,57 +371,61 @@ export function LoanOfferAndCalculator({
       {calculationResult && !amountError && (
         <Panel className="mt-3 overflow-hidden p-0">
           <div className="grid grid-cols-2 divide-x divide-gray-100 border-b border-gray-100">
-            <div className="p-4">
+            <div className="px-3.5 py-2.5">
               <p className="text-xs font-medium text-gray-500">You&apos;ll receive</p>
-              <Amount value={formatMoney(calculationResult.netReceivedAmount)} className="mt-1 block text-xl" />
-              <p className="mt-0.5 text-xs text-gray-500">today</p>
+              <Amount value={formatMoney(calculationResult.netReceivedAmount)} className="block text-lg" />
             </div>
-            <div className="p-4">
-              <p className="text-xs font-medium text-gray-500">You&apos;ll repay</p>
-              <Amount value={formatMoney(calculationResult.total)} className="mt-1 block text-xl text-brand-ink" />
-              <p className="mt-0.5 text-xs text-gray-500">by {formatDate(calculationResult.dueDate)}</p>
+            <div className="px-3.5 py-2.5">
+              <p className="text-xs font-medium text-gray-500">
+                You&apos;ll repay by {formatDate(calculationResult.dueDate)}
+              </p>
+              <Amount value={formatMoney(calculationResult.total)} className="block text-lg text-brand-ink" />
             </div>
           </div>
 
-          <div className="px-4 py-3">
-            <DetailRow label="Loan amount" value={formatMoney(calculationResult.principal)} />
+          {/* Rates go in the labels: one line per row. */}
+          <div className="px-3.5 py-1.5">
+            <DetailRow className="py-1" label="Loan amount" value={formatMoney(calculationResult.principal)} />
             {calculationResult.inclusiveTaxAmount > 0 && (
               <DetailRow
+                className="py-1"
                 label={
                   inclusiveTaxes.length === 1
                     ? `${inclusiveTaxes[0].name || "Tax"} (${inclusiveTaxes[0].rate}%)`
                     : `Taxes (${inclusiveTaxes.reduce((s, t) => s + t.rate, 0)}%)`
                 }
-                hint="Deducted when the loan is paid out"
                 value={`− ${formatMoney(calculationResult.inclusiveTaxAmount)}`}
               />
             )}
             {calculationResult.coreDeductedTaxAmount > 0 && (
               <DetailRow
+                className="py-1"
                 label={`Tax deducted (${CORE_DEDUCTED_TAX_RATE}%)`}
-                hint="Deducted by the bank when the loan is paid out"
                 value={`− ${formatMoney(calculationResult.coreDeductedTaxAmount)}`}
               />
             )}
-            <div className="my-1.5 border-t border-dashed border-gray-200" />
             {calculationResult.serviceFee > 0 && (
-              <DetailRow label="Service fee" hint={serviceFee ?? undefined} value={`+ ${formatMoney(calculationResult.serviceFee)}`} />
+              <DetailRow
+                className="py-1"
+                label={serviceFee ? `Service fee (${serviceFee})` : "Service fee"}
+                value={`+ ${formatMoney(calculationResult.serviceFee)}`}
+              />
             )}
             {calculationResult.interest > 0 && (
               <DetailRow
-                label="Daily fee"
-                hint={dailyFee ? `${dailyFee} for ${duration} days` : undefined}
+                className="py-1"
+                label={dailyFee ? `Daily fee (${dailyFee.replace(" per day", "/day")}, ${duration} days)` : "Daily fee"}
                 value={`+ ${formatMoney(calculationResult.interest)}`}
               />
             )}
             {calculationResult.tax > 0 && (
-              <DetailRow label="Tax on fees" value={`+ ${formatMoney(calculationResult.tax)}`} />
+              <DetailRow className="py-1" label="Tax on fees" value={`+ ${formatMoney(calculationResult.tax)}`} />
             )}
-            <DetailRow label="Total to repay" value={formatETB(calculationResult.total)} strong />
             <DetailRow
-              label="Due date"
-              value={formatDate(calculationResult.dueDate)}
-              hint={duration > 0 ? `${duration} days from today` : "End of today"}
+              label="Total to repay"
+              value={formatETB(calculationResult.total)}
+              strong
+              className="mt-0.5 border-t border-dashed border-gray-200 pt-1.5"
             />
           </div>
 
@@ -421,7 +436,7 @@ export function LoanOfferAndCalculator({
                 onClick={() => setIsPenaltyDetailsOpen((v) => !v)}
                 aria-expanded={isPenaltyDetailsOpen}
                 aria-controls="late-payment-rules"
-                className="flex w-full items-center justify-between px-4 py-3 text-sm font-medium text-gray-700 hover:bg-gray-50"
+                className="flex w-full items-center justify-between px-3.5 py-2.5 text-[13px] font-medium text-gray-700 hover:bg-gray-50"
               >
                 <span className="flex items-center gap-2">
                   <Info className="h-4 w-4 text-amber-600" aria-hidden />
@@ -433,7 +448,7 @@ export function LoanOfferAndCalculator({
                 />
               </button>
               {isPenaltyDetailsOpen && (
-                <ul id="late-payment-rules" className="space-y-1.5 px-4 pb-4 text-sm text-gray-600">
+                <ul id="late-payment-rules" className="space-y-1.5 px-3.5 pb-3 text-[13px] text-gray-600">
                   {penalties.map((rule) => (
                     <li key={rule.id} className="flex gap-2">
                       <span aria-hidden className="mt-2 h-1 w-1 shrink-0 rounded-full bg-gray-400" />
