@@ -124,7 +124,7 @@ const callsTo = (path: string) => calls.filter((c) => c.url.pathname.endsWith(pa
 
 const bank = {
   accountsByPhone: new Map<string, string[]>(),
-  disbursementAnswer: 'success' as 'success' | 'http-500' | 'http-200-error',
+  disbursementAnswer: 'success' as 'success' | 'http-500' | 'http-200-error' | 'network-error',
   nextFt: 1,
 };
 /** Super-app tokens the validation endpoint accepts, and the phone each belongs to. */
@@ -211,6 +211,10 @@ async function fakeFetch(input: string | URL | Request, init: RequestInit = {}):
 }
 
 function disbursementAnswer(body: any) {
+  if (bank.disbursementAnswer === 'network-error') {
+    // The connection drops after the request went out: whether the bank paid is unknown.
+    throw new TypeError('fetch failed');
+  }
   if (bank.disbursementAnswer === 'http-500') {
     return json({ status: 'Error', status_code: 500, message: 'Core banking unavailable' }, 500);
   }
@@ -1321,6 +1325,147 @@ describe('known gaps (expected to fail until fixed)', () => {
     return async () => {
       expect(res.status).toBeGreaterThanOrEqual(400);
       expect((await prisma.loan.findUniqueOrThrow({ where: { id: loanId } })).repaidAmount).toBe(0);
+    };
+  });
+
+  /** Runs `fn` as someone with no borrower session: only a superAppToken cookie of their own making, which the proxy lets through. */
+  async function asStranger<T>(fn: () => Promise<T>): Promise<T> {
+    const saved = new Map(H.cookies);
+    H.cookies.clear();
+    H.cookies.set('superAppToken', 'made-up-by-anyone');
+    try {
+      return await fn();
+    } finally {
+      H.cookies.clear();
+      for (const [name, value] of saved) H.cookies.set(name, value);
+    }
+  }
+
+  knownGap('library modules are not browser-callable server actions', async () => {
+    // Every export of a 'use server' module that a page imports becomes a public HTTP endpoint.
+    // Checked 2026-11-06 on the dev server with only a made-up cookie: session.ts's
+    // createLegacySession minted a session for another borrower's phone (their 23 loans were then
+    // readable), encryptJwt signed an arbitrary payload, and account-utils' getActiveAccountNumber
+    // returned another borrower's account number. createSession(userId) logs in as any staff user.
+    // A function-level directive counts too (audit-log.ts's createAuditLog would let anyone write audit rows).
+    const { readdirSync, readFileSync, statSync } = await import('node:fs');
+    const { join, relative } = await import('node:path');
+    const directive = /^\s*['"]use server['"];?\s*$/m;
+    const offenders: string[] = [];
+    const walk = (dir: string) => {
+      for (const name of readdirSync(dir)) {
+        const file = join(dir, name);
+        if (statSync(file).isDirectory()) walk(file);
+        else if (/\.tsx?$/.test(name) && directive.test(readFileSync(file, 'utf8'))) {
+          offenders.push(relative(PROJECT_ROOT, file).replace(/\\/g, '/'));
+        }
+      }
+    };
+    walk(join(PROJECT_ROOT, 'src', 'lib'));
+    return async () => {
+      expect(offenders).toEqual([]);
+    };
+  });
+
+  knownGap('the eligibility server action answers only for the signed-in borrower', async () => {
+    // src/actions/eligibility.ts is 'use server' and imported by dashboard-client.tsx, so
+    // checkLoanEligibility(phone, provider, product) is a public endpoint. Checked on the dev server
+    // with only a made-up cookie: it returned another borrower's salary-advance limit (half their
+    // salary). It also reveals NPL and overdue status for any phone number.
+    let answer: unknown;
+    let refusal: unknown;
+    await asStranger(async () => {
+      try {
+        answer = await checkLoanEligibility(PHONE, fx.providerId, fx.scoredId);
+      } catch (e) {
+        refusal = e;
+      }
+    });
+    return async () => {
+      if (refusal) return; // refused: safe
+      expect(answer).toMatchObject({ isEligible: false, maxLoanAmount: 0, score: 0 });
+      expect(String((answer as any).reason)).not.toMatch(/loan|restricted|salary/i);
+    };
+  });
+
+  knownGap("starting a repayment needs the loan's borrower to be signed in", async () => {
+    // /api/initiate-payment only wants a superAppToken from getSession(), which accepts a plain,
+    // unsigned superAppToken cookie. It records a PENDING payment for any loan id and its error
+    // message tells the caller the loan's outstanding balance.
+    const loanId = await openLoan(1_000);
+    const res = await asStranger(() => initiatePayment(loanId, 100));
+    const pendingRows = await prisma.pendingPayment.count({ where: { loanId } });
+    return async () => {
+      expect(res.status).toBeGreaterThanOrEqual(400);
+      expect(pendingRows).toBe(0);
+    };
+  });
+
+  knownGap('two callbacks for different payments of one loan arriving together are both credited', async () => {
+    // The callback reads loan.repaidAmount before its transaction and writes "that + this payment",
+    // so the later commit overwrites the earlier one. CBS NPL collections post to the same loans.
+    const loanId = await openLoan(1_000);
+    const first = await initiatePayment(loanId, 300);
+    const second = await initiatePayment(loanId, 400);
+    expect([first.status, second.status]).toEqual([200, 200]);
+    await Promise.all([paymentCallback(first.body.transactionId, 300), paymentCallback(second.body.transactionId, 400)]);
+    return async () => {
+      const loan = await prisma.loan.findUniqueOrThrow({ where: { id: loanId }, include: { payments: true } });
+      expect(loan.payments.map((p) => p.amount).sort((a, b) => a - b)).toEqual([300, 400]);
+      expect(loan.repaidAmount).toBe(700);
+    };
+  });
+
+  knownGap('a second payment of the full balance is refused while the first is still in flight', async () => {
+    // In the local copy of production, 41 FAILED payments (146,467 Birr) sit on loans that are
+    // Paid, 21 of them started within 2 minutes of a completed one: the customer paid twice, the
+    // gateway took both, the callback refused the second, and nothing refunds it.
+    const loanId = await openLoan(1_000);
+    const probe = await initiatePayment(loanId, 1_000_000);
+    const balance = Number(String(probe.body.error).match(/balance of ([\d.]+)/)?.[1]);
+    expect(balance).toBeGreaterThan(1_000);
+    const first = await initiatePayment(loanId, balance);
+    expect(first.status).toBe(200);
+    const second = await initiatePayment(loanId, balance);
+    if (second.status === 200) {
+      await paymentCallback(first.body.transactionId, balance);
+      await paymentCallback(second.body.transactionId, balance); // FAILED: taken, not booked
+    }
+    return async () => {
+      expect(second.status).toBeGreaterThanOrEqual(400);
+    };
+  });
+
+  knownGap('penalty repaid on an installment loan is booked as Penalty Income', async () => {
+    // The installment branch of /api/payment-callback moves the penalty from Receivable to Received
+    // but never credits Penalty Income (the single-payment branch does). Local copy of production:
+    // Penalty Received 11,231.64, Penalty Income 467.
+    const loanId = await openLoan(2_000, fx.salaryId);
+    // An overdue installment rolls into the next one, so only an overdue LAST installment charges a penalty.
+    await travel(loanId, SALARY_ADVANCE.installments * SALARY_ADVANCE.intervalDays + 4);
+    await repay(loanId, 50);
+    const payment = await prisma.payment.findFirstOrThrow({ where: { loanId } });
+    const posted = await postings(payment.journalEntryId!);
+    expect(posted['Penalty Received Debit']).toBeGreaterThan(0);
+    return async () => {
+      expect(posted['Penalty Income Credit']).toBe(posted['Penalty Received Debit']);
+    };
+  });
+
+  knownGap('a payout whose answer never arrived is not recorded as FAILED (the bank may have paid it)', async () => {
+    // In the local copy of production, 10 loans whose only payout record is FAILED ("fetch failed",
+    // a 503 page) were repaid in full by their borrowers (100,127 Birr): the money had arrived.
+    // FAILED has to mean "not paid", or cancelling FAILED loans would write off money paid out.
+    const loanId = await bookLoan(1_000);
+    bank.disbursementAnswer = 'network-error';
+    try {
+      await disburse(loanId);
+    } finally {
+      bank.disbursementAnswer = 'success';
+    }
+    return async () => {
+      const record = await prisma.disbursementTransaction.findFirstOrThrow({ where: { loanId } });
+      expect(record.disbursementStatus).not.toBe('FAILED');
     };
   });
 });
