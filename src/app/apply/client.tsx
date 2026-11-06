@@ -17,7 +17,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { MiniAppShell } from "@/components/miniapp/shell";
 import { BottomSheet } from "@/components/miniapp/bottom-sheet";
 import { BrandButton, Panel } from "@/components/miniapp/ui";
-import { maskAccount, titleCaseName } from "@/lib/miniapp/format";
+import { titleCaseName } from "@/lib/miniapp/format";
 
 type Step = "calculator" | "details";
 
@@ -388,7 +388,7 @@ export function ApplyClient({
   };
 
   const accountLabel = selectedAccount?.accountNumber
-    ? maskAccount(selectedAccount.accountNumber)
+    ? String(selectedAccount.accountNumber)
     : undefined;
 
   const renderStep = () => {
@@ -469,7 +469,7 @@ export function ApplyClient({
               <Skeleton className="mt-1 h-4 w-40 bg-gray-100" />
             ) : selectedAccount ? (
               <p className="truncate text-sm font-semibold">
-                {maskAccount(selectedAccount.accountNumber)}
+                {selectedAccount.accountNumber}
                 {selectedAccount.customerName
                   ? ` · ${titleCaseName(selectedAccount.customerName)}`
                   : ""}

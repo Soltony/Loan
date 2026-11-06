@@ -36,7 +36,6 @@ import {
   firstName,
   formatETB,
   formatMoney,
-  maskAccount,
   titleCaseName,
 } from "@/lib/miniapp/format";
 
@@ -599,7 +598,7 @@ export function DashboardClient({
             }
           : {
               title: "Account updated",
-              description: `Loans will be paid into ${maskAccount(acc.accountNumber)}.`,
+              description: `Loans will be paid into ${acc.accountNumber}.`,
             }
       );
       followDataFetch(acc.accountNumber, data);
@@ -762,16 +761,43 @@ export function DashboardClient({
         {/* Limit card */}
         <section
           aria-label="Your loan limit"
-          className="relative overflow-hidden rounded-3xl bg-brand p-5 text-brand-fg shadow-[0_12px_28px_-16px_rgba(0,0,0,0.45)]"
+          className="relative overflow-hidden rounded-3xl bg-brand px-4 pb-2 pt-3.5 text-brand-fg shadow-[0_12px_28px_-16px_rgba(0,0,0,0.45)]"
         >
-          <div
+          {/* Honeycomb, fading out toward the amount so it never sits behind the figures. */}
+          <svg
             aria-hidden
-            className="pointer-events-none absolute -right-12 -top-16 h-48 w-48 rounded-full bg-white/20"
-          />
-          <div
-            aria-hidden
-            className="pointer-events-none absolute -bottom-20 -left-8 h-44 w-44 rounded-full bg-black/5"
-          />
+            className="pointer-events-none absolute inset-0 h-full w-full text-white"
+          >
+            <defs>
+              <pattern
+                id="limit-card-honeycomb"
+                width="31.18"
+                height="54"
+                patternUnits="userSpaceOnUse"
+              >
+                <path
+                  d="M15.59 0 31.18 9v18L15.59 36 0 27V9ZM15.59 36v18"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.25"
+                />
+              </pattern>
+              <linearGradient id="limit-card-honeycomb-fade" x1="0" x2="1" y1="0" y2="0">
+                <stop offset="0.25" stopColor="#fff" stopOpacity="0" />
+                <stop offset="1" stopColor="#fff" stopOpacity="1" />
+              </linearGradient>
+              <mask id="limit-card-honeycomb-mask">
+                <rect width="100%" height="100%" fill="url(#limit-card-honeycomb-fade)" />
+              </mask>
+            </defs>
+            <rect
+              width="100%"
+              height="100%"
+              fill="url(#limit-card-honeycomb)"
+              mask="url(#limit-card-honeycomb-mask)"
+              opacity="0.45"
+            />
+          </svg>
           <div className="relative">
             <div className="flex items-center justify-between gap-3">
               <p className="text-sm font-medium opacity-80">
@@ -782,7 +808,7 @@ export function DashboardClient({
                 onClick={toggleHideAmounts}
                 aria-pressed={hideAmounts}
                 aria-label={hideAmounts ? "Show amounts" : "Hide amounts"}
-                className="grid h-9 w-9 place-items-center rounded-full bg-black/5 hover:bg-black/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-current"
+                className="-mr-1 grid h-8 w-8 place-items-center rounded-full bg-black/5 hover:bg-black/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-current"
               >
                 {hideAmounts ? (
                   <EyeOff className="h-4 w-4" />
@@ -793,22 +819,20 @@ export function DashboardClient({
             </div>
 
             {isRecalculating ? (
-              <>
-                <Skeleton className="mt-2 h-9 w-52 bg-black/10" />
-                <Skeleton className="mt-3 h-4 w-40 bg-black/10" />
-              </>
+              <Skeleton className="mt-1 h-9 w-52 bg-black/10" />
             ) : (
               <>
                 <Amount
                   value={amount(availableToBorrow)}
-                  className="mt-1 block text-[34px] leading-tight"
+                  className="block text-[32px] leading-tight"
                 />
-                {overallMaxLimit > 0 ? (
-                  <p className="mt-1 text-sm opacity-80">
-                    Your limit {amount(overallMaxLimit)} ETB
+                {/* The limit only adds something when part of it is in use. */}
+                {overallMaxLimit > 0 && overallMaxLimit !== availableToBorrow ? (
+                  <p className="text-sm opacity-80">
+                    of your {amount(overallMaxLimit)} ETB limit
                   </p>
-                ) : limitReason ? (
-                  <p className="mt-2 flex items-start gap-1.5 text-sm leading-snug opacity-90">
+                ) : overallMaxLimit <= 0 && limitReason ? (
+                  <p className="mt-1 flex items-start gap-1.5 text-sm leading-snug opacity-90">
                     <Info className="mt-0.5 h-4 w-4 shrink-0" aria-hidden />
                     {limitReason}
                   </p>
@@ -817,7 +841,7 @@ export function DashboardClient({
             )}
 
             {isUpdatingLimit && (
-              <p className="mt-3 flex items-center gap-2 text-xs opacity-80">
+              <p className="mt-2 flex items-center gap-2 text-xs opacity-80">
                 <Loader2 className="h-3 w-3 animate-spin" aria-hidden />
                 Checking your account activity. Your limit will update
                 shortly.
@@ -825,28 +849,28 @@ export function DashboardClient({
             )}
 
             {selectedAccount && (
+              <div className="mt-2.5 border-t border-black/10 pt-1">
               <button
                 type="button"
                 onClick={() => setShowAccountModal(true)}
-                className="mt-4 flex w-full items-center gap-3 rounded-2xl bg-white/30 px-3 py-2.5 text-left transition hover:bg-white/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-current"
+                aria-label={`Loans are paid into ${selectedAccount.accountNumber}. Change account`}
+                className="-mx-2 flex w-[calc(100%+1rem)] items-center gap-2 rounded-xl px-2 py-2 text-left text-sm transition hover:bg-black/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-current"
               >
-                <Landmark className="h-5 w-5 shrink-0 opacity-80" aria-hidden />
-                <span className="min-w-0 flex-1">
-                  <span className="block text-xs opacity-75">
-                    Loans are paid into
-                  </span>
-                  <span className="block truncate text-sm font-semibold">
-                    {maskAccount(selectedAccount.accountNumber)}
+                <Landmark className="h-4 w-4 shrink-0 opacity-70" aria-hidden />
+                <span className="min-w-0 flex-1 truncate">
+                  <span className="font-semibold tabular-nums">
+                    {selectedAccount.accountNumber}
                     {selectedAccount.customerName
                       ? ` · ${titleCaseName(selectedAccount.customerName)}`
                       : ""}
                   </span>
                 </span>
-                <span className="flex items-center text-xs font-semibold">
+                <span className="flex shrink-0 items-center text-xs font-semibold">
                   Change
                   <ChevronRight className="h-4 w-4" aria-hidden />
                 </span>
               </button>
+              </div>
             )}
           </div>
         </section>

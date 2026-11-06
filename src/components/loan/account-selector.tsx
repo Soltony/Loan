@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Check, Landmark, RefreshCw } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { maskAccount, titleCaseName } from "@/lib/miniapp/format";
+import { titleCaseName } from "@/lib/miniapp/format";
 import { BrandButton, Notice } from "@/components/miniapp/ui";
 import { Skeleton } from "@/components/ui/skeleton";
 
@@ -282,7 +282,7 @@ export default function AccountSelector({ phoneNumber, onSelected }: Props) {
                   </span>
                   <span className="min-w-0 flex-1">
                     <span className="block font-semibold tabular-nums">
-                      {maskAccount(option.accountNumber)}
+                      {option.accountNumber}
                     </span>
                     <span className="block truncate text-sm text-gray-500">
                       {titleCaseName(option.name) || "Bank account"}

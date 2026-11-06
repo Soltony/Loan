@@ -5,7 +5,6 @@ import {
   formatDate,
   formatETB,
   formatMoney,
-  maskAccount,
   repaidShare,
   titleCaseName,
 } from './format';
@@ -50,13 +49,7 @@ describe('dueStatus', () => {
   });
 });
 
-describe('names and accounts', () => {
-  it('masks all but the last four digits', () => {
-    expect(maskAccount('7000042312237')).toBe('•••• 2237');
-    expect(maskAccount('123')).toBe('123');
-    expect(maskAccount(null)).toBe('');
-  });
-
+describe('names', () => {
   it('title-cases upper-case bank names', () => {
     expect(titleCaseName('CHALEW NEGASH  DEGAREGE')).toBe('Chalew Negash Degarege');
     expect(firstName('CHALEW NEGASH DEGAREGE')).toBe('Chalew');

@@ -62,13 +62,6 @@ export function dueStatus(
   return { tone: diff <= 3 ? 'soon' : 'later', days: diff, label: `Due in ${days(diff)}` };
 }
 
-/** "7000042312237" -> "•••• 2237". */
-export function maskAccount(account: string | number | null | undefined): string {
-  const s = String(account ?? '').replace(/\s+/g, '');
-  if (s.length <= 4) return s;
-  return `•••• ${s.slice(-4)}`;
-}
-
 const capitalise = (word: string) =>
   word ? word.charAt(0).toUpperCase() + word.slice(1).toLowerCase() : '';
 
