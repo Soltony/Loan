@@ -37,6 +37,8 @@ import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { differenceInCalendarDays, format, subDays } from 'date-fns';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+// A plain constant: safe to import before the env and mocks are in place.
+import { REPAYMENT_CONFIRMATION_WINDOW_MS } from '@/lib/repayment-window';
 
 const PROJECT_ROOT = fileURLToPath(new URL('..', import.meta.url));
 
@@ -1407,8 +1409,16 @@ describe('known gaps (expected to fail until fixed)', () => {
   knownGap('two callbacks for different payments of one loan arriving together are both credited', async () => {
     // The callback reads loan.repaidAmount before its transaction and writes "that + this payment",
     // so the later commit overwrites the earlier one. CBS NPL collections post to the same loans.
+    // Two payments of one loan can only be in flight together once the first one's confirmation
+    // window has run out (its callback is late) — /api/initiate-payment refuses a second one
+    // inside it. Age the first past the window to get there without waiting.
     const loanId = await openLoan(1_000);
     const first = await initiatePayment(loanId, 300);
+    expect(first.status).toBe(200);
+    await prisma.pendingPayment.update({
+      where: { transactionId: first.body.transactionId },
+      data: { createdAt: new Date(Date.now() - REPAYMENT_CONFIRMATION_WINDOW_MS - 1_000) },
+    });
     const second = await initiatePayment(loanId, 400);
     expect([first.status, second.status]).toEqual([200, 200]);
     await Promise.all([paymentCallback(first.body.transactionId, 300), paymentCallback(second.body.transactionId, 400)]);
@@ -1419,24 +1429,33 @@ describe('known gaps (expected to fail until fixed)', () => {
     };
   });
 
-  knownGap('a second payment of the full balance is refused while the first is still in flight', async () => {
-    // In the local copy of production, 41 FAILED payments (146,467 Birr) sit on loans that are
-    // Paid, 21 of them started within 2 minutes of a completed one: the customer paid twice, the
-    // gateway took both, the callback refused the second, and nothing refunds it.
-    const loanId = await openLoan(1_000);
-    const probe = await initiatePayment(loanId, 1_000_000);
-    const balance = Number(String(probe.body.error).match(/balance of ([\d.]+)/)?.[1]);
-    expect(balance).toBeGreaterThan(1_000);
-    const first = await initiatePayment(loanId, balance);
-    expect(first.status).toBe(200);
-    const second = await initiatePayment(loanId, balance);
-    if (second.status === 200) {
-      await paymentCallback(first.body.transactionId, balance);
-      await paymentCallback(second.body.transactionId, balance); // FAILED: taken, not booked
+  // Was a known gap until 2026-11-06. In the local copy of production, 41 FAILED payments
+  // (146,467 Birr) sit on loans that are Paid, 21 of them started within 2 minutes of a completed
+  // one: the customer paid twice, the gateway took both, the callback refused the second.
+  it('refuses a second payment while the first is still in flight, and points the borrower at the first', async () => {
+    try {
+      const loanId = await openLoan(1_000);
+      const probe = await initiatePayment(loanId, 1_000_000);
+      const balance = Number(String(probe.body.error).match(/balance of ([\d.]+)/)?.[1]);
+      expect(balance).toBeGreaterThan(1_000);
+      const first = await initiatePayment(loanId, balance);
+      expect(first.status).toBe(200);
+
+      const second = await initiatePayment(loanId, balance);
+      expect(second.status, JSON.stringify(second.body)).toBe(409);
+      expect(second.body.code).toBe('PAYMENT_IN_PROGRESS');
+      // The borrower's screen rejoins the first payment's wait with this; no new charge exists.
+      expect(second.body.inFlight).toEqual({ transactionId: first.body.transactionId, amount: balance });
+      expect(second.body.retryAfterSeconds).toBeGreaterThan(0);
+      expect(second.body.retryAfterSeconds).toBeLessThanOrEqual(REPAYMENT_CONFIRMATION_WINDOW_MS / 1000);
+      expect(await prisma.pendingPayment.count({ where: { loanId, status: 'PENDING' } })).toBe(1);
+
+      // Once the first is confirmed the loan is paid off, and the outstanding check refuses more.
+      expect((await paymentCallback(first.body.transactionId, balance)).status).toBe(200);
+      expect((await initiatePayment(loanId, balance)).status).toBe(400);
+    } finally {
+      await closeOpenLoans();
     }
-    return async () => {
-      expect(second.status).toBeGreaterThanOrEqual(400);
-    };
   });
 
   knownGap('penalty repaid on an installment loan is booked as Penalty Income', async () => {

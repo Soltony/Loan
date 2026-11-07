@@ -23,7 +23,12 @@ export interface PendingRepayment {
   providerName: string | null;
   /** Provider brand colour, so a resumed screen keeps the lender's colours. */
   providerColor: string | null;
-  /** Epoch ms. */
+  /**
+   * True when this screen did not start the payment: the server refused a new one because
+   * this payment was already waiting for its callback, and the screen rejoined that wait.
+   */
+  rejoined?: boolean;
+  /** Epoch ms, on this device's clock. */
   startedAt: number;
 }
 
@@ -83,8 +88,10 @@ export function readPendingRepayment(): PendingRepayment | null {
  * Opens the wait: writes it down and raises the status screen. Called before the token
  * goes to the super app, so the waiting screen is already up under the PIN sheet.
  */
-export function startPendingRepayment(payment: Omit<PendingRepayment, 'startedAt'>): PendingRepayment {
-  const record: PendingRepayment = { ...payment, startedAt: Date.now() };
+export function startPendingRepayment(
+  payment: Omit<PendingRepayment, 'startedAt'> & { startedAt?: number },
+): PendingRepayment {
+  const record: PendingRepayment = { ...payment, startedAt: payment.startedAt ?? Date.now() };
   write(record);
   if (typeof window !== 'undefined') {
     window.dispatchEvent(new CustomEvent<PendingRepayment>(STARTED_EVENT, { detail: record }));

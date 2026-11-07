@@ -7,6 +7,7 @@ import { cn } from '@/lib/utils';
 import { calculateInstallmentDueBreakdown, calculateTotalRepayableDetailed } from '@/lib/loan-calculator';
 import { BottomSheet } from '@/components/miniapp/bottom-sheet';
 import { abortPendingRepayment, nextPaint, startPendingRepayment } from '@/lib/miniapp/pending-repayment';
+import { REPAYMENT_CONFIRMATION_WINDOW_MS } from '@/lib/repayment-window';
 import { DetailRow } from '@/components/miniapp/ui';
 import { brandCssVars } from '@/lib/miniapp/brand';
 import { formatETB, formatMoney } from '@/lib/miniapp/format';
@@ -124,7 +125,8 @@ export function RepaymentDialog({ isOpen, onClose, loan, totalBalanceDue, provid
         setIsProcessing(true);
         setPayError('');
 
-        let started: { paymentToken: string; transactionId: string };
+        let started: { paymentToken: string; transactionId: string } | null = null;
+        let inFlight: { transactionId: string; amount: number; retryAfterSeconds: number } | null = null;
         try {
             // Step 1: our backend registers the payment with the gateway and returns its token.
             const initiateResponse = await fetch('/api/initiate-payment', {
@@ -134,13 +136,19 @@ export function RepaymentDialog({ isOpen, onClose, loan, totalBalanceDue, provid
             });
 
             const data = await initiateResponse.json().catch(() => ({}));
-            if (!initiateResponse.ok) {
+            if (initiateResponse.status === 409 && data.code === 'PAYMENT_IN_PROGRESS' && data.inFlight?.transactionId) {
+                inFlight = {
+                    transactionId: String(data.inFlight.transactionId),
+                    amount: Number(data.inFlight.amount) || numericAmount,
+                    retryAfterSeconds: Number(data.retryAfterSeconds) || 0,
+                };
+            } else if (!initiateResponse.ok) {
                 throw new Error(data.error || 'We could not start the payment. Please try again.');
-            }
-            if (!data.paymentToken || !data.transactionId) {
+            } else if (!data.paymentToken || !data.transactionId) {
                 throw new Error('We could not start the payment. Please try again.');
+            } else {
+                started = { paymentToken: data.paymentToken, transactionId: data.transactionId };
             }
-            started = { paymentToken: data.paymentToken, transactionId: data.transactionId };
         } catch (err) {
             // Nothing has been charged yet, so the keypad stays open to try again.
             setPayError((err instanceof Error && err.message) || 'Something went wrong with the payment. Please try again.');
@@ -148,18 +156,37 @@ export function RepaymentDialog({ isOpen, onClose, loan, totalBalanceDue, provid
             return;
         }
 
+        const about = {
+            loanId: loan.id,
+            productName: loan.productName ?? 'Loan',
+            providerName: loan.providerName ?? null,
+            providerColor: providerColor ?? null,
+        };
+
+        if (inFlight) {
+            // A payment on this loan is still waiting for its callback — started on another
+            // device, or on this one before the screen lost track of it. The server took no
+            // new payment, so there is no token to hand over: follow the existing one instead.
+            startPendingRepayment({
+                ...about,
+                transactionId: inFlight.transactionId,
+                amount: inFlight.amount,
+                rejoined: true,
+                // Placed from what the server says is left of the window, so a wrong clock on
+                // this phone neither cuts the wait short nor drags it out.
+                startedAt: Date.now() - (REPAYMENT_CONFIRMATION_WINDOW_MS - inFlight.retryAfterSeconds * 1000),
+            });
+            onClose();
+            setIsProcessing(false);
+            return;
+        }
+        if (!started) return;
+
         // Step 2: raise the payment status screen and let it paint *before* the token goes
         // to the super app, so the borrower comes back from the PIN sheet to the wait (and
         // then the verdict) instead of to this keypad. The loan is only updated when the
         // gateway's callback lands; the status screen polls for that.
-        startPendingRepayment({
-            transactionId: started.transactionId,
-            loanId: loan.id,
-            amount: numericAmount,
-            productName: loan.productName ?? 'Loan',
-            providerName: loan.providerName ?? null,
-            providerColor: providerColor ?? null,
-        });
+        startPendingRepayment({ ...about, transactionId: started.transactionId, amount: numericAmount });
         onClose();
         setIsProcessing(false);
         await nextPaint();
@@ -170,7 +197,9 @@ export function RepaymentDialog({ isOpen, onClose, loan, totalBalanceDue, provid
             console.error('Super app channel rejected the payment token', err);
             abortPendingRepayment(
                 started.transactionId,
-                "We couldn't open the payment screen, so nothing was charged. Please reopen Loans from the app and try again.",
+                // The server cannot tell this payment from one awaiting approval, so it holds
+                // the loan for the rest of the confirmation window — hence the wait.
+                "We couldn't open the payment screen, so nothing was charged. Please reopen Loans from the app and try again in 2 minutes.",
             );
         }
     };

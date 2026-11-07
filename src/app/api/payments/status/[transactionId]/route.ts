@@ -19,6 +19,8 @@ export const dynamic = 'force-dynamic';
  *  - FAILED    the callback arrived — the money left the borrower — but it was more
  *              than the loan owed at that moment, so nothing was posted. Final: the
  *              callback refuses to process a row that is no longer PENDING.
+ *  - NOT_STARTED  /api/initiate-payment never got a token from the gateway, so the
+ *              borrower was never asked to approve anything and nothing was charged.
  */
 
 /** Same product terms /api/initiate-payment loads; the full row carries ~1 MB of icon and salary data. */

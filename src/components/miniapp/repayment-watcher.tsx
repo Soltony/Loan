@@ -17,11 +17,16 @@ import {
   subscribeRepaymentStarted,
   type PendingRepayment,
 } from '@/lib/miniapp/pending-repayment';
+import { REPAYMENT_CONFIRMATION_WINDOW_MS } from '@/lib/repayment-window';
 import { RepaymentStatusPage, type RepaymentOutcome, type RepaymentStatus } from './repayment-status-page';
 
 const POLL_INTERVAL_MS = 2000;
-/** From the moment the payment was started, so a wait resumed after a reload gets what is left of it. */
-const POLL_WINDOW_MS = 120_000;
+/**
+ * From the moment the payment was started, so a wait resumed after a reload gets what is
+ * left of it. The same window /api/initiate-payment blocks a second payment for, so
+ * "still waiting" appears exactly when paying again becomes possible.
+ */
+const POLL_WINDOW_MS = REPAYMENT_CONFIRMATION_WINDOW_MS;
 /** A "Check again" after the window ran out polls for this much longer. */
 const RECHECK_WINDOW_MS = 30_000;
 
@@ -103,6 +108,14 @@ export function RepaymentWatcher() {
             nextDue: data.loan?.nextDue ?? null,
           });
           setStatus(data.status === 'COMPLETED' ? 'success' : 'not-applied');
+          return;
+        }
+
+        if (data?.status === 'NOT_STARTED') {
+          clearPendingRepayment();
+          setChecking(false);
+          setMessage('This payment could not be started, so nothing was charged. You can try again now.');
+          setStatus('not-started');
           return;
         }
 
@@ -193,6 +206,7 @@ export function RepaymentWatcher() {
       providerName={pending.providerName}
       providerColor={pending.providerColor}
       transactionId={pending.transactionId}
+      rejoined={Boolean(pending.rejoined)}
       outcome={outcome}
       message={message}
       checking={checking}

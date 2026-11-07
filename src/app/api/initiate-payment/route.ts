@@ -7,6 +7,9 @@ import { calculateTotalRepayable } from '@/lib/loan-calculator';
 import { getAsOfDate } from '@/lib/date-utils';
 import { createAuditLog } from '@/lib/audit-log';
 import { getSession } from '@/lib/session';
+import { requireMiniAppAuthContext } from '@/lib/miniapp-auth';
+import { getPhoneNumbersForAccount } from '@/lib/account-utils';
+import { REPAYMENT_CONFIRMATION_WINDOW_MS } from '@/lib/repayment-window';
 import { auditExternalApiRequest, auditExternalApiResponse, newAuditCorrelationId } from '@/lib/audit-log';
 
 export async function POST(req: NextRequest) {
@@ -31,6 +34,8 @@ export async function POST(req: NextRequest) {
         );
     }
 
+    /** Set once this request's PendingPayment row exists. */
+    let startedTransactionId: string | null = null;
     try {
         const ipAddress = req.headers.get('x-forwarded-for') || 'N/A';
         const userAgent = req.headers.get('user-agent') || 'N/A';
@@ -152,16 +157,74 @@ export async function POST(req: NextRequest) {
         };
         // final payload prepared for payment gateway (log removed to reduce console noise)
 
-        // --- Step 6: Save Pending Payment ---
-        await prisma.pendingPayment.create({
-            data: {
-                transactionId,
-                loanId,
-                borrowerId: loan.borrowerId,
-                amount,
-                status: 'PENDING',
-            },
+        // --- Step 6: Save Pending Payment, unless one is already in flight for this loan ---
+        // Both payments would pass the outstanding-balance check above, because the loan is
+        // only credited when a callback lands. The second one is then refused by the callback
+        // as an overpayment after the money has left the customer (FAILED). So a loan takes
+        // one payment at a time until the first is confirmed or its window runs out.
+        const cutoff = new Date(Date.now() - REPAYMENT_CONFIRMATION_WINDOW_MS);
+        const inFlight = await prisma.$transaction(async (tx) => {
+            // Serialises initiations per loan, so two taps at once cannot both pass the check.
+            // An application lock rather than a lock on the Loan row: the payment callback
+            // locks Loan and PendingPayment in an order of its own, and only this route
+            // takes this lock, so it cannot deadlock with a callback.
+            const [lock] = await tx.$queryRaw<{ result: number }[]>`
+                DECLARE @result int;
+                EXEC @result = sp_getapplock @Resource = ${`initiate-payment:${loanId}`}, @LockMode = 'Exclusive', @LockOwner = 'Transaction', @LockTimeout = 10000;
+                SELECT @result AS result;`;
+            if (!lock || lock.result < 0) {
+                throw new Error('We could not start the payment right now. Please try again.');
+            }
+
+            const existing = await tx.pendingPayment.findFirst({
+                where: { loanId, status: 'PENDING', createdAt: { gt: cutoff } },
+                orderBy: { createdAt: 'desc' },
+                select: { transactionId: true, amount: true, createdAt: true },
+            });
+            if (existing) return existing;
+
+            await tx.pendingPayment.create({
+                data: {
+                    transactionId,
+                    loanId,
+                    borrowerId: loan.borrowerId,
+                    amount,
+                    status: 'PENDING',
+                },
+            });
+            return null;
         });
+
+        if (inFlight) {
+            const elapsedMs = Date.now() - inFlight.createdAt.getTime();
+            const retryAfterSeconds = Math.max(1, Math.ceil((REPAYMENT_CONFIRMATION_WINDOW_MS - elapsedMs) / 1000));
+            const wait = retryAfterSeconds <= 60 ? 'a minute' : `${Math.ceil(retryAfterSeconds / 60)} minutes`;
+
+            // This route does not otherwise check that the loan is the caller's, so the
+            // in-flight payment's reference only goes back to its owner — whose screen uses
+            // it to rejoin that wait instead of showing an error.
+            const ctx = await requireMiniAppAuthContext().catch(() => null);
+            const ownsLoan = ctx ? (await getPhoneNumbersForAccount(ctx.borrowerId)).includes(loan.borrowerId) : false;
+
+            await createAuditLog({
+                actorId: ctx?.borrowerId ?? loan.borrowerId,
+                action: 'PAYMENT_GATEWAY_REQUEST_BLOCKED',
+                entity: 'LOAN',
+                entityId: loanId,
+                details: { reason: 'PAYMENT_IN_PROGRESS', amount, inFlightTransactionId: inFlight.transactionId },
+            }).catch(() => null);
+
+            return NextResponse.json(
+                {
+                    error: `A payment for this loan is already waiting for confirmation. Please wait about ${wait} before paying again.`,
+                    code: 'PAYMENT_IN_PROGRESS',
+                    retryAfterSeconds,
+                    ...(ownsLoan ? { inFlight: { transactionId: inFlight.transactionId, amount: inFlight.amount } } : {}),
+                },
+                { status: 409, headers: { 'Retry-After': String(retryAfterSeconds) } },
+            );
+        }
+        startedTransactionId = transactionId;
 
         await createAuditLog({
             actorId: loan.borrowerId,
@@ -275,6 +338,16 @@ export async function POST(req: NextRequest) {
 
         return NextResponse.json({ paymentToken, transactionId });
     } catch (error) {
+        // The payment row exists but its token never left this server, so the borrower
+        // cannot be asked to approve it and no charge can follow. Releasing it keeps the
+        // in-flight check above from holding up their retry for a payment that cannot happen.
+        // NOT_STARTED, not FAILED: FAILED means money arrived and was refused, and is
+        // listed for operators to resolve.
+        if (startedTransactionId) {
+            await prisma.pendingPayment
+                .updateMany({ where: { transactionId: startedTransactionId, status: 'PENDING' }, data: { status: 'NOT_STARTED' } })
+                .catch((e) => console.error('Could not release the unstarted payment', e));
+        }
         console.error('💥 Error initiating payment:', error);
         const errorMessage = error instanceof Error ? error.message : 'An unknown error occurred.';
         return NextResponse.json({ error: errorMessage }, { status: 500 });

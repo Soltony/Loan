@@ -47,6 +47,8 @@ interface Props {
   providerName: string | null;
   providerColor: string | null;
   transactionId: string;
+  /** The screen is following a payment started earlier (the server refused a second one). */
+  rejoined: boolean;
   outcome: RepaymentOutcome | null;
   /** Why the payment did not start, when the hand-off itself failed. */
   message: string | null;
@@ -111,7 +113,9 @@ function explanation(status: RepaymentStatus, props: Props) {
   const amount = `${formatMoney(props.outcome?.amount ?? props.amount)} ETB`;
   switch (status) {
     case 'waiting':
-      return `Approve the payment of ${amount} in the app. This screen updates as soon as it is confirmed.`;
+      return props.rejoined
+        ? `You already started a payment of ${amount} for this loan. We are waiting for it to be confirmed before you can pay again.`
+        : `Approve the payment of ${amount} in the app. This screen updates as soon as it is confirmed.`;
     case 'success':
       return props.outcome?.fullyRepaid
         ? `You have paid off your ${props.productName} loan. Thank you!`
@@ -146,7 +150,6 @@ export function RepaymentStatusPage(props: Props) {
             might tap mid-payment — the Repay button above all. */}
         <Dialog.Overlay className="fixed inset-0 z-[90] bg-gray-100 data-[state=open]:animate-in data-[state=open]:fade-in-0" />
         <Dialog.Content
-          aria-describedby="repayment-status-explanation"
           // Nothing dismisses this while the money is in flight — not a tap outside, not
           // Escape. The way out appears once there is an outcome to accept.
           onPointerDownOutside={(e) => e.preventDefault()}
@@ -180,9 +183,9 @@ export function RepaymentStatusPage(props: Props) {
               <Dialog.Title className={cn('mt-6 text-[26px] font-bold leading-tight tracking-tight', tone.title)}>
                 {headline(status, outcome)}
               </Dialog.Title>
-              <p id="repayment-status-explanation" className="mx-auto mt-2 max-w-[20rem] text-sm leading-relaxed text-gray-500">
+              <Dialog.Description className="mx-auto mt-2 max-w-[20rem] text-sm leading-relaxed text-gray-500">
                 {explanation(status, props)}
-              </p>
+              </Dialog.Description>
             </div>
 
             <div className="mt-7 w-full overflow-hidden rounded-2xl border border-gray-200/80 bg-white text-left shadow-[0_1px_2px_rgba(16,24,40,0.05)]">

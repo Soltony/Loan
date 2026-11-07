@@ -630,7 +630,7 @@ model PendingPayment {
   borrowerId    String
   borrower      Borrower @relation(fields: [borrowerId], references: [id], onUpdate: NoAction, onDelete: NoAction)
   amount        Float
-  status        String   @default("PENDING") // PENDING, COMPLETED, FAILED
+  status        String   @default("PENDING") // PENDING, COMPLETED, FAILED (callback refused the amount), NOT_STARTED (gateway gave no token: no charge possible)
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
 

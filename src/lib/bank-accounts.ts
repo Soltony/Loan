@@ -8,7 +8,7 @@
 // A successful answer is reused for a few minutes: the picker, the link and the loan request
 // usually come within moments of each other.
 const CACHE_MS = 5 * 60 * 1000;
-const TIMEOUT_MS = 20_000;
+const TIMEOUT_MS = 90_000;
 
 const cache: Map<string, { at: number; accounts: Set<string> }> = ((globalThis as any).__bankAccountsByPhone ??=
   new Map());
